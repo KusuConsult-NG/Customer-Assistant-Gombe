@@ -1,0 +1,654 @@
+"use client";
+
+import React, { useEffect, useState, useCallback } from 'react';
+import { API_URL, apiFetch } from '@/lib/api';
+import { useToast } from '@/components/ui/Toast';
+import { ListSkeleton } from '@/components/ui/Skeleton';
+import { RoleNotice, useScreenAccess } from '@/components/RoleNotice';
+import {
+  Send,
+  Plus,
+  Trash2,
+  Users,
+  CheckCircle2,
+  XCircle,
+  Clock,
+  MessageSquare,
+  FileText,
+  Sparkles,
+  Search,
+  Layers,
+  ArrowRight,
+  ChevronRight,
+  X,
+  AlertCircle
+} from 'lucide-react';
+
+interface WhatsAppTemplate {
+  id: string;
+  name: string;
+  language: string;
+  category: string;
+  headerType?: string;
+  headerContent?: string;
+  bodyText: string;
+  footerText?: string;
+  status: string;
+  createdAt: string;
+}
+
+interface BroadcastCampaign {
+  id: string;
+  name: string;
+  recipients: string[];
+  totalCount: number;
+  sentCount: number;
+  failedCount: number;
+  status: string;
+  sentAt?: string;
+  createdAt: string;
+  template?: WhatsAppTemplate;
+}
+
+export default function BroadcastsPage() {
+  const toast = useToast();
+  const [activeTab, setActiveTab] = useState<'campaigns' | 'templates'>('campaigns');
+  const [templates, setTemplates] = useState<WhatsAppTemplate[]>([]);
+  const [broadcasts, setBroadcasts] = useState<BroadcastCampaign[]>([]);
+  const [contacts, setContacts] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  // Modals
+  const [showTemplateModal, setShowTemplateModal] = useState(false);
+  const [showBroadcastModal, setShowBroadcastModal] = useState(false);
+
+  // Template Form
+  const [tplName, setTplName] = useState('');
+  const [tplCategory, setTplCategory] = useState('MARKETING');
+  const [tplLanguage, setTplLanguage] = useState('en_US');
+  const [tplBody, setTplBody] = useState('Hello {{1}}, thank you for choosing us! We have an exclusive offer for you.');
+  const [tplFooter, setTplFooter] = useState('Reply STOP to unsubscribe');
+  const [creatingTemplate, setCreatingTemplate] = useState(false);
+
+  // Broadcast Form
+  const [campaignName, setCampaignName] = useState('');
+  const [selectedTemplateId, setSelectedTemplateId] = useState('');
+  const [recipientsText, setRecipientsText] = useState('');
+  const [useAllContacts, setUseAllContacts] = useState(false);
+  const [contactTotal, setContactTotal] = useState<number | null>(null);
+  const [varValue1, setVarValue1] = useState('Valued Customer');
+  const [sendingBroadcast, setSendingBroadcast] = useState(false);
+  const [statusNotice, setStatusNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
+  const getHeaders = () => ({
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${typeof window !== 'undefined' ? localStorage.getItem('ace_token') : ''}`,
+  });
+
+  const fetchData = useCallback(async () => {
+    setLoading(true);
+    try {
+      const headers = getHeaders();
+      const [tplRes, bcRes, cRes] = await Promise.allSettled([
+        apiFetch(`${API_URL}/api/whatsapp/templates`, { headers }),
+        apiFetch(`${API_URL}/api/whatsapp/broadcasts`, { headers }),
+        apiFetch(`${API_URL}/api/crm/contacts`, { headers }),
+      ]);
+
+      if (tplRes.status === 'fulfilled' && tplRes.value.ok) {
+        setTemplates(await tplRes.value.json() || []);
+      }
+      if (bcRes.status === 'fulfilled' && bcRes.value.ok) {
+        setBroadcasts(await bcRes.value.json() || []);
+      }
+      if (cRes.status === 'fulfilled' && cRes.value.ok) {
+        const cData = await cRes.value.json();
+        setContacts(Array.isArray(cData) ? cData : cData?.data || []);
+        // The TOTAL, not the page. `contacts` is one page of fifty, and the
+        // "send to everyone" label was drawn from its length — so an agency
+        // with thousands of citizens read "Send to all 50" and believed it.
+        setContactTotal(
+          Array.isArray(cData) ? cData.length : typeof cData?.total === 'number' ? cData.total : null
+        );
+      }
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchData();
+  }, [fetchData]);
+
+  const handleCreateTemplate = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!tplName.trim() || !tplBody.trim()) return;
+    setCreatingTemplate(true);
+    try {
+      const res = await apiFetch(`${API_URL}/api/whatsapp/templates`, {
+        method: 'POST',
+        headers: getHeaders(),
+        body: JSON.stringify({
+          name: tplName,
+          category: tplCategory,
+          language: tplLanguage,
+          bodyText: tplBody,
+          footerText: tplFooter,
+        }),
+      });
+
+      if (res.ok) {
+        setStatusNotice({ type: 'success', text: 'WhatsApp template created successfully!' });
+        setShowTemplateModal(false);
+        setTplName('');
+        setTplBody('');
+        fetchData();
+      } else {
+        const err = await res.json().catch(() => ({ message: 'Failed to create template' }));
+        setStatusNotice({ type: 'error', text: err.message || 'Could not save template.' });
+      }
+    } catch {
+      setStatusNotice({ type: 'error', text: 'Network error creating template.' });
+    } finally {
+      setCreatingTemplate(false);
+    }
+  };
+
+  const handleDeleteTemplate = async (id: string) => {
+    if (!confirm('Are you sure you want to delete this WhatsApp template?')) return;
+    try {
+      const res = await apiFetch(`${API_URL}/api/whatsapp/templates/${id}`, {
+        method: 'DELETE',
+        headers: getHeaders(),
+      });
+      if (res.ok) {
+        setTemplates(prev => prev.filter(t => t.id !== id));
+      } else {
+        // There was no else at all: a refusal left the template sitting in
+        // the list and said nothing, so the button looked broken. Deleting a
+        // template is OWNER/ADMIN, which makes a 403 the commonest outcome
+        // for an agent clicking it — and the server's message says exactly
+        // that.
+        const err = await res.json().catch(() => ({} as any));
+        const message = Array.isArray(err?.message) ? err.message.join(' ') : err?.message;
+        toast.error(
+          message ||
+            (res.status === 403
+              ? 'Only an OWNER or ADMIN can delete a WhatsApp template.'
+              : 'Could not delete the template.')
+        );
+      }
+    } catch {
+      toast.error('Could not reach the server to delete the template.');
+    }
+  };
+
+  const handleSendBroadcast = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!campaignName.trim() || !selectedTemplateId) {
+      toast.warning('Give the campaign a name and choose a template first.');
+      return;
+    }
+
+    // "Everyone" is asked for by NAME and resolved on the server, from the
+    // database. Sending the page of contacts this browser happens to hold is
+    // what made "all" mean fifty.
+    const recipientList = useAllContacts
+      ? []
+      : recipientsText
+          .split(/[\n,;]+/)
+          .map(p => p.trim())
+          .filter(p => p.length >= 7);
+
+    if (!useAllContacts && recipientList.length === 0) {
+      toast.warning('Add at least one recipient phone number.');
+      return;
+    }
+
+    setSendingBroadcast(true);
+    setStatusNotice(null);
+
+    try {
+      const res = await apiFetch(`${API_URL}/api/whatsapp/broadcasts/send`, {
+        method: 'POST',
+        headers: getHeaders(),
+        body: JSON.stringify({
+          name: campaignName,
+          templateId: selectedTemplateId,
+          ...(useAllContacts ? { audience: 'ALL_CONTACTS' } : { recipients: recipientList }),
+          variables: { '1': varValue1 },
+        }),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        setStatusNotice({
+          type: 'success',
+          text: `Broadcast "${data.name}" dispatched successfully to ${data.sentCount} recipients!`,
+        });
+        setShowBroadcastModal(false);
+        setCampaignName('');
+        setRecipientsText('');
+        fetchData();
+      } else {
+        const err = await res.json().catch(() => ({ message: 'Failed to send broadcast' }));
+        setStatusNotice({ type: 'error', text: err.message || 'Error dispatching broadcast.' });
+      }
+    } catch {
+      setStatusNotice({ type: 'error', text: 'Network error sending broadcast campaign.' });
+    } finally {
+      setSendingBroadcast(false);
+    }
+  };
+
+  // This screen exists to CHANGE things, so a member who cannot change
+  // anything here is told so instead of being shown the controls and
+  // left to discover it by pressing one. Cosmetic either way: the API
+  // re-checks the role on every request.
+  const access = useScreenAccess('/broadcasts');
+  if (access === 'denied') return <div className="p-6"><RoleNotice path="/broadcasts" /></div>;
+
+  return (
+    <div className="space-y-6 max-w-7xl pb-12">
+      <RoleNotice path="/broadcasts" />
+      {/* Header */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-bold text-slate-900 dark:text-white flex items-center gap-2">
+            <Send className="w-6 h-6 text-brand-700 dark:text-brand-300" /> WhatsApp Broadcasts
+          </h1>
+          <p className="text-sm text-slate-600 dark:text-slate-400 mt-1">
+            Send service updates, deadline reminders, and office announcements to the citizens on your agency's list.
+          </p>
+        </div>
+        <div className="flex gap-2">
+          <button
+            onClick={() => setShowTemplateModal(true)}
+            className="flex items-center gap-2 px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white text-sm font-semibold transition-all"
+          >
+            <Plus className="w-4 h-4" /> Create Template
+          </button>
+          <button
+            onClick={() => setShowBroadcastModal(true)}
+            className="flex items-center gap-2 px-4 py-2.5 rounded-xl text-white font-semibold transition-all text-sm shadow-md"
+            style={{ background: 'linear-gradient(135deg, #3b6102, #4d7d02)' }}
+          >
+            <Send className="w-4 h-4" /> New Broadcast
+          </button>
+        </div>
+      </div>
+
+      {statusNotice && (
+        <div className={`p-4 rounded-xl text-sm border flex items-center justify-between ${
+          statusNotice.type === 'success'
+            ? 'bg-emerald-50 dark:bg-emerald-500/10 border-emerald-200 dark:border-emerald-500/20 text-emerald-700 dark:text-emerald-400'
+            : 'bg-red-50 dark:bg-red-500/10 border-red-200 dark:border-red-500/20 text-red-700 dark:text-red-400'
+        }`}>
+          <span>{statusNotice.text}</span>
+          <button onClick={() => setStatusNotice(null)}><X className="w-4 h-4" /></button>
+        </div>
+      )}
+
+      {/* Tabs */}
+      <div className="flex border-b border-slate-200 dark:border-slate-800 gap-8">
+        <button
+          onClick={() => setActiveTab('campaigns')}
+          className={`pb-3 text-sm font-semibold flex items-center gap-2 border-b-2 transition-all ${
+            activeTab === 'campaigns'
+              ? 'border-blue-500 text-blue-700 dark:text-blue-400'
+              : 'border-transparent text-slate-600 dark:text-slate-400 hover:text-slate-800 dark:text-slate-200'
+          }`}
+        >
+          <Send className="w-4 h-4" /> Broadcast History ({broadcasts.length})
+        </button>
+        <button
+          onClick={() => setActiveTab('templates')}
+          className={`pb-3 text-sm font-semibold flex items-center gap-2 border-b-2 transition-all ${
+            activeTab === 'templates'
+              ? 'border-blue-500 text-blue-700 dark:text-blue-400'
+              : 'border-transparent text-slate-600 dark:text-slate-400 hover:text-slate-800 dark:text-slate-200'
+          }`}
+        >
+          <FileText className="w-4 h-4" /> WhatsApp Templates ({templates.length})
+        </button>
+      </div>
+
+      {/* Tab 1: Broadcast Campaigns History */}
+      {activeTab === 'campaigns' && (
+        <div className="rounded-2xl bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 overflow-hidden">
+          {loading ? (
+            <div className="p-8 space-y-3">
+              {[1, 2, 3].map(i => <div key={i} className="h-16 bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 shadow-sm rounded-xl animate-pulse" />)}
+            </div>
+          ) : broadcasts.length === 0 ? (
+            <div className="p-12 text-center flex flex-col items-center justify-center">
+              <div className="w-12 h-12 rounded-full bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 flex items-center justify-center text-slate-600 dark:text-slate-400 mb-3">
+                <Send className="w-6 h-6 text-blue-700 dark:text-blue-400" />
+              </div>
+              <p className="text-slate-700 dark:text-slate-300 font-medium mb-1">No Broadcast Campaigns Sent Yet</p>
+              <p className="text-xs text-slate-500 dark:text-slate-400 max-w-sm mb-4">
+                Launch a multi-recipient WhatsApp template campaign to reach your CRM contacts instantly.
+              </p>
+              <button
+                onClick={() => setShowBroadcastModal(true)}
+                className="px-4 py-2 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-xs shadow-lg shadow-brand-600/20"
+              >
+                Send First Campaign
+              </button>
+            </div>
+          ) : (
+            <table className="w-full text-sm text-left">
+              <thead className="bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 shadow-sm border-b border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-400 text-xs uppercase tracking-wider">
+                <tr>
+                  <th className="px-5 py-3.5">Campaign Name</th>
+                  <th className="px-5 py-3.5">Template</th>
+                  <th className="px-5 py-3.5">Recipients</th>
+                  <th className="px-5 py-3.5">Sent / Failed</th>
+                  <th className="px-5 py-3.5">Status</th>
+                  <th className="px-5 py-3.5">Sent Date</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-white/[0.04]">
+                {broadcasts.map((b) => (
+                  <tr key={b.id} className="hover:bg-white dark:bg-slate-900/80 transition-colors">
+                    <td className="px-5 py-4 font-bold text-slate-900 dark:text-white">{b.name}</td>
+                    <td className="px-5 py-4 font-mono text-xs text-purple-700 dark:text-purple-400">
+                      {b.template?.name || 'Standard Template'}
+                    </td>
+                    <td className="px-5 py-4 font-medium text-slate-700 dark:text-slate-300">
+                      {b.totalCount} contacts
+                    </td>
+                    <td className="px-5 py-4 text-xs font-mono">
+                      <span className="text-emerald-700 dark:text-emerald-400 font-bold">{b.sentCount} sent</span>
+                      {b.failedCount > 0 && <span className="text-red-700 dark:text-red-400 ml-2">({b.failedCount} failed)</span>}
+                    </td>
+                    <td className="px-5 py-4">
+                      <span className={`px-2.5 py-1 rounded-full text-xs font-semibold border ${
+                        b.status === 'COMPLETED'
+                          ? 'bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/20'
+                          : b.status === 'SENDING'
+                          ? 'bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 border-blue-200 dark:border-blue-500/20'
+                          : 'bg-red-50 dark:bg-red-500/10 text-red-700 dark:text-red-400 border-red-200 dark:border-red-500/20'
+                      }`}>
+                        {b.status}
+                      </span>
+                    </td>
+                    <td className="px-5 py-4 text-xs text-slate-500 dark:text-slate-400">
+                      {b.sentAt ? new Date(b.sentAt).toLocaleString() : new Date(b.createdAt).toLocaleDateString()}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+
+      {/* Tab 2: WhatsApp Templates Library */}
+      {activeTab === 'templates' && (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {loading ? (
+            <div className="col-span-full"><ListSkeleton rows={3} /></div>
+          ) : templates.length === 0 ? (
+            <div className="col-span-full p-12 text-center rounded-2xl bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800">
+              <FileText className="w-10 h-10 text-purple-700 dark:text-purple-400 mx-auto mb-2" />
+              <p className="text-slate-700 dark:text-slate-300 font-medium">No Templates Created</p>
+              <p className="text-xs text-slate-500 dark:text-slate-400 max-w-sm mx-auto mb-4">
+                Meta requires pre-approved templates for outgoing broadcast messages outside 24-hour customer windows.
+              </p>
+              <button
+                onClick={() => setShowTemplateModal(true)}
+                className="px-4 py-2 rounded-xl bg-purple-600 hover:bg-purple-500 text-white font-semibold text-xs"
+              >
+                Create Template
+              </button>
+            </div>
+          ) : (
+            templates.map((tpl) => (
+              <div key={tpl.id} className="p-5 rounded-2xl bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 space-y-4 hover:border-purple-200 dark:border-purple-500/30 transition-all flex flex-col justify-between">
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold text-slate-900 dark:text-white text-base">{tpl.name}</span>
+                    <span className="px-2 py-0.5 rounded bg-purple-50 dark:bg-purple-500/10 text-purple-700 dark:text-purple-400 border border-purple-200 dark:border-purple-500/20 text-[10px] font-mono uppercase font-bold">
+                      {tpl.category}
+                    </span>
+                  </div>
+
+                  <div className="p-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-xs text-slate-700 dark:text-slate-300 font-sans space-y-2">
+                    <p className="whitespace-pre-wrap">{tpl.bodyText}</p>
+                    {tpl.footerText && (
+                      <p className="text-[10px] text-slate-500 dark:text-slate-400 border-t border-slate-200 dark:border-slate-800 pt-1.5">{tpl.footerText}</p>
+                    )}
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between border-t border-slate-200 dark:border-slate-800 pt-3 text-xs">
+                  <span className="text-slate-500 dark:text-slate-400 font-mono">{tpl.language}</span>
+                  <div className="flex items-center gap-2">
+                    <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold border ${
+                      tpl.status === 'APPROVED' ? 'bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/20' :
+                      tpl.status === 'REJECTED' ? 'bg-red-50 dark:bg-red-500/10 text-red-700 dark:text-red-400 border-red-200 dark:border-red-500/20' :
+                      'bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-500/20'
+                    }`}>
+                      {tpl.status || 'APPROVED'}
+                    </span>
+                    <button
+                      onClick={() => handleDeleteTemplate(tpl.id)}
+                      className="p-1 rounded text-slate-500 dark:text-slate-400 hover:text-red-600 dark:text-red-400 transition-colors"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      )}
+
+      {/* Modal 1: Create Template */}
+      {showTemplateModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-4">
+          <div className="w-full max-w-lg rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 space-y-5 animate-in fade-in zoom-in-95">
+            <div className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-3">
+              <h2 className="text-lg font-bold text-slate-900 dark:text-white flex items-center gap-2">
+                <FileText className="w-5 h-5 text-purple-700 dark:text-purple-400" /> Create WhatsApp Template
+              </h2>
+              <button onClick={() => setShowTemplateModal(false)} className="text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleCreateTemplate} className="space-y-4 text-xs">
+              <div>
+                <label className="block text-slate-600 dark:text-slate-400 font-medium mb-1">Template Name (Unique)</label>
+                <input
+                  required
+                  type="text"
+                  value={tplName}
+                  onChange={(e) => setTplName(e.target.value)}
+                  placeholder="e.g. promo_discount_offer"
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 shadow-sm text-slate-900 dark:text-white focus:border-purple-500 outline-none"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-slate-600 dark:text-slate-400 font-medium mb-1">Category</label>
+                  <select
+                    value={tplCategory}
+                    onChange={(e) => setTplCategory(e.target.value)}
+                    className="w-full px-3.5 py-2.5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shadow-sm text-slate-900 dark:text-white outline-none"
+                  >
+                    <option value="MARKETING">MARKETING</option>
+                    <option value="UTILITY">UTILITY</option>
+                    <option value="AUTHENTICATION">AUTHENTICATION</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-slate-600 dark:text-slate-400 font-medium mb-1">Language</label>
+                  <select
+                    value={tplLanguage}
+                    onChange={(e) => setTplLanguage(e.target.value)}
+                    className="w-full px-3.5 py-2.5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shadow-sm text-slate-900 dark:text-white outline-none"
+                  >
+                    <option value="en_US">English (en_US)</option>
+                    <option value="es">Spanish (es)</option>
+                    <option value="fr">French (fr)</option>
+                  </select>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-slate-600 dark:text-slate-400 font-medium mb-1">Body Text (Use {"{{1}}"} for variable parameters)</label>
+                <textarea
+                  required
+                  rows={4}
+                  value={tplBody}
+                  onChange={(e) => setTplBody(e.target.value)}
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 shadow-sm text-slate-900 dark:text-white focus:border-purple-500 outline-none font-mono"
+                />
+              </div>
+
+              <div>
+                <label className="block text-slate-600 dark:text-slate-400 font-medium mb-1">Footer Text (Optional)</label>
+                <input
+                  type="text"
+                  value={tplFooter}
+                  onChange={(e) => setTplFooter(e.target.value)}
+                  placeholder="e.g. Reply STOP to unsubscribe"
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 shadow-sm text-slate-900 dark:text-white outline-none"
+                />
+              </div>
+
+              <div className="pt-2 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowTemplateModal(false)}
+                  className="px-4 py-2.5 rounded-xl bg-slate-50 dark:bg-slate-800/60 text-slate-700 dark:text-slate-300 font-semibold"
+                >
+                  Cancel
+                </button>
+                <button
+                  disabled={creatingTemplate}
+                  type="submit"
+                  className="px-4 py-2.5 rounded-xl bg-purple-600 hover:bg-purple-500 text-white font-semibold shadow-lg shadow-purple-500/20 disabled:opacity-50"
+                >
+                  {creatingTemplate ? 'Saving...' : 'Save & Register Template'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Modal 2: Send Broadcast Campaign */}
+      {showBroadcastModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-4">
+          <div className="w-full max-w-lg rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 space-y-5 animate-in fade-in zoom-in-95">
+            <div className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-3">
+              <h2 className="text-lg font-bold text-slate-900 dark:text-white flex items-center gap-2">
+                <Send className="w-5 h-5 text-blue-700 dark:text-blue-400" /> Send Multi-Recipient WhatsApp Broadcast
+              </h2>
+              <button onClick={() => setShowBroadcastModal(false)} className="text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSendBroadcast} className="space-y-4 text-xs">
+              <div>
+                <label className="block text-slate-600 dark:text-slate-400 font-medium mb-1">Campaign Title</label>
+                <input
+                  required
+                  type="text"
+                  value={campaignName}
+                  onChange={(e) => setCampaignName(e.target.value)}
+                  placeholder="e.g. August Customer Special Offer"
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 shadow-sm text-slate-900 dark:text-white focus:border-brand-600 outline-none"
+                />
+              </div>
+
+              <div>
+                <label className="block text-slate-600 dark:text-slate-400 font-medium mb-1">Select Approved Template</label>
+                <select
+                  required
+                  value={selectedTemplateId}
+                  onChange={(e) => setSelectedTemplateId(e.target.value)}
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shadow-sm text-slate-900 dark:text-white outline-none"
+                >
+                  <option value="">-- Choose WhatsApp Template --</option>
+                  {templates.map((t) => (
+                    <option key={t.id} value={t.id}>
+                      {t.name} ({t.category})
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-slate-600 dark:text-slate-400 font-medium mb-1">Variable {"{{1}}"} Substitution</label>
+                <input
+                  type="text"
+                  value={varValue1}
+                  onChange={(e) => setVarValue1(e.target.value)}
+                  placeholder="e.g. Valued Customer"
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 shadow-sm text-slate-900 dark:text-white outline-none"
+                />
+              </div>
+
+              <div className="space-y-2 pt-1">
+                <label className="flex items-center gap-2 text-slate-700 dark:text-slate-300 font-medium cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={useAllContacts}
+                    onChange={(e) => setUseAllContacts(e.target.checked)}
+                    className="rounded bg-slate-100 dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-blue-700 focus:ring-0"
+                  />
+                  <span>
+                    {contactTotal === null
+                      ? 'Send to every citizen on this agency\u2019s record'
+                      : `Send to all ${contactTotal} citizens on this agency\u2019s record`}
+                  </span>
+                </label>
+
+                {!useAllContacts && (
+                  <div>
+                    <label className="block text-slate-600 dark:text-slate-400 font-medium mb-1">
+                      Recipient Phone Numbers (one per line or comma-separated)
+                    </label>
+                    <textarea
+                      rows={3}
+                      value={recipientsText}
+                      onChange={(e) => setRecipientsText(e.target.value)}
+                      placeholder="+2348030000000, +2348120000000"
+                      className="w-full px-3.5 py-2.5 rounded-xl bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 shadow-sm text-slate-900 dark:text-white font-mono outline-none"
+                    />
+                  </div>
+                )}
+              </div>
+
+              <div className="pt-2 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowBroadcastModal(false)}
+                  className="px-4 py-2.5 rounded-xl bg-slate-50 dark:bg-slate-800/60 text-slate-700 dark:text-slate-300 font-semibold"
+                >
+                  Cancel
+                </button>
+                <button
+                  disabled={sendingBroadcast}
+                  type="submit"
+                  className="px-4 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold shadow-lg shadow-brand-600/20 disabled:opacity-50 flex items-center gap-2"
+                >
+                  {sendingBroadcast ? 'Sending...' : <><Send className="w-4 h-4" /> Launch Broadcast</>}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

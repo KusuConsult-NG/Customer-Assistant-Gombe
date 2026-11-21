@@ -1,0 +1,716 @@
+import { Injectable, NotFoundException, BadRequestException, ConflictException } from '@nestjs/common';
+import {
+  prisma, phoneNumberVariants, BUSY_BOOKING_STATUSES,
+  isOverlapViolation, isDeadlock, withDeadlockRetry, recordAgencyAudit, type AuditActor, newReference } from '@ace/database';
+import { BookingStatus } from '@ace/shared-types';
+import { AppointmentReminderService } from './appointment-reminder.service';
+import { WorkflowTriggerService } from '../workflows/workflow-trigger.service';
+import { WebhookDispatcherService } from '../webhooks/webhook-dispatcher.service';
+
+/**
+ * Booking-conflict detection lives in `@ace/database`, not here.
+ *
+ * The orchestrator writes bookings too — it moves appointments for customers on
+ * WhatsApp — and it cannot import from `apps/api`. A second copy would be a
+ * second thing to keep correct, and being wrong means telling a customer the
+ * system broke when their slot was merely taken. Re-exported so every existing
+ * importer and test keeps working against the one implementation.
+ */
+export { isOverlapViolation, isDeadlock, withDeadlockRetry } from '@ace/database';
+
+/**
+ * How long a booking write may wait for its turn behind the slot lock.
+ *
+ * Generous because the lock serialises a pile-up: with eight callers on one
+ * slot the last of them waits for seven short transactions, not for anything
+ * slow. Prisma's own default is five seconds, which a contended burst can
+ * exceed — and a timeout here would be reported as a malfunction when the
+ * caller was simply in a queue.
+ */
+const BOOKING_LOCK_TIMEOUT_MS = 20_000;
+
+@Injectable()
+export class SchedulingService {
+  constructor(
+    private reminderService: AppointmentReminderService,
+    private workflows: WorkflowTriggerService,
+    private webhookDispatcher: WebhookDispatcherService
+  ) {}
+
+  // ─── Bookings: Read ──────────────────────────────────────────────────────────
+
+  async getBookings(organizationId: string) {
+    return prisma.booking.findMany({
+      where: { organizationId },
+      include: { contact: true },
+      orderBy: { startTime: 'asc' },
+    });
+  }
+
+  /** Find most recent active booking for a contact phone number (used by AI). */
+  async getActiveBookingByPhone(organizationId: string, phoneNumber: string) {
+    // Matches on every shape the same number might be stored under. An exact
+    // match meant a booking made over WhatsApp was invisible to the same
+    // customer calling in, because one row said "+234…" and the other "234…".
+    const contact = await prisma.contact.findFirst({
+      where: { organizationId, phoneNumber: { in: phoneNumberVariants(phoneNumber) } },
+    });
+    if (!contact) return null;
+
+    return prisma.booking.findFirst({
+      where: {
+        organizationId,
+        contactId: contact.id,
+        status: { in: ['CONFIRMED', 'RESCHEDULED'] },
+        startTime: { gte: new Date() },
+      },
+      include: { contact: true },
+      // The NEXT one, not the latest. This ordered by startTime desc with no
+      // lower bound, so a customer with an appointment this Friday and another
+      // next month was told about next month — and "cancel my appointment"
+      // cancelled next month while Friday silently stayed. Past bookings were
+      // in scope too, reported as though they were still to come.
+      orderBy: { startTime: 'asc' },
+    });
+  }
+
+  /** Find most recent active reservation for a contact phone number (used by AI). */
+  async getActiveReservationByPhone(organizationId: string, phoneNumber: string) {
+    const contact = await prisma.contact.findFirst({
+      where: { organizationId, phoneNumber: { in: phoneNumberVariants(phoneNumber) } },
+    });
+    if (!contact) return null;
+
+    return prisma.reservation.findFirst({
+      where: {
+        organizationId,
+        contactId: contact.id,
+        status: { in: ['CONFIRMED', 'RESCHEDULED'] },
+        reservationTime: { gte: new Date() },
+      },
+      include: { contact: true },
+      // The NEXT one, not the latest. This ordered by startTime desc with no
+      // lower bound, so a customer with an appointment this Friday and another
+      // next month was told about next month — and "cancel my appointment"
+      // cancelled next month while Friday silently stayed. Past bookings were
+      // in scope too, reported as though they were still to come.
+      orderBy: { reservationTime: 'asc' },
+    });
+  }
+
+  /** List all refund-request tickets for the org (REF-BK-* and REF-RS-* prefixes). */
+  async getRefundRequests(organizationId: string) {
+    return prisma.ticket.findMany({
+      where: {
+        organizationId,
+        OR: [
+          { ticketNumber: { startsWith: 'REF-BK-' } },
+          { ticketNumber: { startsWith: 'REF-RS-' } },
+        ],
+      },
+      include: { contact: true, assignedUser: true },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  // ─── Bookings: Create ─────────────────────────────────────────────────────────
+
+  async createBooking(
+    organizationId: string,
+    data: {
+      contactId: string;
+      serviceName: string;
+      staffName?: string;
+      startTime: string;
+      durationMinutes?: number;
+      notes?: string;
+    }
+  ) {
+    const start = new Date(data.startTime);
+    if (isNaN(start.getTime())) {
+      throw new BadRequestException('startTime must be a valid ISO 8601 date string');
+    }
+    if (start.getTime() < Date.now()) {
+      throw new BadRequestException('Booking time cannot be in the past');
+    }
+
+    const end = new Date(start.getTime() + (data.durationMinutes ?? 30) * 60 * 1000);
+
+    // The contact must belong to this organization — otherwise an authenticated user
+    // could attach a booking to another tenant's customer record just by id.
+    const contact = await prisma.contact.findFirst({
+      where: { id: data.contactId, organizationId },
+      select: { id: true },
+    });
+    if (!contact) throw new NotFoundException('Contact not found');
+
+    // Check the slot is free before promising it.
+    //
+    // This check did not exist: any number of bookings could be written over the same
+    // half hour with the same staff member, and every one of them received a
+    // "confirmed" email. Two customers turning up for the same slot is a failure the
+    // customer discovers in the waiting room.
+    const conflict = await this.findConflictingBooking(organizationId, start, end, data.staffName);
+    if (conflict) {
+      throw new ConflictException(
+        `That slot is already taken by ${conflict.serviceName} ` +
+        `(${conflict.startTime.toLocaleString('en-NG', { timeZone: 'Africa/Lagos' })})` +
+        (data.staffName ? ` for ${data.staffName}` : '') +
+        '. Please choose another time.'
+      );
+    }
+
+    // ── Why the write takes a lock before it touches the table ─────────────
+    //
+    // The check above is a read-then-write race: under concurrency every
+    // in-flight request passes it before any of them commits (measured: 8
+    // simultaneous requests all created a booking in the same slot). The
+    // `bookings_no_staff_overlap` EXCLUSION constraint is what actually
+    // guarantees exclusivity, and it still does.
+    //
+    // But leaving the constraint to settle a PILE-UP is not free. Eight
+    // writers contending on one GiST exclusion key do not queue politely:
+    // PostgreSQL resolves the tangle by aborting transactions with 40P01, and
+    // it does not even look for the cycle until `deadlock_timeout` — a second,
+    // by default. Retrying is correct but racy in a way that matters: a loser
+    // can exhaust its attempts BEFORE any winner has committed, so asking the
+    // diary afterwards finds nothing, and a caller whose slot was merely taken
+    // is told the system broke and handed to a human. CI reproduced exactly
+    // that, twice.
+    //
+    // So the contention is removed instead of survived. A transaction-scoped
+    // advisory lock keyed on the agency, the staff member and the slot makes
+    // the writers queue; with the lock held, one read is authoritative, so the
+    // answer is either a real conflict or an insert that cannot collide. The
+    // lock is released by commit or rollback, so nothing can leak it, and two
+    // different slots that happen to hash together merely take turns.
+    //
+    // The constraint and the deadlock retry both stay. This makes them rare
+    // rather than redundant: the constraint is still the only thing that can
+    // guarantee exclusivity against a writer that does not pass through here.
+    const lockKey = `${organizationId}|${data.staffName ?? ''}|${start.toISOString()}`;
+
+    let booking;
+    try {
+      booking = await withDeadlockRetry(() =>
+        prisma.$transaction(
+          async (tx) => {
+            // `$executeRaw`, not `$queryRaw`: the function returns void, and
+            // Prisma cannot deserialise a void column.
+            await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey})::bigint)`;
+
+            // Authoritative now: every competing writer is either behind this
+            // lock or already committed.
+            const taken = await tx.booking.findFirst({
+              where: {
+                organizationId,
+                ...(data.staffName ? { staffName: data.staffName } : {}),
+                status: { in: BUSY_BOOKING_STATUSES as unknown as string[] } as any,
+                startTime: { lt: end },
+                endTime: { gt: start },
+              },
+              select: { id: true },
+            });
+            if (taken) {
+              throw new ConflictException(
+                'That slot was just taken by another booking. Please choose another time.'
+              );
+            }
+
+            return tx.booking.create({
+              data: {
+                organizationId,
+                reference: await newReference(tx.booking, organizationId),
+                contactId: data.contactId,
+                serviceName: data.serviceName,
+                staffName: data.staffName,
+                startTime: start,
+                endTime: end,
+                notes: data.notes,
+                status: BookingStatus.CONFIRMED,
+              },
+              include: { contact: true },
+            });
+          },
+          { timeout: BOOKING_LOCK_TIMEOUT_MS }
+        )
+      );
+    } catch (err: any) {
+      // A conflict raised inside the transaction is the answer, not a failure.
+      if (err instanceof ConflictException) throw err;
+      if (isOverlapViolation(err)) {
+        throw new ConflictException(
+          'That slot was just taken by another booking. Please choose another time.'
+        );
+      }
+      // A deadlock that still survived every retry is an ANSWERABLE question:
+      // 40P01 means the write was rolled back, not rejected, so nothing has
+      // been said about whether the slot is free. Ask the diary before
+      // reporting a malfunction.
+      if (isDeadlock(err)) {
+        const taken = await this.findConflictingBooking(organizationId, start, end, data.staffName);
+        if (taken) {
+          throw new ConflictException(
+            'That slot was just taken by another booking. Please choose another time.'
+          );
+        }
+      }
+      throw err;
+    }
+
+    if (booking.contact?.email) {
+      this.reminderService.sendBookingConfirmationAndReceiptEmail(booking.id).catch(() => {});
+    }
+
+    this.workflows.emitAsync(organizationId, 'BOOKING_CONFIRMED', {
+      bookingId: booking.id,
+      serviceName: booking.serviceName,
+      staffName: booking.staffName,
+      startTime: booking.startTime.toISOString(),
+      contactId: booking.contactId,
+      contact: booking.contact
+        ? { id: booking.contact.id, fullName: booking.contact.fullName, phoneNumber: booking.contact.phoneNumber, email: booking.contact.email }
+        : undefined,
+    });
+
+    // The tenant's own system hears about it too. A workflow trigger fires
+    // inside this deployment; `appointment.booked` is how an agency's existing
+    // diary, queue or SMS system learns of an appointment it has to honour.
+    // Fire-and-forget on purpose: the booking is written and the citizen has
+    // been told, so a webhook problem must not surface as a failed booking.
+    this.webhookDispatcher.appointmentBooked(organizationId, booking.id).catch(() => {});
+
+    return booking;
+  }
+
+  /**
+   * Returns an overlapping CONFIRMED/RESCHEDULED booking, if any.
+   *
+   * Overlap test is the standard half-open interval comparison
+   * (existing.start < new.end AND existing.end > new.start), which correctly treats
+   * back-to-back bookings as non-conflicting.
+   */
+  private async findConflictingBooking(
+    organizationId: string,
+    start: Date,
+    end: Date,
+    staffName?: string,
+    excludeBookingId?: string
+  ) {
+    return prisma.booking.findFirst({
+      where: {
+        organizationId,
+        ...(staffName ? { staffName } : {}),
+        ...(excludeBookingId ? { NOT: { id: excludeBookingId } } : {}),
+        status: { in: [BookingStatus.CONFIRMED, BookingStatus.RESCHEDULED] },
+        startTime: { lt: end },
+        endTime: { gt: start },
+      },
+      select: { id: true, serviceName: true, startTime: true },
+    });
+  }
+
+  // ─── Bookings: Cancel ─────────────────────────────────────────────────────────
+
+  async cancelBooking(
+    organizationId: string,
+    bookingId: string,
+    reason?: string,
+    actor: AuditActor = 'system:orchestrator'
+  ) {
+    const booking = await prisma.booking.findFirst({
+      where: { id: bookingId, organizationId },
+      include: { contact: true },
+    });
+    if (!booking) throw new NotFoundException(`Booking ${bookingId} not found`);
+    if (booking.status === 'CANCELLED') {
+      throw new BadRequestException('This booking is already cancelled');
+    }
+    if (booking.status === 'COMPLETED') {
+      throw new BadRequestException('Completed bookings cannot be cancelled — request a refund instead');
+    }
+
+    // Append rather than overwrite. Replacing `notes` wholesale destroyed whatever
+    // the operator had written there AND the [REMINDED_72H]/[REMINDED_48H] markers
+    // that AppointmentReminderService uses for idempotency.
+    const cancellationNote = reason ? `Cancelled by customer: ${reason}` : 'Cancelled by customer';
+
+    const cancelled = await prisma.booking.update({
+      where: { id: bookingId },
+      data: {
+        status: BookingStatus.CANCELLED,
+        notes: [booking.notes, cancellationNote].filter(Boolean).join('\n'),
+        updatedAt: new Date(),
+      },
+      include: { contact: true },
+    });
+
+    // The time that was given up, so "what appointment did this citizen
+    // lose" survives the cancellation.
+    await recordAgencyAudit(actor, organizationId, {
+      action: 'agency.booking.cancelled',
+      targetType: 'Booking',
+      targetId: bookingId,
+      previousValue: { status: booking.status, startTime: booking.startTime },
+      newValue: { status: cancelled.status, reason: reason ?? null },
+    });
+
+    return cancelled;
+  }
+
+  // ─── Bookings: Reschedule ─────────────────────────────────────────────────────
+
+  async rescheduleBooking(
+    organizationId: string,
+    bookingId: string,
+    newStartTime: string,
+    durationMinutes = 30,
+    actor: AuditActor = 'system:orchestrator'
+  ) {
+    const booking = await prisma.booking.findFirst({
+      where: { id: bookingId, organizationId },
+      include: { contact: true },
+    });
+    if (!booking) throw new NotFoundException(`Booking ${bookingId} not found`);
+    if (booking.status === 'CANCELLED') {
+      throw new BadRequestException('Cannot reschedule a cancelled booking — please create a new one');
+    }
+    if (booking.status === 'COMPLETED') {
+      throw new BadRequestException('Cannot reschedule a completed booking');
+    }
+
+    const start = new Date(newStartTime);
+    if (isNaN(start.getTime())) {
+      throw new BadRequestException('Invalid newStartTime — must be a valid ISO 8601 date string');
+    }
+    if (start < new Date()) {
+      throw new BadRequestException('New booking time cannot be in the past');
+    }
+
+    const end = new Date(start.getTime() + durationMinutes * 60 * 1000);
+
+    const conflict = await this.findConflictingBooking(
+      organizationId, start, end, booking.staffName ?? undefined, bookingId
+    );
+    if (conflict) {
+      throw new ConflictException(
+        `That slot is already taken by ${conflict.serviceName} ` +
+        `(${conflict.startTime.toLocaleString('en-NG', { timeZone: 'Africa/Lagos' })}). ` +
+        'Please choose another time.'
+      );
+    }
+
+    let moved;
+    try {
+      moved = await withDeadlockRetry(() => prisma.booking.update({
+        where: { id: bookingId },
+        data: {
+          status: BookingStatus.RESCHEDULED,
+          startTime: start,
+          endTime: end,
+          updatedAt: new Date(),
+        },
+        include: { contact: true },
+      }));
+    } catch (err: any) {
+      if (isOverlapViolation(err)) {
+        throw new ConflictException(
+          'That slot was just taken by another booking. Please choose another time.'
+        );
+      }
+      // A deadlock that survived every retry is still an ANSWERABLE question.
+      //
+      // 40P01 means the write was rolled back, not that it was rejected — so
+      // nothing has been said about whether the slot is free. Under real
+      // contention (eight callers on one slot, each collision costing a second
+      // of server-side detection) the retries can run out before the
+      // constraint ever gets to speak, and the caller was then told "I could
+      // not complete that just now" and handed to a human, when the true
+      // answer was simply "that time is taken".
+      //
+      // So ask the database what is actually there now. Only a booking that
+      // really occupies the slot produces the conflict; anything else is a
+      // genuine failure and is reported as one.
+      if (isDeadlock(err)) {
+        const taken = await this.findConflictingBooking(
+          organizationId, start, end, booking.staffName ?? undefined, bookingId
+        );
+        if (taken) {
+          throw new ConflictException(
+            'That slot was just taken by another booking. Please choose another time.'
+          );
+        }
+      }
+      throw err;
+    }
+
+    // Recorded only after the write succeeded. A slot lost to the exclusion
+    // constraint is not a reschedule, and an audit row for one would describe
+    // a move that never happened.
+    await recordAgencyAudit(actor, organizationId, {
+      action: 'agency.booking.rescheduled',
+      targetType: 'Booking',
+      targetId: bookingId,
+      previousValue: { startTime: booking.startTime, status: booking.status },
+      newValue: { startTime: moved.startTime, status: moved.status },
+    });
+
+    return moved;
+  }
+
+  // ─── Bookings: Refund Request ─────────────────────────────────────────────────
+
+  async requestBookingRefund(organizationId: string, bookingId: string, reason: string) {
+    const booking = await prisma.booking.findFirst({
+      where: { id: bookingId, organizationId },
+      include: { contact: true },
+    });
+    if (!booking) throw new NotFoundException(`Booking ${bookingId} not found`);
+
+    const ticketNumber = `REF-BK-${Date.now().toString().slice(-6)}-${Math.random().toString(36).slice(2, 5).toUpperCase()}`;
+    const ticket = await prisma.ticket.create({
+      data: {
+        organizationId,
+        contactId: booking.contactId,
+        ticketNumber,
+        subject: `Refund Request — Booking #${bookingId.slice(-8).toUpperCase()} (${booking.serviceName})`,
+        description:
+          `Customer requested a refund for booking of "${booking.serviceName}" ` +
+          `scheduled on ${booking.startTime.toLocaleString('en-NG', { timeZone: 'Africa/Lagos' })}.\n\n` +
+          `Booking ID: ${bookingId}\n` +
+          `Contact: ${booking.contact.fullName} (${booking.contact.phoneNumber})\n\n` +
+          `Reason: ${reason}`,
+        status: 'OPEN',
+        priority: 'HIGH',
+        updatedAt: new Date(),
+      },
+    });
+
+    // Automatically cancel the booking so slot is freed
+    if (!['CANCELLED', 'COMPLETED'].includes(booking.status)) {
+      await prisma.booking.update({
+        where: { id: bookingId },
+        data: {
+          status: BookingStatus.CANCELLED,
+          notes: [booking.notes, `Refund requested (${ticketNumber}): ${reason}`].filter(Boolean).join('\n'),
+          updatedAt: new Date(),
+        },
+      });
+    }
+
+    return { ticketId: ticket.id, ticketNumber, bookingId, status: 'REFUND_REQUESTED' };
+  }
+
+  // ─── Bookings: Legacy status update ──────────────────────────────────────────
+
+  async updateBookingStatus(
+    bookingId: string,
+    status: BookingStatus,
+    organizationId: string,
+    actor: AuditActor = 'system:orchestrator'
+  ) {
+    const booking = await prisma.booking.findFirst({ where: { id: bookingId, organizationId } });
+    if (!booking) throw new NotFoundException('Booking not found');
+    const updated = await prisma.booking.update({
+      where: { id: bookingId },
+      data: { status, updatedAt: new Date() },
+    });
+
+    await recordAgencyAudit(actor, organizationId, {
+      action: 'agency.booking.status_changed',
+      targetType: 'Booking',
+      targetId: bookingId,
+      previousValue: { status: booking.status },
+      newValue: { status: updated.status },
+    });
+
+    return updated;
+  }
+
+  // ─── Reservations: Read ───────────────────────────────────────────────────────
+
+  async getReservations(organizationId: string) {
+    return prisma.reservation.findMany({
+      where: { organizationId },
+      include: { contact: true },
+      orderBy: { reservationTime: 'asc' },
+    });
+  }
+
+  // ─── Reservations: Create ─────────────────────────────────────────────────────
+
+  async createReservation(
+    organizationId: string,
+    data: {
+      contactId: string;
+      partySize: number;
+      reservationTime: string;
+      tableOrRoomNumber?: string;
+      specialRequests?: string;
+    }
+  ) {
+    const contact = await prisma.contact.findFirst({
+      where: { id: data.contactId, organizationId },
+      select: { id: true },
+    });
+    if (!contact) throw new NotFoundException('Contact not found');
+
+    const reservationTime = new Date(data.reservationTime);
+    if (isNaN(reservationTime.getTime())) {
+      throw new BadRequestException('reservationTime must be a valid ISO 8601 date string');
+    }
+    if (!Number.isInteger(data.partySize) || data.partySize < 1 || data.partySize > 100) {
+      throw new BadRequestException('partySize must be a whole number between 1 and 100');
+    }
+
+    return prisma.reservation.create({
+      data: {
+        organizationId,
+        contactId: data.contactId,
+        partySize: data.partySize,
+        reservationTime,
+        tableOrRoomNumber: data.tableOrRoomNumber,
+        specialRequests: data.specialRequests,
+        status: BookingStatus.CONFIRMED,
+        updatedAt: new Date(),
+      },
+      include: { contact: true },
+    });
+  }
+
+  // ─── Reservations: Cancel ─────────────────────────────────────────────────────
+
+  async cancelReservation(
+    organizationId: string,
+    reservationId: string,
+    reason?: string,
+    actor: AuditActor = 'system:orchestrator'
+  ) {
+    const reservation = await prisma.reservation.findFirst({
+      where: { id: reservationId, organizationId },
+      include: { contact: true },
+    });
+    if (!reservation) throw new NotFoundException(`Reservation ${reservationId} not found`);
+    if (reservation.status === 'CANCELLED') {
+      throw new BadRequestException('This reservation is already cancelled');
+    }
+    if (reservation.status === 'COMPLETED') {
+      throw new BadRequestException('Completed reservations cannot be cancelled — request a refund instead');
+    }
+
+    const cancellationNote = reason ? `Cancelled by customer: ${reason}` : 'Cancelled by customer';
+
+    const cancelled = await prisma.reservation.update({
+      where: { id: reservationId },
+      data: {
+        status: BookingStatus.CANCELLED,
+        specialRequests: [reservation.specialRequests, cancellationNote].filter(Boolean).join('\n'),
+        updatedAt: new Date(),
+      },
+      include: { contact: true },
+    });
+
+    await recordAgencyAudit(actor, organizationId, {
+      action: 'agency.reservation.cancelled',
+      targetType: 'Reservation',
+      targetId: reservationId,
+      previousValue: { status: reservation.status, reservationTime: reservation.reservationTime },
+      newValue: { status: cancelled.status, reason: reason ?? null },
+    });
+
+    return cancelled;
+  }
+
+  // ─── Reservations: Reschedule ─────────────────────────────────────────────────
+
+  async rescheduleReservation(
+    organizationId: string,
+    reservationId: string,
+    newReservationTime: string,
+    actor: AuditActor = 'system:orchestrator'
+  ) {
+    const reservation = await prisma.reservation.findFirst({
+      where: { id: reservationId, organizationId },
+      include: { contact: true },
+    });
+    if (!reservation) throw new NotFoundException(`Reservation ${reservationId} not found`);
+    if (reservation.status === 'CANCELLED') {
+      throw new BadRequestException('Cannot reschedule a cancelled reservation');
+    }
+    if (reservation.status === 'COMPLETED') {
+      throw new BadRequestException('Cannot reschedule a completed reservation');
+    }
+
+    const newTime = new Date(newReservationTime);
+    if (isNaN(newTime.getTime())) {
+      throw new BadRequestException('Invalid newReservationTime — must be a valid ISO 8601 date string');
+    }
+    if (newTime < new Date()) {
+      throw new BadRequestException('New reservation time cannot be in the past');
+    }
+
+    const moved = await prisma.reservation.update({
+      where: { id: reservationId },
+      data: {
+        status: BookingStatus.RESCHEDULED,
+        reservationTime: newTime,
+        updatedAt: new Date(),
+      },
+      include: { contact: true },
+    });
+
+    await recordAgencyAudit(actor, organizationId, {
+      action: 'agency.reservation.rescheduled',
+      targetType: 'Reservation',
+      targetId: reservationId,
+      previousValue: { reservationTime: reservation.reservationTime, status: reservation.status },
+      newValue: { reservationTime: moved.reservationTime, status: moved.status },
+    });
+
+    return moved;
+  }
+
+  // ─── Reservations: Refund Request ─────────────────────────────────────────────
+
+  async requestReservationRefund(organizationId: string, reservationId: string, reason: string) {
+    const reservation = await prisma.reservation.findFirst({
+      where: { id: reservationId, organizationId },
+      include: { contact: true },
+    });
+    if (!reservation) throw new NotFoundException(`Reservation ${reservationId} not found`);
+
+    const ticketNumber = `REF-RS-${Date.now().toString().slice(-6)}-${Math.random().toString(36).slice(2, 5).toUpperCase()}`;
+    const ticket = await prisma.ticket.create({
+      data: {
+        organizationId,
+        contactId: reservation.contactId,
+        ticketNumber,
+        subject: `Refund Request — Reservation #${reservationId.slice(-8).toUpperCase()} (Party of ${reservation.partySize})`,
+        description:
+          `Customer requested a refund for a reservation for *${reservation.partySize} guest(s)* ` +
+          `at ${reservation.reservationTime.toLocaleString('en-NG', { timeZone: 'Africa/Lagos' })}.\n\n` +
+          `Reservation ID: ${reservationId}\n` +
+          `Table/Room: ${reservation.tableOrRoomNumber ?? 'Unassigned'}\n` +
+          `Contact: ${reservation.contact.fullName} (${reservation.contact.phoneNumber})\n\n` +
+          `Reason: ${reason}`,
+        status: 'OPEN',
+        priority: 'HIGH',
+        updatedAt: new Date(),
+      },
+    });
+
+    // Automatically cancel the reservation
+    if (!['CANCELLED', 'COMPLETED'].includes(reservation.status)) {
+      await prisma.reservation.update({
+        where: { id: reservationId },
+        data: {
+          status: BookingStatus.CANCELLED,
+          specialRequests: [reservation.specialRequests, `Refund requested (${ticketNumber}): ${reason}`].filter(Boolean).join('\n'),
+          updatedAt: new Date(),
+        },
+      });
+    }
+
+    return { ticketId: ticket.id, ticketNumber, reservationId, status: 'REFUND_REQUESTED' };
+  }
+}

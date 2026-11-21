@@ -1,0 +1,550 @@
+"use client";
+import './globals.css';
+import { OfficerPhone } from '@/components/OfficerPhone';
+import React, { useEffect, useState, useRef } from 'react';
+import Link from 'next/link';
+import { usePathname, useRouter } from 'next/navigation';
+import {
+  LayoutDashboard,
+  BarChart3,
+  MessageSquareText,
+  MessageCircle,
+  Users,
+  BookOpen,
+  Settings,
+  Building2,
+  Sparkles,
+  LogOut,
+  Calendar,
+  PhoneCall,
+  ChevronRight,
+  Bell,
+  Menu,
+  X,
+  GitFork,
+  Sun,
+  Moon,
+  Landmark,
+  Briefcase,
+  ClipboardList,
+  Bot
+} from 'lucide-react';
+import { io } from 'socket.io-client';
+
+import { API_URL, clearSession, refreshSession } from '@/lib/api';
+import { ToastProvider } from '@/components/ui/Toast';
+import { canView, storedRole, type Role } from '@/lib/roles';
+
+/**
+ * Routes reachable without a session.
+ */
+const PUBLIC_ROUTES = [
+  '/login',
+  '/register',
+  '/forgot-password',
+  '/reset-password',
+  '/verify-email',
+  '/setup-account',
+  '/selfie',
+  // '/pay' was here until the payment layer was subtracted. The page is gone
+  // and nothing serves that path, so listing it only invited someone to
+  // assume a public payment route still exists.
+];
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  const pathname = usePathname();
+  const router = useRouter();
+  const [mounted, setMounted] = useState(false);
+  const [theme, setTheme] = useState<'light' | 'dark'>('dark');
+  const [user, setUser] = useState<{ fullName?: string; email?: string; role?: string; organizationName?: string; isPlatformAdmin?: boolean; logoUrl?: string } | null>(null);
+  // Read from the stored session, not from `user.role` alone, so an older
+  // session with no role recorded falls back to showing everything rather than
+  // hiding the dashboard from somebody entitled to it.
+  const role: Role | undefined = (user?.role as Role | undefined) ?? storedRole();
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [notifications, setNotifications] = useState<any[]>([]);
+  const [showNotifications, setShowNotifications] = useState(false);
+  const didRedirect = useRef(false);
+
+  const unreadCount = notifications.filter(n => !n.read).length;
+
+  useEffect(() => {
+    // Load theme preference
+    const savedTheme = localStorage.getItem('ace_theme') as 'light' | 'dark' | null;
+    if (savedTheme) {
+      setTheme(savedTheme);
+    } else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) {
+      setTheme('light');
+    }
+  }, []);
+
+  const toggleTheme = () => {
+    const nextTheme = theme === 'dark' ? 'light' : 'dark';
+    setTheme(nextTheme);
+    localStorage.setItem('ace_theme', nextTheme);
+  };
+
+  useEffect(() => {
+    const token = localStorage.getItem('ace_token');
+    if (!token) return;
+
+    // Connect to the '/events' NAMESPACE, where AgentConsoleGateway actually lives.
+    // This used to call io(API_URL), landing on the default '/' namespace — which has
+    // no gateway at all — and then listen for 'new_message' / 'new_call', names the
+    // server never emits (it emits 'new_message_received' and 'call_status_updated').
+    // The bell icon could therefore never show a single notification.
+    const socket = io(`${API_URL}/events`, {
+      auth: { token },
+      transports: ['websocket', 'polling'],
+    });
+
+    const push = (type: string, text: string) => {
+      setNotifications(prev => [
+        { type, text, timestamp: new Date().toISOString(), read: false },
+        ...prev,
+      ].slice(0, 20));
+    };
+
+    socket.on('new_message_received', (data: any) =>
+      push('message', data?.message?.content ? `New message: ${String(data.message.content).slice(0, 60)}` : 'New message received'));
+    socket.on('call_status_updated', (data: any) =>
+      push('call', `Call ${data?.status ?? 'updated'}`));
+    socket.on('conversation_takeover_updated', () =>
+      push('handoff', 'A conversation was handed to an agent'));
+    socket.on('new_ticket', (data: any) =>
+      push('ticket', data?.subject ? `New ticket: ${data.subject}` : 'New support ticket'));
+    socket.on('new_lead', () => push('lead', 'New lead captured'));
+    socket.on('unauthorized', () => socket.disconnect());
+
+    return () => { socket.disconnect(); };
+  }, []);
+
+  useEffect(() => {
+    setMounted(true);
+  }, []);
+
+  /**
+   * Re-read the stored identity on every navigation.
+   *
+   * This ran once on mount with an empty dependency array. The layout is not
+   * remounted by client-side navigation, so after signing in — which writes
+   * `ace_user` and then router.push('/') — the effect never ran again and the
+   * sidebar kept showing the "My Organization" / "Administrator" placeholders until
+   * the user happened to do a full page reload. Verified in the browser: the header
+   * greeted "Browser QA Clinic" while the sidebar still said "My Organization".
+   *
+   * Also listens for `storage` so signing out in one tab updates the others.
+   */
+  useEffect(() => {
+    const readUser = () => {
+      try {
+        const stored = localStorage.getItem('ace_user');
+        setUser(stored ? JSON.parse(stored) : null);
+      } catch {
+        setUser(null);
+      }
+    };
+
+    readUser();
+    window.addEventListener('storage', readUser);
+    return () => window.removeEventListener('storage', readUser);
+  }, [pathname]);
+
+  useEffect(() => {
+    const checkAuth = async () => {
+      const token = localStorage.getItem('ace_token');
+      const refreshToken = localStorage.getItem('ace_refresh_token');
+      const isPublic = PUBLIC_ROUTES.some(r => pathname === r || pathname.startsWith(r + '/'));
+
+      if (!token && !isPublic) {
+        if (refreshToken) {
+          const refreshed = await refreshSession();
+          if (refreshed) return;
+        }
+        if (!didRedirect.current) {
+          didRedirect.current = true;
+          router.replace('/login');
+        }
+      } else if (token && pathname === '/login') {
+        router.replace('/');
+      }
+    };
+
+    checkAuth();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pathname]);
+
+  const handleLogout = async () => {
+    // Tell the server first so the token is actually revoked. Clearing localStorage
+    // alone left the access AND refresh tokens valid for their full lifetime — a
+    // token copied from a shared machine kept working after "signing out".
+    const token = localStorage.getItem('ace_token');
+    if (token) {
+      try {
+        await fetch(`${API_URL}/api/auth/logout`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+        });
+      } catch {
+        // Network failure must not trap the user in a signed-in UI.
+      }
+    }
+    clearSession();
+    router.replace('/login');
+  };
+
+  const isAuthPage = PUBLIC_ROUTES.some(r => pathname === r || pathname?.startsWith(r + '/'));
+
+  const initials = user?.fullName
+    ? user.fullName.split(' ').map((n: string) => n[0]).join('').slice(0, 2).toUpperCase()
+    : 'AD';
+
+  return (
+    <html lang="en" className={theme}>
+      <head>
+        <title>Customer Care Platform</title>
+        <meta name="description" content="Citizen customer care for State ministries, departments and agencies — conversations, cases, appointments and reporting." />
+        {/*
+          No webfont is fetched from a CDN.
+
+          This used to load Inter from fonts.googleapis.com with a
+          render-blocking stylesheet link. That put a third-party request on
+          the critical path of every page: on a machine without internet — an
+          offline demo, a locked-down corporate network, a Nigerian office on a
+          dropped connection — the request hangs or resets and the page renders
+          in a fallback face anyway, just later. It is also a privacy leak, as
+          every visitor's IP reaches Google on every page load.
+
+          The declaration below is unchanged from when the link tag was here,
+          deliberately: it is what already rendered whenever the CDN was slow
+          or blocked, so removing the request changes no metrics. A wider
+          fallback chain was tried and rejected — it re-flowed the sidebar and
+          truncated labels like "WhatsApp Broadcasts". To ship Inter itself,
+          commit the woff2 files and load them with next/font/local —
+          self-hosted, still no CDN.
+        */}
+      </head>
+      <body className={`min-h-screen flex flex-col antialiased transition-colors duration-200 ${
+        theme === 'dark' ? 'bg-[#0b0f19] text-slate-100' : 'bg-slate-50 text-slate-900'
+      }`} style={{ fontFamily: "'Inter', sans-serif" }}>
+        <ToastProvider>
+        {!mounted ? (
+          <div className="flex min-h-screen items-center justify-center">
+            <div className="flex flex-col items-center gap-4">
+              <div className="w-12 h-12 rounded-2xl flex items-center justify-center shadow-lg shadow-brand-500/30 animate-pulse" style={{ background: 'linear-gradient(135deg, #3b6102, #4d7d02)' }}>
+                <Sparkles className="w-6 h-6 text-white" />
+              </div>
+              <div className="w-6 h-6 rounded-full border-2 border-brand-600 dark:border-brand-400 border-t-transparent animate-spin" />
+            </div>
+          </div>
+        ) : isAuthPage ? (
+          <div className="w-full min-h-screen flex flex-col">
+            {children}
+          </div>
+        ) : (
+          <div className="flex h-screen overflow-hidden relative">
+            {/* The officer's phone. Mounted in the SHELL, not on one page, so
+                a citizen's call reaches whoever is signed in wherever they
+                happen to be working. Renders nothing at all on a deployment
+                that has not switched browser answering on. */}
+            <OfficerPhone />
+            {/* Ambient Background Glows */}
+            <div className="absolute top-0 left-1/4 w-96 h-96 bg-brand-500/10 dark:bg-brand-600/10 rounded-full blur-3xl pointer-events-none" />
+            <div className="absolute bottom-0 right-1/4 w-96 h-96 bg-brand-600/10 dark:bg-brand-500/5 rounded-full blur-3xl pointer-events-none" />
+
+            {/* Sidebar Mobile Overlay */}
+            {sidebarOpen && (
+              <div 
+                className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-40 md:hidden" 
+                onClick={() => setSidebarOpen(false)} 
+              />
+            )}
+
+            {/* Sidebar */}
+            <aside className={`fixed md:relative z-50 w-64 h-full flex-shrink-0 flex flex-col justify-between transition-all duration-300 ${
+              theme === 'dark' 
+                ? 'bg-[#0f172a]/95 border-r border-slate-800/80' 
+                : 'bg-white/90 border-r border-slate-200/80 shadow-sm'
+            } backdrop-blur-xl ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'} md:translate-x-0`}>
+              <button 
+                className="md:hidden absolute top-4 right-4 text-slate-500 dark:text-slate-400 hover:text-slate-200 z-50 p-1"
+                onClick={() => setSidebarOpen(false)}
+              >
+                <X className="w-5 h-5" />
+              </button>
+
+              {/* Top section */}
+              <div className="flex flex-col h-full">
+                {/* Logo */}
+                <div className={`flex items-center gap-3.5 px-6 py-5 border-b ${theme === 'dark' ? 'border-slate-800/80' : 'border-slate-200/80'}`}>
+                  {/* `shrink-0`: with the text now allowed to shrink, flex
+                      would otherwise squash the logo tile into an oval. */}
+                  <div className="w-10 h-10 rounded-xl flex items-center justify-center shadow-lg shrink-0" style={{ background: 'linear-gradient(135deg, #3b6102, #4d7d02)' }}>
+                    {/* A neutral mark. This was a health cross, which is a
+                        claim about what the agency does — wrong for a lands
+                        registry or a revenue board. An agency that uploads a
+                        logo shows that instead. */}
+                    {user?.logoUrl ? (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img src={user.logoUrl} alt="" className="w-6 h-6 object-contain" />
+                    ) : (
+                      <Landmark className="w-6 h-6 text-white" />
+                    )}
+                  </div>
+                  {/* `min-w-0` is what makes the `truncate` below work.
+                      A flex item defaults to min-width:auto, so this wrapper
+                      refused to shrink below its content and the heading grew
+                      past the sidebar instead of ellipsising — measured at
+                      297px of name inside a 288px rail. An agency named
+                      "Gombe State Citizen Information Center" therefore
+                      overlapped the portal label under it. Agency names come
+                      from the database and are as long as the agency is. */}
+                  <div className="min-w-0 flex-1">
+                    <h1 className={`font-bold text-base tracking-tight leading-tight truncate ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>{user?.organizationName || 'Customer Care'}</h1>
+                    <p className="text-[11px] font-medium text-brand-700 dark:text-brand-300 truncate">Citizen Care Portal</p>
+                  </div>
+                </div>
+
+                {/* Org badge */}
+                <div className={`mx-4 mt-4 mb-2 px-3.5 py-2.5 rounded-xl flex items-center justify-between border ${
+                  theme === 'dark' 
+                    ? 'bg-slate-800/40 border-slate-700/50' 
+                    : 'bg-slate-100/80 border-slate-200'
+                }`}>
+                  <div className="flex items-center gap-2 overflow-hidden min-w-0">
+                    <Building2 className="w-4 h-4 text-brand-700 dark:text-brand-300 flex-shrink-0" />
+                    <span className={`text-xs font-semibold truncate ${theme === 'dark' ? 'text-slate-200' : 'text-slate-800'}`}>
+                      {user?.organizationName || 'Your agency'}
+                    </span>
+                  </div>
+                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 font-bold tracking-wider flex-shrink-0 ml-2 border border-emerald-500/20">LIVE</span>
+                </div>
+
+                {/* Nav */}
+                {/* Role-aware. A front-desk officer used to be shown the
+                    agency's whole administration surface — System Settings,
+                    Branding, Agent Provisioning, Workflows, Broadcasts — and
+                    learned it was not theirs by clicking a button and getting a
+                    403 back. The server rules were right; the dashboard simply
+                    did not reflect them.
+
+                    Like the platform link below, this is what to OFFER, not a
+                    permission: `ace_user` is editable, so every screen still
+                    calls the API and still renders whatever refusal it gets. */}
+                <nav className="flex-1 px-3.5 py-3 space-y-1 overflow-y-auto">
+                  {(() => {
+                    const link = (href: string, icon: React.ReactNode, label: string) =>
+                      canView(href, role) ? (
+                        <SidebarLink key={href} href={href} icon={icon} label={label} pathname={pathname} theme={theme} onClick={() => setSidebarOpen(false)} />
+                      ) : null;
+                    // A heading with nothing under it is a section that looks
+                    // broken rather than one that does not apply.
+                    const section = (title: string, links: React.ReactNode[]) =>
+                      links.some(Boolean) ? (
+                        <React.Fragment key={title}>
+                          <p className="text-[10px] font-bold uppercase tracking-widest text-slate-500 dark:text-slate-400 px-3 py-1.5 mt-4 first:mt-1">{title}</p>
+                          {links}
+                        </React.Fragment>
+                      ) : null;
+
+                    return (
+                      <>
+                        {section('Service', [
+                          link('/', <LayoutDashboard className="w-4 h-4" />, 'Dashboard'),
+                          link('/analytics', <BarChart3 className="w-4 h-4" />, 'Analytics'),
+                          link('/crm', <Users className="w-4 h-4" />, 'Citizens & Contacts'),
+                          link('/agent-console', <MessageSquareText className="w-4 h-4" />, 'Agent Console'),
+                          link('/conversations', <MessageCircle className="w-4 h-4" />, 'Live Conversations'),
+                          link('/knowledge', <BookOpen className="w-4 h-4" />, 'Knowledge & FAQs'),
+                          link('/workflows', <GitFork className="w-4 h-4" />, 'Automation Workflows'),
+                        ])}
+
+                        {section('Channels', [
+                          link('/broadcasts', <MessageSquareText className="w-4 h-4" />, 'WhatsApp Broadcasts'),
+                          link('/telephony', <PhoneCall className="w-4 h-4" />, 'Telephone Service'),
+                          link('/scheduling', <Calendar className="w-4 h-4" />, 'Appointments'),
+                          link('/callbacks', <PhoneCall className="w-4 h-4" />, 'Callback Queue'),
+                          link('/cases', <ClipboardList className="w-4 h-4" />, 'Cases'),
+                          link('/agent-provisioning', <Bot className="w-4 h-4" />, 'Agent Provisioning'),
+                        ])}
+
+                        {/* Shown only to a platform operator. This is a
+                            CONVENIENCE, not a permission — localStorage is
+                            editable, and every /api/platform/* route re-checks
+                            the flag against the database. Someone who forces
+                            their way to the page gets a plain "unavailable"
+                            panel, not a broken dashboard. */}
+                        {user?.isPlatformAdmin && (
+                          <>
+                            <p className="text-[10px] font-bold uppercase tracking-widest text-slate-500 dark:text-slate-400 px-3 py-1.5 mt-4">State Platform</p>
+                            <SidebarLink href="/platform" icon={<Landmark className="w-4 h-4" />} label="Platform Console" pathname={pathname} theme={theme} onClick={() => setSidebarOpen(false)} />
+                          </>
+                        )}
+
+                        {section('Administration', [
+                          link('/services', <Briefcase className="w-4 h-4" />, 'Services & Locations'),
+                          link('/budget', <Landmark className="w-4 h-4" />, 'Budget & Projects'),
+                          link('/white-label', <Building2 className="w-4 h-4" />, 'Branding & White Label'),
+                          link('/settings', <Settings className="w-4 h-4" />, 'System Settings'),
+                        ])}
+                      </>
+                    );
+                  })()}
+                </nav>
+
+                {/* User footer */}
+                <div className={`px-4 py-4 border-t ${theme === 'dark' ? 'border-slate-800/80 bg-slate-900/40' : 'border-slate-200/80 bg-slate-100/50'}`}>
+                  <div className="flex items-center gap-3">
+                    <div className="w-9 h-9 rounded-xl text-white font-bold flex items-center justify-center text-xs shadow-md flex-shrink-0" style={{ background: 'linear-gradient(135deg, #3b6102, #4d7d02)' }}>
+                      {initials}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className={`text-xs font-bold truncate ${theme === 'dark' ? 'text-slate-200' : 'text-slate-800'}`}>{user?.fullName || 'Administrator'}</p>
+                      <p className="text-[10px] text-slate-500 dark:text-slate-400 truncate">{user?.email || ''}</p>
+                    </div>
+                    <button
+                      onClick={handleLogout}
+                      title="Sign out"
+                      className="p-1.5 rounded-lg text-slate-500 dark:text-slate-400 hover:text-red-500 hover:bg-red-500/10 transition-colors flex-shrink-0"
+                    >
+                      <LogOut className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </aside>
+
+            {/* Main content */}
+            <div className="flex-1 flex flex-col min-w-0 overflow-hidden relative">
+              {/* Top bar */}
+              <header className={`h-16 flex-shrink-0 flex items-center justify-between px-6 border-b transition-colors duration-200 ${
+                theme === 'dark' 
+                  ? 'bg-[#0b0f19]/80 border-slate-800/80' 
+                  : 'bg-white/80 border-slate-200/80'
+              } backdrop-blur-xl z-20`}>
+                <div className="flex items-center gap-2 text-sm text-slate-500 dark:text-slate-400">
+                  <button 
+                    className="md:hidden mr-2 p-1.5 rounded-lg text-slate-500 dark:text-slate-400 hover:text-slate-200 hover:bg-slate-800/50" 
+                    onClick={() => setSidebarOpen(true)}
+                  >
+                    <Menu className="w-5 h-5" />
+                  </button>
+                  {/* Breadcrumb */}
+                  <span className="font-semibold truncate max-w-[14rem] text-brand-700 dark:text-brand-300">{user?.organizationName || 'Customer Care'}</span>
+                  <ChevronRight className="w-3.5 h-3.5 opacity-60" />
+                  <span className={`font-semibold capitalize ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>
+                    {pathname === '/' ? 'Executive Dashboard' : pathname.slice(1).replace(/-/g, ' ')}
+                  </span>
+                </div>
+
+                <div className="flex items-center gap-3">
+                  {/* Theme Switcher Button */}
+                  <button
+                    onClick={toggleTheme}
+                    className={`p-2 rounded-xl border transition-all flex items-center gap-2 text-xs font-semibold ${
+                      theme === 'dark'
+                        ? 'bg-slate-800/80 border-slate-700 text-brand-700 dark:text-brand-300 hover:bg-slate-700'
+                        : 'bg-slate-100 border-slate-300 text-brand-700 hover:bg-slate-200'
+                    }`}
+                    title={theme === 'dark' ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
+                  >
+                    {theme === 'dark' ? (
+                      <>
+                        <Sun className="w-4 h-4 text-brand-700 dark:text-brand-300" />
+                        <span className="hidden sm:inline text-slate-200">Light Mode</span>
+                      </>
+                    ) : (
+                      <>
+                        <Moon className="w-4 h-4 text-brand-700" />
+                        <span className="hidden sm:inline text-slate-700">Dark Mode</span>
+                      </>
+                    )}
+                  </button>
+
+                  {/* Notifications Bell */}
+                  <div className="relative">
+                    <button 
+                      className={`relative p-2 rounded-xl border transition-colors ${
+                        theme === 'dark'
+                          ? 'bg-slate-800/50 border-slate-700/60 text-slate-300 hover:text-white hover:bg-slate-800'
+                          : 'bg-slate-100 border-slate-200 text-slate-600 hover:text-slate-900 hover:bg-slate-200/70'
+                      }`}
+                      onClick={() => setShowNotifications(!showNotifications)}
+                    >
+                      <Bell className="w-4 h-4" />
+                      {unreadCount > 0 && <span className="absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-brand-600 dark:bg-brand-500 ring-2 ring-brand-600" />}
+                    </button>
+                    {showNotifications && (
+                      <div className={`absolute right-0 mt-2 w-80 border rounded-2xl shadow-2xl z-50 backdrop-blur-2xl ${
+                        theme === 'dark' 
+                          ? 'bg-slate-900/95 border-slate-700 text-slate-100' 
+                          : 'bg-white/95 border-slate-200 text-slate-900 shadow-slate-200'
+                      }`}>
+                        <div className="p-4 border-b border-slate-700/50 flex justify-between items-center">
+                          <span className="text-sm font-bold">Notifications</span>
+                          <button onClick={() => setNotifications(prev => prev.map(n => ({...n, read: true})))} className="text-xs text-brand-700 dark:text-brand-300 hover:underline font-semibold">Mark all read</button>
+                        </div>
+                        <div className="max-h-72 overflow-y-auto">
+                          {notifications.length === 0 ? (
+                            <div className="p-6 text-sm text-slate-500 dark:text-slate-400 text-center">No new notifications</div>
+                          ) : (
+                            notifications.map((n, i) => (
+                              <div key={i} className="p-3.5 border-b border-slate-700/30 flex items-start gap-3 hover:bg-brand-500/5">
+                                <div className="w-2 h-2 mt-1.5 rounded-full bg-brand-600 dark:bg-brand-500 flex-shrink-0" style={{ opacity: n.read ? 0.3 : 1 }} />
+                                <div>
+                                  <div className="text-xs font-medium">{n.text}</div>
+                                  <div className="text-[10px] text-slate-500 dark:text-slate-400 mt-1">{new Date(n.timestamp).toLocaleTimeString()}</div>
+                                </div>
+                              </div>
+                            ))
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="w-9 h-9 rounded-xl text-white font-bold flex items-center justify-center text-xs shadow-md" style={{ background: 'linear-gradient(135deg, #3b6102, #4d7d02)' }}>
+                    {initials}
+                  </div>
+                </div>
+              </header>
+
+              <main className="flex-1 overflow-y-auto p-6 relative">
+                {children}
+              </main>
+            </div>
+          </div>
+        )}
+        </ToastProvider>
+      </body>
+    </html>
+  );
+}
+
+function SidebarLink({ href, icon, label, pathname, theme, onClick }: { href: string; icon: React.ReactNode; label: string; pathname: string; theme: 'light' | 'dark'; onClick?: () => void }) {
+  const isActive = pathname === href || (href !== '/' && pathname.startsWith(href));
+  return (
+    <Link
+      href={href}
+      onClick={onClick}
+      className={`flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-semibold transition-all group ${
+        isActive
+          ? theme === 'dark'
+            ? 'bg-brand-500/20 text-brand-700 dark:text-brand-300 border border-brand-500/30 shadow-md shadow-brand-500/10'
+            : 'bg-emerald-50 text-brand-700 border border-brand-500/30 shadow-sm'
+          : theme === 'dark'
+            ? 'text-slate-500 dark:text-slate-400 hover:text-slate-100 hover:bg-slate-800/40 border border-transparent'
+            : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100 border border-transparent'
+      }`}
+    >
+      <span className={`transition-transform duration-200 group-hover:scale-110 ${
+        isActive 
+          ? 'text-brand-700 dark:text-brand-300 dark:text-brand-300' 
+          : 'text-slate-500 dark:text-slate-400 group-hover:text-brand-700 dark:text-brand-300'
+      }`}>
+        {icon}
+      </span>
+      <span className="truncate">{label}</span>
+    </Link>
+  );
+}

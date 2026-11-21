@@ -1,0 +1,760 @@
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { randomBytes } from 'crypto';
+import { prisma, countContactRelations, describeContactRelation, normalizePhoneNumber, createTicketWithUniqueNumber, recordAgencyAudit, type Actor } from '@ace/database';
+import { mayIdentifyReporter, visibleCasesOfContactWhere, visibleCasesWhere, type Viewer } from '../common/case-visibility';
+import { resolvePaging, pageEnvelope, STABLE_DESC } from '../common/pagination';
+import { WebhookDispatcherService } from '../webhooks/webhook-dispatcher.service';
+import { WorkflowTriggerService } from '../workflows/workflow-trigger.service';
+import { LeadStatus, DealStage, TicketStatus, TicketPriority } from '@ace/shared-types';
+import { PdfGeneratorService } from '@ace/pdf-generator';
+import { SUPPORTED_LANGUAGES, type Language } from '@ace/orchestrator';
+
+/**
+ * A reference prefix derived from the agency's own name.
+ *
+ * Every agency used to issue `PLS/<year>/<id>` — one scheme's initials on a
+ * lands registry's reference number. An existing `metadata.policyId` always
+ * wins, so numbers already issued are untouched; only new ones take the
+ * agency's initials.
+ */
+function referencePrefix(organizationName: string | null | undefined): string {
+  const initials = (organizationName ?? '')
+    .replace(/[^A-Za-z ]/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length > 2)          // skip "of", "and", "the"
+    .map((w) => w[0]!.toUpperCase())
+    .join('')
+    .slice(0, 4);
+  return initials || 'REF';
+}
+
+@Injectable()
+export class CrmService {
+  constructor(
+    private webhookDispatcher: WebhookDispatcherService,
+    private workflows: WorkflowTriggerService
+  ) {}
+
+  async getContacts(organizationId: string, rawPage?: unknown, rawLimit?: unknown) {
+    const paging = resolvePaging(rawPage, rawLimit);
+    const [data, total] = await Promise.all([
+      prisma.contact.findMany({
+        where: { organizationId },
+        orderBy: STABLE_DESC,
+        // Counts, not the full child collections.
+        //
+        // `include: { leads: true, deals: true, tickets: true }` made Prisma issue a
+        // separate query per relation (7 SQL round trips instead of 4, measured at
+        // 2101ms vs 919ms for one page) and embedded every lead, deal and ticket of
+        // every contact in a list response that only renders a table. The detail
+        // endpoint (getContactById) still returns the full records.
+        include: { _count: { select: { leads: true, deals: true, tickets: true } } },
+        take: paging.limit,
+        skip: paging.skip,
+      }),
+      prisma.contact.count({ where: { organizationId } }),
+    ]);
+    return pageEnvelope(data, total, paging);
+  }
+
+  async createContact(organizationId: string, data: { fullName: string; phoneNumber: string; email?: string; tags?: string[]; address?: string; city?: string; state?: string }) {
+    let contact;
+    try {
+      contact = await prisma.contact.create({
+        data: {
+          organizationId,
+          fullName: data.fullName,
+          // Stored canonical, so a number typed as 08012345678 is the same
+          // record as the +234… one a call creates. The unique constraint on
+          // [organizationId, phoneNumber] then catches the duplicate that used
+          // to slip through as a differently-formatted string.
+          phoneNumber: normalizePhoneNumber(data.phoneNumber),
+          email: data.email,
+          tags: data.tags || [],
+          // address/city/state existed in the schema from day one but were
+          // silently dropped — no API or form could ever set a contact's location.
+          address: data.address,
+          city: data.city,
+          state: data.state,
+        },
+      });
+    } catch (err: any) {
+      // Contact has @@unique([organizationId, phoneNumber]). A repeat submission —
+      // an impatient double-click, a retried request, or genuinely re-entering an
+      // existing customer — raised Prisma P2002, which surfaced to the browser as an
+      // opaque HTTP 500. Report the actual situation instead.
+      if (err?.code === 'P2002') {
+        throw new ConflictException(
+          `A contact with the phone number ${data.phoneNumber} already exists in this organization.`
+        );
+      }
+      throw err;
+    }
+
+    this.webhookDispatcher.dispatch(organizationId, 'contact.created', {
+      contactId: contact.id,
+      fullName: contact.fullName,
+    }).catch(() => {});
+
+    this.workflows.emitAsync(organizationId, 'CONTACT_CREATED', {
+      contactId: contact.id,
+      contact: { id: contact.id, fullName: contact.fullName, phoneNumber: contact.phoneNumber, email: contact.email },
+    });
+
+    return contact;
+  }
+
+  async getLeads(organizationId: string, rawPage?: unknown, rawLimit?: unknown) {
+    const paging = resolvePaging(rawPage, rawLimit);
+    const [data, total] = await Promise.all([
+      prisma.lead.findMany({
+        where: { organizationId },
+        include: { contact: true },
+        orderBy: STABLE_DESC,
+        take: paging.limit,
+        skip: paging.skip,
+      }),
+      prisma.lead.count({ where: { organizationId } }),
+    ]);
+    return pageEnvelope(data, total, paging);
+  }
+
+  async createLead(organizationId: string, contactId: string, notes?: string) {
+    const lead = await prisma.lead.create({
+      data: {
+        organizationId,
+        contactId,
+        notes,
+        status: LeadStatus.NEW,
+      },
+      include: { contact: true },
+    });
+
+    this.webhookDispatcher.dispatch(organizationId, 'lead.captured', {
+      leadId: lead.id,
+      contactId: lead.contactId,
+    }).catch(() => {});
+
+    this.workflows.emitAsync(organizationId, 'LEAD_CREATED', {
+      leadId: lead.id,
+      status: lead.status,
+      contactId: lead.contactId,
+      contact: lead.contact
+        ? { id: lead.contact.id, fullName: lead.contact.fullName, phoneNumber: lead.contact.phoneNumber, email: lead.contact.email }
+        : undefined,
+    });
+
+    return lead;
+  }
+
+  async updateLeadStatus(leadId: string, status: LeadStatus, organizationId: string) {
+    const lead = await prisma.lead.findFirst({ where: { id: leadId, organizationId } });
+    if (!lead) throw new NotFoundException('Lead not found');
+    return prisma.lead.update({
+      where: { id: leadId },
+      data: { status },
+    });
+  }
+
+  async getDeals(organizationId: string, rawPage?: unknown, rawLimit?: unknown) {
+    const paging = resolvePaging(rawPage, rawLimit);
+    const [data, total] = await Promise.all([
+      prisma.deal.findMany({
+        where: { organizationId },
+        include: { contact: true },
+        orderBy: STABLE_DESC,
+        take: paging.limit,
+        skip: paging.skip,
+      }),
+      prisma.deal.count({ where: { organizationId } }),
+    ]);
+    return pageEnvelope(data, total, paging);
+  }
+
+  async createDeal(organizationId: string, data: { contactId: string; title: string; amount: number; stage?: DealStage }) {
+    // A negative or non-finite amount silently corrupts pipelineValue on the
+    // dashboard (it is a plain SUM) and every revenue figure derived from it.
+    if (!Number.isFinite(data.amount) || data.amount < 0) {
+      throw new BadRequestException('Deal amount must be a positive number.');
+    }
+    return prisma.deal.create({
+      data: {
+        organizationId,
+        contactId: data.contactId,
+        title: data.title,
+        amount: data.amount,
+        stage: data.stage || DealStage.DISCOVERY,
+      },
+      include: { contact: true },
+    });
+  }
+
+  /**
+   * The same visibility rules as the Cases screen (CasesService), because a
+   * second list that ignores them is a way round them: a sensitive case is
+   * visible only to OWNER/ADMIN and its assignee, an anonymous reporter is
+   * withheld from everyone below OWNER/ADMIN, and an MDA liaison sees only
+   * cases referred to their MDA.
+   */
+  async getTickets(
+    organizationId: string,
+    rawPage?: unknown,
+    rawLimit?: unknown,
+    viewer?: { userId: string; role: string; mdaName?: string | null },
+  ) {
+    const paging = resolvePaging(rawPage, rawLimit);
+    // No viewer is an internal caller (the export), which sees everything.
+    const as: Viewer | null = viewer ? { ...viewer, organizationId } : null;
+    const where: any = as ? visibleCasesWhere(as) : { organizationId };
+    const [rows, total] = await Promise.all([
+      prisma.ticket.findMany({
+        where,
+        include: { contact: true, assignedUser: true },
+        orderBy: STABLE_DESC,
+        take: paging.limit,
+        skip: paging.skip,
+      }),
+      prisma.ticket.count({ where }),
+    ]);
+    const data = rows.map((t: any) =>
+      as && !mayIdentifyReporter(as, t)
+        ? { ...t, contactId: null, contact: { id: null, fullName: 'Anonymous reporter', phoneNumber: null, email: null } }
+        : t,
+    );
+    return pageEnvelope(data, total, paging);
+  }
+
+  async createTicket(
+    organizationId: string,
+    data: {
+      contactId: string;
+      subject: string;
+      description: string;
+      priority?: TicketPriority;
+      /**
+       * Case-management fields (PRD §10), for a report the caller has already
+       * described in full — the phone agent's create-ticket. The dashboard's
+       * own "new ticket" sends none, and gets a plain RECEIVED case as before.
+       * A CREATED event goes with them, because a case's history starts when
+       * it is opened, not when an officer first touches it.
+       */
+      caseFields?: {
+        caseStage: 'RECEIVED' | 'CLASSIFIED';
+        category: string;
+        isSensitive: boolean;
+        isAnonymous: boolean;
+        lga: string | null;
+        ward: string | null;
+        community: string | null;
+        /** The MDA the case is marked for — what the caller was told. */
+        responsibleMda?: string | null;
+        summary: string | null;
+        dueAt: Date;
+        channel: string;
+        openedBy: string;
+        eventBody: string;
+      };
+    }
+  ) {
+    // ticketNumber is @unique across the whole table.
+    //
+    // It used to be `TCK-<4 digits of Date.now()>-<count+1>`, derived from a COUNT
+    // read before the insert. Under concurrency every in-flight request reads the
+    // same count and computes the same number, so simultaneous tickets collide:
+    // driving 25 parallel creates produced 14 HTTP 500s from the unique constraint.
+    // The count also made numbering O(n) and non-monotonic across organizations.
+    //
+    // Now: time-ordered prefix (so numbers still sort chronologically) plus 5 bytes
+    // of randomness, with a bounded retry for the vanishingly unlikely collision.
+    const c = data.caseFields;
+    const ticket = await this.createWithUniqueTicketNumber(() => ({
+      organizationId,
+      contactId: data.contactId,
+      subject: data.subject,
+      description: data.description,
+      priority: data.priority || TicketPriority.MEDIUM,
+      status: TicketStatus.OPEN,
+      updatedAt: new Date(),
+      ...(c
+        ? {
+            caseStage: c.caseStage,
+            category: c.category,
+            isSensitive: c.isSensitive,
+            isAnonymous: c.isAnonymous,
+            lga: c.lga,
+            ward: c.ward,
+            community: c.community,
+            responsibleMda: c.responsibleMda ?? null,
+            summary: c.summary,
+            dueAt: c.dueAt,
+            channel: c.channel,
+            events: {
+              create: {
+                organizationId,
+                type: 'CREATED',
+                toStage: c.caseStage,
+                actorLabel: c.openedBy,
+                body: c.eventBody,
+              },
+            },
+          }
+        : {}),
+    }));
+
+    this.webhookDispatcher.dispatch(organizationId, 'ticket.created', {
+      ticketId: ticket.id,
+      subject: ticket.subject,
+      priority: ticket.priority,
+    }).catch(() => {});
+
+    this.workflows.emitAsync(organizationId, 'TICKET_CREATED', {
+      ticketId: ticket.id,
+      subject: ticket.subject,
+      priority: ticket.priority,
+      status: ticket.status,
+      contactId: ticket.contactId,
+      contact: ticket.contact
+        ? { id: ticket.contact.id, fullName: ticket.contact.fullName, phoneNumber: ticket.contact.phoneNumber, email: ticket.contact.email }
+        : undefined,
+    });
+
+    return ticket;
+  }
+
+  /**
+   * Generates a collision-resistant ticket number and inserts, retrying on the
+   * unique-constraint violation rather than returning a 500.
+   */
+  private async createWithUniqueTicketNumber(buildData: () => any) {
+    try {
+      // The generator moved to @ace/database. It was correct here and broken in
+      // packages/orchestrator, which could not import from the API — so the live
+      // engine kept allocating `TCK-<6 digits of Date.now()>` and losing tickets
+      // to a table-wide unique constraint. One implementation, in the package
+      // both sides already depend on.
+      return await createTicketWithUniqueNumber((ticketNumber) =>
+        prisma.ticket.create({
+          data: { ...buildData(), ticketNumber },
+          include: { contact: true },
+        })
+      );
+    } catch (err: any) {
+      if (err?.code === 'P2003') throw new NotFoundException('Contact not found');
+      if (err?.code === 'P2002') {
+        throw new ConflictException('Could not allocate a unique ticket number. Please retry.');
+      }
+      throw err;
+    }
+  }
+
+  async updateTicketStatus(
+    ticketId: string,
+    status: TicketStatus,
+    organizationId: string,
+    actor: Actor
+  ) {
+    const ticket = await prisma.ticket.findFirst({ where: { id: ticketId, organizationId } });
+    if (!ticket) throw new NotFoundException('Ticket not found');
+    const updated = await prisma.ticket.update({
+      where: { id: ticketId },
+      data: { status },
+      include: { contact: true },
+    });
+
+    // Both sides. "Who closed this citizen's case, and what was it before"
+    // is unanswerable from the new status alone.
+    await recordAgencyAudit(actor, organizationId, {
+      action: 'agency.ticket.status_changed',
+      targetType: 'Ticket',
+      targetId: ticketId,
+      previousValue: { status: ticket.status },
+      newValue: { status: updated.status, ticketNumber: updated.ticketNumber },
+    });
+
+    return updated;
+  }
+
+  async updateDealStage(dealId: string, stage: DealStage, organizationId: string) {
+    const deal = await prisma.deal.findFirst({ where: { id: dealId, organizationId } });
+    if (!deal) throw new NotFoundException('Deal not found');
+
+    const updated = await prisma.deal.update({
+      where: { id: dealId },
+      data: { stage },
+      include: { contact: true },
+    });
+
+    this.workflows.emitAsync(organizationId, 'DEAL_STAGE_CHANGED', {
+      dealId: updated.id,
+      stage: updated.stage,
+      previousStage: deal.stage,
+      amount: updated.amount,
+      contactId: updated.contactId,
+      contact: updated.contact
+        ? { id: updated.contact.id, fullName: updated.contact.fullName, phoneNumber: updated.contact.phoneNumber, email: updated.contact.email }
+        : undefined,
+    });
+
+    return updated;
+  }
+
+  /**
+   * Update a contact's editable fields.
+   *
+   * The field list is applied HERE, at runtime, rather than being left to the
+   * controller's parameter type. TypeScript types are erased before this runs,
+   * and this method used to hand the request body straight to
+   * `prisma.contact.update` — so a body carrying `organizationId` rewrote the
+   * row's tenancy and moved a customer into someone else's CRM, and one
+   * carrying `id` re-pointed the primary key. Neither field is meant to be
+   * writable from here, and nothing in the request path was rejecting them.
+   *
+   * `preferredLanguage` is validated rather than passed through for a smaller
+   * but similar reason: the orchestrator falls back to English on any value it
+   * does not recognise, so storing an unrecognised one is a setting that
+   * appears to save and changes nothing.
+   */
+  async updateContact(
+    contactId: string,
+    data: {
+      fullName?: string; phoneNumber?: string; email?: string; tags?: string[];
+      address?: string; city?: string; state?: string; preferredLanguage?: string | null;
+    },
+    organizationId: string
+  ) {
+    const contact = await prisma.contact.findFirst({ where: { id: contactId, organizationId } });
+    if (!contact) throw new NotFoundException('Contact not found');
+
+    if (
+      data.preferredLanguage !== undefined &&
+      data.preferredLanguage !== null &&
+      data.preferredLanguage !== '' &&
+      !SUPPORTED_LANGUAGES.includes(data.preferredLanguage as Language)
+    ) {
+      throw new BadRequestException(
+        `preferredLanguage must be one of: ${SUPPORTED_LANGUAGES.join(', ')}`
+      );
+    }
+
+    return prisma.contact.update({
+      where: { id: contactId },
+      data: {
+        ...(data.fullName !== undefined && { fullName: data.fullName }),
+        ...(data.phoneNumber !== undefined && { phoneNumber: data.phoneNumber }),
+        ...(data.email !== undefined && { email: data.email }),
+        ...(data.tags !== undefined && { tags: data.tags }),
+        ...(data.address !== undefined && { address: data.address }),
+        ...(data.city !== undefined && { city: data.city }),
+        ...(data.state !== undefined && { state: data.state }),
+        // Empty string clears it back to "not yet known" rather than storing
+        // a value the language resolver would ignore.
+        ...(data.preferredLanguage !== undefined && {
+          preferredLanguage: data.preferredLanguage || null,
+        }),
+      },
+    });
+  }
+
+  /**
+   * Delete a citizen's record, and everything cascading off it.
+   *
+   * ── Why this asks ───────────────────────────────────────────────────────
+   *
+   * Every relation on `Contact` is `onDelete: Cascade`. Deleting a citizen
+   * therefore destroys their appointments, the callbacks the agency promised
+   * them, their open cases, their call records and the whole conversation
+   * history — the record of what this agency told them. It is the most
+   * destructive single action in the product, and it sat behind one generic
+   * "Are you sure you want to delete this record?".
+   *
+   * So it names the consequence before it happens, and asks again. This is
+   * the same shape as `confirmVoiceCutover` and the drop-dead-models script's
+   * `--i-have-read-the-rows`: an explicit acknowledgement for an action whose
+   * cost is invisible at the moment of clicking.
+   *
+   * A citizen with nothing attached — a duplicate typed in by mistake — is
+   * deleted without ceremony, because making the ordinary case harder is how
+   * confirmations stop being read.
+   */
+  async deleteContact(
+    contactId: string,
+    organizationId: string,
+    actor: Actor,
+    options: { acknowledgeDestroysRelatedRecords?: boolean } = {}
+  ) {
+    const contact = await prisma.contact.findFirst({ where: { id: contactId, organizationId } });
+    if (!contact) throw new NotFoundException('Contact not found');
+
+    const attached = await countContactRelations(prisma as any, contactId);
+
+    if (attached.length > 0 && !options.acknowledgeDestroysRelatedRecords) {
+      const described = attached.map((a) => describeContactRelation(a.model, a.count));
+      const list =
+        described.length === 1
+          ? described[0]
+          : `${described.slice(0, -1).join(', ')} and ${described[described.length - 1]}`;
+      throw new BadRequestException(
+        `Deleting ${contact.fullName} also destroys ${list}. ` +
+        `None of it can be recovered, and anyone expecting an appointment or a call back will ` +
+        `still be expecting it. Send acknowledgeDestroysRelatedRecords: true to go ahead.`
+      );
+    }
+
+    const removed = await prisma.contact.delete({ where: { id: contactId } });
+
+    // Recorded with the row's own details AND what went with it: once it is
+    // deleted there is nothing left to resolve the id against, and "what did
+    // we lose" has no answer anywhere else.
+    await recordAgencyAudit(actor, organizationId, {
+      action: 'agency.contact.deleted',
+      targetType: 'Contact',
+      targetId: contactId,
+      previousValue: {
+        fullName: contact.fullName,
+        phoneNumber: contact.phoneNumber,
+        email: contact.email,
+        destroyed: Object.fromEntries(attached.map((a) => [a.model, a.count])),
+      },
+    });
+
+    return removed;
+  }
+
+  async deleteLead(leadId: string, organizationId: string, actor: Actor) {
+    const lead = await prisma.lead.findFirst({ where: { id: leadId, organizationId } });
+    if (!lead) throw new NotFoundException('Lead not found');
+    const removed = await prisma.lead.delete({ where: { id: leadId } });
+
+    // Recorded with the row's own details: once it is deleted there is
+    // nothing left to resolve the id against, and an entry naming only a
+    // uuid describes a record nobody can identify.
+    await recordAgencyAudit(actor, organizationId, {
+      action: 'agency.lead.deleted',
+      targetType: 'Lead',
+      targetId: leadId,
+      previousValue: { contactId: lead.contactId, source: lead.source, status: lead.status, score: lead.score },
+    });
+
+    return removed;
+  }
+
+  async deleteDeal(dealId: string, organizationId: string, actor: Actor) {
+    const deal = await prisma.deal.findFirst({ where: { id: dealId, organizationId } });
+    if (!deal) throw new NotFoundException('Deal not found');
+    const removed = await prisma.deal.delete({ where: { id: dealId } });
+
+    // Recorded with the row's own details: once it is deleted there is
+    // nothing left to resolve the id against, and an entry naming only a
+    // uuid describes a record nobody can identify.
+    await recordAgencyAudit(actor, organizationId, {
+      action: 'agency.deal.deleted',
+      targetType: 'Deal',
+      targetId: dealId,
+      previousValue: { title: deal.title, stage: deal.stage },
+    });
+
+    return removed;
+  }
+
+  async deleteTicket(ticketId: string, organizationId: string, actor: Actor) {
+    const ticket = await prisma.ticket.findFirst({ where: { id: ticketId, organizationId } });
+    if (!ticket) throw new NotFoundException('Ticket not found');
+    const removed = await prisma.ticket.delete({ where: { id: ticketId } });
+
+    // Recorded with the row's own details: once it is deleted there is
+    // nothing left to resolve the id against, and an entry naming only a
+    // uuid describes a record nobody can identify.
+    await recordAgencyAudit(actor, organizationId, {
+      action: 'agency.ticket.deleted',
+      targetType: 'Ticket',
+      targetId: ticketId,
+      previousValue: { ticketNumber: ticket.ticketNumber, subject: ticket.subject, status: ticket.status },
+    });
+
+    return removed;
+  }
+
+  /**
+   * A contact, with the cases this viewer may see listed under them. On a
+   * contact's own page the contact IS the reporter, so an anonymous case listed
+   * here names its reporter — exactly what the Cases screen withholds.
+   */
+  async getContactById(contactId: string, organizationId: string, viewer?: { userId: string; role: string; mdaName?: string | null }) {
+    const contact = await prisma.contact.findFirst({
+      where: { id: contactId, organizationId },
+      include: {
+        leads: true,
+        deals: true,
+        tickets: viewer ? { where: visibleCasesOfContactWhere({ ...viewer, organizationId }, contactId) } : true,
+      },
+    });
+    if (!contact) throw new NotFoundException('Contact not found');
+    return contact;
+  }
+
+  /**
+   * Full unpaginated read, used only by the CSV export.
+   *
+   * Kept as an explicit, named method rather than calling the paginated list with
+   * `limit: 99999` — which would now be clamped to MAX_PAGE_SIZE and silently
+   * truncate the export to 200 rows. Batched so a large tenant does not have to fit
+   * in one query's memory.
+   */
+  async getAllContactsForExport(organizationId: string) {
+    const BATCH = 1000;
+    const all: any[] = [];
+    let cursor: string | undefined;
+
+    for (;;) {
+      const batch = await prisma.contact.findMany({
+        where: { organizationId },
+        orderBy: { id: 'asc' },
+        take: BATCH,
+        ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}),
+      });
+      all.push(...batch);
+      if (batch.length < BATCH) break;
+      cursor = batch[batch.length - 1].id;
+    }
+
+    return { data: all, total: all.length };
+  }
+
+  async searchContacts(organizationId: string, query: string) {
+    return prisma.contact.findMany({
+      where: {
+        organizationId,
+        OR: [
+          { fullName: { contains: query, mode: 'insensitive' } },
+          { phoneNumber: { contains: query } },
+          { email: { contains: query, mode: 'insensitive' } },
+        ],
+      },
+      include: { leads: true, deals: true },
+      take: 50,
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  async getQuotationData(dealId: string, organizationId: string) {
+    const deal = await prisma.deal.findFirst({
+      where: { id: dealId, organizationId },
+      include: { contact: true, organization: true },
+    });
+
+    if (!deal) {
+      throw new NotFoundException('Deal not found');
+    }
+
+    return {
+      quotationNumber: `QUO-${deal.id.slice(0, 8).toUpperCase()}`,
+      organizationName: deal.organization?.name || 'ACE Customer Care',
+      organizationPhone: deal.organization?.phone || '+234 1 700 8000',
+      customerName: deal.contact?.fullName || 'Valued Customer',
+      customerPhone: deal.contact?.phoneNumber || '+234 800 000 0000',
+      items: [
+        { description: deal.title || 'Service Quotation', quantity: 1, unitPrice: deal.amount, totalPrice: deal.amount },
+      ],
+      subtotal: deal.amount,
+      tax: 0,
+      grandTotal: deal.amount,
+      currency: 'NGN',
+      validUntil: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+    };
+  }
+
+  async getDigitalCardData(contactId: string, organizationId: string) {
+    const contact = await prisma.contact.findFirst({
+      where: { id: contactId, organizationId },
+      include: { organization: true, selfieRequests: { where: { status: 'RECEIVED' }, orderBy: { updatedAt: 'desc' } } },
+    });
+    if (!contact) throw new NotFoundException('Contact not found');
+
+    const meta = (contact.metadata as Record<string, any>) || {};
+    const policyId =
+      meta.policyId ||
+      `${referencePrefix(contact.organization?.name)}/${new Date().getFullYear()}/${contact.id.slice(0, 8).toUpperCase()}`;
+    const selfie = contact.selfieRequests[0];
+    const photoUrl = selfie?.storagePath ? `/api/onboarding/selfies/${selfie.id}` : undefined;
+
+    return PdfGeneratorService.generateEnrolleeDigitalCard({
+      policyId,
+      fullName: contact.fullName,
+      phoneNumber: contact.phoneNumber,
+      residentialAddress: meta.residentialAddress || contact.address || undefined,
+      ageOrDob: meta.ageOrDob || undefined,
+      // Each of these was a fabricated default on an identity document:
+      // one scheme's plan taxonomy, a State name standing in for an LGA, and
+      // a facility claim ("Accredited Primary Healthcare Provider") for a
+      // citizen nobody had assigned anywhere. The card omits a row it has no
+      // value for, so unknown now reads as absent rather than as a fact.
+      planType: meta.planType || undefined,
+      lga: meta.lga || contact.city || undefined,
+      preferredHospital: meta.preferredHospital || undefined,
+      nin: meta.nin,
+      photoUrl,
+      dependents: meta.dependents || undefined,
+      issuedAt: meta.approvedAt ? new Date(meta.approvedAt).toLocaleDateString('en-NG') : new Date().toLocaleDateString('en-NG'),
+      expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toLocaleDateString('en-NG'),
+      // No fallback to a scheme name. A card is an identity document: printing
+      // one agency's name on another agency's card is worse than printing none.
+      organizationName: contact.organization?.name ?? '',
+    });
+  }
+
+  async approveEnrollee(contactId: string, organizationId: string) {
+    // The organization is included because the reference number is built from
+    // its name. Without it the prefix silently degraded to "REF" on the one
+    // call that ISSUES the number, which is the hardest place to notice.
+    const contact = await prisma.contact.findFirst({
+      where: { id: contactId, organizationId },
+      include: { organization: { select: { name: true } } },
+    });
+    if (!contact) throw new NotFoundException('Contact not found');
+
+    const meta = (contact.metadata as Record<string, any>) || {};
+    const policyId =
+      meta.policyId ||
+      `${referencePrefix(contact.organization?.name)}/${new Date().getFullYear()}/${contact.id.slice(0, 8).toUpperCase()}`;
+
+    const updated = await prisma.contact.update({
+      where: { id: contactId },
+      data: {
+        metadata: {
+          ...meta,
+          policyId,
+          enrollmentStatus: 'ENROLLED_ACTIVE',
+          approvedAt: new Date().toISOString(),
+        },
+        tags: contact.tags.includes('enrolled-active')
+          ? contact.tags.filter((t) => t !== 'enrollment-pending')
+          : [...contact.tags.filter((t) => t !== 'enrollment-pending'), 'enrolled-active'],
+      },
+    });
+
+    // The note is the record of WHO approved WHAT, so a lost one is a gap in
+    // the citizen's file rather than a cosmetic miss — it is awaited and its
+    // failure is reported, not swallowed.
+    //
+    // The wording is the agency's, not the health scheme's. This read
+    // "Coverage active across accredited facilities", which describes an
+    // insurance product; for a lands registry or a water board it is simply
+    // untrue, and it is written into a citizen's record where an officer
+    // reads it back to them.
+    await prisma.note.create({
+      data: {
+        contactId: contact.id,
+        content:
+          `Registration approved. Reference ${policyId}, issued by ` +
+          `${contact.organization?.name ?? 'this agency'}.`,
+      },
+    });
+
+    return {
+      success: true,
+      policyId,
+      enrollee: updated,
+    };
+  }
+}
+

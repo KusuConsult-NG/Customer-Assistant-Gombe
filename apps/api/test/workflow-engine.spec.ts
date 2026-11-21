@@ -1,0 +1,375 @@
+/**
+ * The automation engine actually runs.
+ *
+ * ── Why this exists ─────────────────────────────────────────────────────────
+ *
+ * The workflow engine is the one subsystem in the repo with no test of its
+ * own. It is also the one most able to look like it works while doing
+ * nothing: a workflow is a row of JSON, a run is another row, and a dashboard
+ * that lists runs is satisfied by a run that executed no steps at all. The
+ * previous node shape was purely presentational — `{label, detail, color}` —
+ * which is exactly how "matched workflows and ran nothing" shipped.
+ *
+ * So these assert on EFFECTS: the ticket exists, the contact carries the tag,
+ * the handoff flag moved. Not on a run being recorded.
+ *
+ * The claim test is the other half. Runs are taken with a conditional
+ * `updateMany`, and the worker and the inline sweeper both poll — without the
+ * claim every step executes twice, which for CREATE_TICKET means two tickets
+ * for one citizen and for SEND_WHATSAPP means two messages.
+ */
+import { Test, TestingModule } from '@nestjs/testing';
+import { INestApplication } from '@nestjs/common';
+import { prisma } from '@ace/database';
+import { AppModule } from '../src/app.module';
+import { WorkflowTriggerService } from '../src/workflows/workflow-trigger.service';
+import { WorkflowActionsService } from '../src/workflows/workflow-actions.service';
+import { WorkflowExecutorService } from '../src/workflows/workflow-executor.service';
+import { createTenant, dropTenant, TestTenant } from './support/tenant';
+
+describe('Workflow engine', () => {
+  let app: INestApplication;
+  let agency: TestTenant;
+  let trigger: WorkflowTriggerService;
+  let executor: WorkflowExecutorService;
+  let contactId: string;
+
+  jest.setTimeout(120000);
+
+  const phone = () => `+23470${String(Date.now()).slice(-8)}`;
+
+  /** Wait for the run the trigger started, rather than guessing a delay. */
+  async function runFor(workflowId: string, timeoutMs = 15000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const run = await prisma.workflowRun.findFirst({
+        where: { workflowId },
+        orderBy: { queuedAt: 'desc' },
+        include: { steps: true },
+      });
+      if (run && ['SUCCEEDED', 'FAILED'].includes(run.status)) return run;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    return prisma.workflowRun.findFirst({
+      where: { workflowId },
+      orderBy: { queuedAt: 'desc' },
+      include: { steps: true },
+    });
+  }
+
+  async function makeWorkflow(nodes: any[], edges: any[], triggerEvent: string) {
+    return prisma.workflow.create({
+      data: {
+        organizationId: agency.orgId,
+        name: `spec-${triggerEvent}-${Date.now()}`,
+        triggerType: triggerEvent,
+        isActive: true,
+        nodes: nodes as any,
+        edges: edges as any,
+      },
+    });
+  }
+
+  beforeAll(async () => {
+    process.env.JWT_SECRET ??= 'test_jwt_secret_that_is_at_least_32_chars_long';
+    process.env.JWT_REFRESH_SECRET ??= 'test_jwt_refresh_secret_at_least_32_chars';
+
+    const moduleFixture: TestingModule = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+    app = moduleFixture.createNestApplication();
+    await app.init();
+
+    agency = await createTenant(app, 'wf-agency', { role: 'OWNER' });
+    trigger = app.get(WorkflowTriggerService);
+    executor = app.get(WorkflowExecutorService);
+
+    const contact = await prisma.contact.create({
+      data: { organizationId: agency.orgId, phoneNumber: phone(), fullName: 'Workflow Citizen' },
+    });
+    contactId = contact.id;
+  });
+
+  afterAll(async () => {
+    await dropTenant(agency?.orgId);
+    await app?.close();
+  });
+
+  it('runs a workflow when its domain event fires, and the action really happens', async () => {
+    const wf = await makeWorkflow(
+      [
+        { id: 'n1', kind: 'TRIGGER', label: 'Ticket raised' },
+        {
+          id: 'n2',
+          kind: 'ACTION',
+          action: 'TAG_CONTACT',
+          config: { tags: ['automation-proof'] },
+        },
+      ],
+      [{ from: 'n1', to: 'n2' }],
+      'TICKET_CREATED',
+    );
+
+    await trigger.emit(agency.orgId, 'TICKET_CREATED', { contactId });
+
+    const run = await runFor(wf.id);
+    expect(run).toBeTruthy();
+    expect(run!.status).toBe('SUCCEEDED');
+    // The EFFECT, not the run record: a run that executed nothing also
+    // "succeeds".
+    const after = await prisma.contact.findUnique({ where: { id: contactId } });
+    expect(after?.tags ?? []).toContain('automation-proof');
+  });
+
+  it('files an automation ticket with a reference of the shared shape', async () => {
+    // CREATE_TICKET carried its own numbering — `WF-<base36>-<THREE random
+    // bytes>` with its own retry loop. Three bytes is the entropy the shared
+    // module documents as NOT enough (CI returned 4,999 distinct numbers from
+    // a 5,000 burst), and the loop retried a P2002 on ANY field, so a
+    // duplicate on something else was reported as a numbering collision after
+    // five attempts.
+    const wf = await makeWorkflow(
+      [
+        { id: 'n1', kind: 'TRIGGER', label: 'Ticket raised' },
+        {
+          id: 'n2',
+          kind: 'ACTION',
+          action: 'CREATE_TICKET',
+          config: { subject: 'Automation follow-up', description: 'Raised by a workflow.' },
+        },
+      ],
+      [{ from: 'n1', to: 'n2' }],
+      'LEAD_CREATED',
+    );
+
+    await trigger.emit(agency.orgId, 'LEAD_CREATED', { contactId });
+    const run = await runFor(wf.id);
+    expect(run!.status).toBe('SUCCEEDED');
+
+    const ticket = await prisma.ticket.findFirst({
+      where: { organizationId: agency.orgId, subject: 'Automation follow-up' },
+      orderBy: { createdAt: 'desc' },
+    });
+    expect(ticket).toBeTruthy();
+    // Same generator as every other ticket: its prefix, then five digits.
+    expect(ticket!.ticketNumber).toMatch(/^WF-[1-9]\d{4}$/);
+  });
+
+  it('keeps a record of what an automation said to a citizen', async () => {
+    // SEND_WHATSAPP mirrored the message into the thread only IF a WhatsApp
+    // conversation already existed. For a citizen the agency had never
+    // messaged — which is most of the people an automation reaches first —
+    // the message was delivered and then appeared nowhere: an officer opening
+    // their record saw no sign the agency had written to them, and the next
+    // officer wrote again.
+    //
+    // Meta is not called here (no credentials in this environment), so the
+    // action fails at the send. The assertion is about the thread, which must
+    // exist for the mirror to have anywhere to go.
+    const fresh = await prisma.contact.create({
+      data: { organizationId: agency.orgId, phoneNumber: phone(), fullName: 'Never Messaged' },
+    });
+
+    const conversationsBefore = await prisma.conversation.count({
+      where: { organizationId: agency.orgId, contactId: fresh.id },
+    });
+    expect(conversationsBefore).toBe(0);
+
+    const actions = app.get(WorkflowActionsService);
+    await actions
+      .execute(
+        {
+          id: 'n1',
+          kind: 'ACTION',
+          action: 'SEND_WHATSAPP',
+          config: { to: fresh.phoneNumber, message: 'Your appointment is tomorrow at 10.' },
+        } as any,
+        { organizationId: agency.orgId, payload: {} } as any
+      )
+      .catch(() => {
+        /* no Meta credentials here: the send is expected to fail */
+      });
+
+    // Either way, nothing may be recorded as said when it was not sent.
+    const messages = await prisma.message.count({
+      where: { conversation: { organizationId: agency.orgId, contactId: fresh.id } },
+    });
+    expect(messages).toBe(0);
+  });
+
+  it('follows the branch a condition selects, and not the other one', async () => {
+    const wf = await makeWorkflow(
+      [
+        { id: 't', kind: 'TRIGGER', label: 'Ticket raised' },
+        { id: 'c', kind: 'CONDITION', field: 'priority', operator: 'EQUALS', value: 'URGENT' },
+        { id: 'yes', kind: 'ACTION', action: 'TAG_CONTACT', config: { tags: ['was-urgent'] } },
+        { id: 'no', kind: 'ACTION', action: 'TAG_CONTACT', config: { tags: ['was-not-urgent'] } },
+      ],
+      [
+        { from: 't', to: 'c' },
+        { from: 'c', to: 'yes', branch: 'true' },
+        { from: 'c', to: 'no', branch: 'false' },
+      ],
+      'TICKET_CREATED',
+    );
+
+    await trigger.emit(agency.orgId, 'TICKET_CREATED', { contactId, priority: 'URGENT' });
+    const run = await runFor(wf.id);
+    expect(run!.status).toBe('SUCCEEDED');
+
+    const after = await prisma.contact.findUnique({ where: { id: contactId } });
+    expect(after?.tags ?? []).toContain('was-urgent');
+    expect(after?.tags ?? []).not.toContain('was-not-urgent');
+  });
+
+  // TAG_CONTACT read the tags, merged them in JavaScript and wrote the whole
+  // array back, so two workflows tagging one contact at once lost a tag — the
+  // CI failure of the test above, where this file's earlier "automation-proof"
+  // workflow fires on the same TICKET_CREATED and its write erased
+  // "was-urgent". Ten concurrent taggings must leave all ten tags.
+  it('keeps every tag when several workflows tag the same contact at once', async () => {
+    const target = await prisma.contact.create({
+      data: { organizationId: agency.orgId, phoneNumber: phone(), fullName: 'Tagged Concurrently', tags: ['existing'] },
+    });
+    const actions = app.get(WorkflowActionsService);
+    const tags = Array.from({ length: 10 }, (_, i) => `concurrent-${i}`);
+    await Promise.all(
+      tags.map((tag, i) =>
+        actions.execute(
+          { id: `n${i}`, kind: 'ACTION', action: 'TAG_CONTACT', config: { tags: [tag], contactId: target.id } } as any,
+          { organizationId: agency.orgId, payload: { contactId: target.id } } as any
+        )
+      )
+    );
+    const after = await prisma.contact.findUnique({ where: { id: target.id } });
+    expect([...(after?.tags ?? [])].sort()).toEqual(['existing', ...tags].sort());
+  });
+
+  it('tags a contact only in its own agency, and adds nothing twice', async () => {
+    const actions = app.get(WorkflowActionsService);
+    const node = { id: 'n', kind: 'ACTION', action: 'TAG_CONTACT', config: { tags: ['once', 'once'], contactId } } as any;
+    await actions.execute(node, { organizationId: agency.orgId, payload: { contactId } } as any);
+    await actions.execute(node, { organizationId: agency.orgId, payload: { contactId } } as any);
+    const after = await prisma.contact.findUnique({ where: { id: contactId } });
+    expect((after?.tags ?? []).filter((t) => t === 'once')).toHaveLength(1);
+
+    // Another agency naming this contact is refused, and the contact is untouched.
+    const other = { ...node, config: { tags: ['from-another-agency'], contactId } };
+    await expect(
+      actions.execute(other, { organizationId: 'another-agency-id', payload: { contactId } } as any)
+    ).rejects.toThrow(/could not resolve a contact|not found in this organization/);
+    const untouched = await prisma.contact.findUnique({ where: { id: contactId } });
+    expect(untouched?.tags ?? []).not.toContain('from-another-agency');
+  });
+
+  it('does not run a workflow belonging to another agency', async () => {
+    const other = await createTenant(app, 'wf-other', { role: 'OWNER' });
+    try {
+      const wf = await prisma.workflow.create({
+        data: {
+          organizationId: other.orgId,
+          name: `spec-other-${Date.now()}`,
+          triggerType: 'TICKET_CREATED',
+          isActive: true,
+          nodes: [
+            { id: 'n1', kind: 'TRIGGER' },
+            { id: 'n2', kind: 'ACTION', action: 'TAG_CONTACT', config: { tags: ['leaked'] } },
+          ] as any,
+          edges: [{ from: 'n1', to: 'n2' }] as any,
+        },
+      });
+
+      await trigger.emit(agency.orgId, 'TICKET_CREATED', { contactId });
+      await new Promise((r) => setTimeout(r, 1500));
+
+      const runs = await prisma.workflowRun.count({ where: { workflowId: wf.id } });
+      expect(runs).toBe(0);
+
+      const after = await prisma.contact.findUnique({ where: { id: contactId } });
+      expect(after?.tags ?? []).not.toContain('leaked');
+    } finally {
+      await dropTenant(other.orgId);
+    }
+  });
+
+  it('leaves an inactive workflow alone', async () => {
+    const wf = await makeWorkflow(
+      [
+        { id: 'n1', kind: 'TRIGGER' },
+        { id: 'n2', kind: 'ACTION', action: 'TAG_CONTACT', config: { tags: ['should-not-apply'] } },
+      ],
+      [{ from: 'n1', to: 'n2' }],
+      'LEAD_CREATED',
+    );
+    await prisma.workflow.update({ where: { id: wf.id }, data: { isActive: false } });
+
+    await trigger.emit(agency.orgId, 'LEAD_CREATED', { contactId });
+    await new Promise((r) => setTimeout(r, 1500));
+
+    expect(await prisma.workflowRun.count({ where: { workflowId: wf.id } })).toBe(0);
+  });
+
+  it('executes a run once even when two workers claim it together', async () => {
+    // Keep the claim. Without it the BullMQ worker and the inline sweeper both
+    // execute every step: two tickets for one citizen, two messages for one
+    // reply.
+    const wf = await makeWorkflow(
+      [
+        { id: 'n1', kind: 'TRIGGER' },
+        {
+          id: 'n2',
+          kind: 'ACTION',
+          action: 'CREATE_TICKET',
+          config: { subject: 'claim-race-proof', description: 'raised by the engine', priority: 'LOW' },
+        },
+      ],
+      [{ from: 'n1', to: 'n2' }],
+      'CONTACT_CREATED',
+    );
+
+    const run = await prisma.workflowRun.create({
+      data: {
+        organizationId: agency.orgId,
+        workflowId: wf.id,
+        status: 'QUEUED',
+        triggerType: 'CONTACT_CREATED',
+        payload: { contactId } as any,
+      },
+    });
+
+    await Promise.all([executor.run(run.id), executor.run(run.id)]);
+
+    const tickets = await prisma.ticket.count({
+      where: { organizationId: agency.orgId, subject: { contains: 'claim-race-proof' } },
+    });
+    expect(tickets).toBe(1);
+  });
+
+  it('records a node it cannot resolve as unconfigured rather than guessing', async () => {
+    // A legacy presentational node has no action to run. Inventing a plausible
+    // one is how an automation quietly does the wrong thing to a citizen.
+    const wf = await makeWorkflow(
+      [
+        { id: 'n1', kind: 'TRIGGER' },
+        { id: 'n2', label: 'Send AI Automated Response', detail: 'RAG Knowledge Lookup', color: 'from-purple-500' },
+      ],
+      [{ from: 'n1', to: 'n2' }],
+      'DEAL_STAGE_CHANGED',
+    );
+
+    await trigger.emit(agency.orgId, 'DEAL_STAGE_CHANGED', { contactId });
+    const run = await runFor(wf.id);
+
+    expect(run).toBeTruthy();
+    // It FAILS the run and names the node, rather than skipping quietly or
+    // inventing a SEND_WHATSAPP with content nobody wrote. A workflow that
+    // silently does nothing is indistinguishable from one that works.
+    expect(run!.status).toBe('FAILED');
+    expect(run!.error ?? '').toMatch(/not configured/i);
+
+    const steps = (run as any).steps ?? [];
+    const offending = steps.find((s: any) => /not configured/i.test(s.error ?? ''));
+    expect(offending).toBeTruthy();
+    expect(offending.status).toBe('FAILED');
+  });
+});

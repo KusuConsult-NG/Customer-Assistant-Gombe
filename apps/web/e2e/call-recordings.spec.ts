@@ -1,0 +1,220 @@
+import { test, expect, Page } from '@playwright/test';
+import { randomBytes } from 'crypto';
+
+/**
+ * Playing a call back, on the call list and on the case it opened.
+ *
+ * Every call on the telephony screen used to show a disabled "Play Audio":
+ * the audio existed (ElevenLabs keeps it) and nothing recorded where. The
+ * audio is fetched with the agency's ElevenLabs key, which the browser never
+ * holds, so the player must ask OUR API with the officer's session — these
+ * assert on that request, not only on what is drawn, because a player that
+ * opened a bare link would look the same and play nothing.
+ *
+ * The audio bytes are stubbed (no sandbox holds a recorded call). Everything
+ * else — the call list, the case, the "Call record" section, and a refusal —
+ * comes from the real API.
+ */
+
+const createdOrgIds: string[] = [];
+const FAKE_MP3 = Buffer.from('ID3\u0004fake-mp3-for-e2e');
+
+type Seeded = { token: string; agentToken: string; playableCallId: string; unrecordedCallId: string; ticketNumber: string; anonPhone: string };
+
+async function seed(): Promise<Seeded> {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { prisma } = require('@ace/database');
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const jwt = require('jsonwebtoken');
+  const secret = process.env.JWT_SECRET;
+  if (!secret) throw new Error('JWT_SECRET must be set for the call-recordings e2e.');
+
+  const tag = `e2erec-${randomBytes(3).toString('hex')}`;
+  const org = await prisma.organization.create({ data: { name: `${tag} Agency`, slug: tag, industry: 'GOVERNMENT' } });
+  createdOrgIds.push(org.id);
+  await prisma.hostedAgentConfig.create({ data: { organizationId: org.id, agentId: `agent_${tag}` } });
+  const user = await prisma.user.create({
+    data: { organizationId: org.id, email: `${tag}@mda.test`, passwordHash: 'x', fullName: 'Amina Officer', role: 'OWNER' },
+  });
+  const digits = String(randomBytes(3).readUIntBE(0, 3)).padStart(8, '0').slice(0, 8);
+  const contact = await prisma.contact.create({
+    data: { organizationId: org.id, phoneNumber: `+23481${digits}`, fullName: 'Ngozi Pam' },
+  });
+  const played = await prisma.callLog.create({
+    data: {
+      organizationId: org.id, contactId: contact.id, callSid: `CA${tag}a`, fromNumber: contact.phoneNumber,
+      toNumber: '+2348000000001', status: 'COMPLETED', durationSeconds: 95, recordingUrl: `elevenlabs:conv_${tag}`,
+      transcript: 'agent: Good morning.\nuser: The culvert at Pantami Junction has collapsed.',
+      summary: 'Caller reported a collapsed culvert.',
+    },
+  });
+  // Answered by the agent, but stored before references were kept: Play is
+  // offered and the REAL API decides (here: this agency has no workspace key).
+  const unrecorded = await prisma.callLog.create({
+    data: {
+      organizationId: org.id, contactId: contact.id, callSid: `CA${tag}b`, fromNumber: contact.phoneNumber,
+      toNumber: '+2348000000001', status: 'COMPLETED', durationSeconds: 30,
+    },
+  });
+  const ticket = await prisma.ticket.create({
+    data: {
+      organizationId: org.id, contactId: contact.id, ticketNumber: `TCK-${tag}`, subject: 'Collapsed culvert',
+      description: 'The culvert has collapsed.', summary: 'A collapsed culvert at Pantami Junction.', caseStage: 'CLASSIFIED',
+      category: 'roads', channel: 'VOICE',
+      events: {
+        create: [
+          { organizationId: org.id, type: 'CREATED', actorLabel: 'system:voice-agent', body: `Opened from a phone call. Call reference: conv_${tag}.` },
+          { organizationId: org.id, type: 'CALL_RECORDED', actorLabel: 'system:voice-agent', body: `Call recorded: ${played.id} (1m 35s). The transcript and recording are on the call record.` },
+        ],
+      },
+    },
+  });
+  // A whistle-blower's call: the record of an ANONYMOUS report.
+  const anonPhone = `+23482${digits}`;
+  const whistle = await prisma.contact.create({ data: { organizationId: org.id, phoneNumber: anonPhone, fullName: 'Whistle Blower' } });
+  const anonCall = await prisma.callLog.create({
+    data: {
+      organizationId: org.id, contactId: whistle.id, callSid: `CA${tag}c`, fromNumber: anonPhone, toNumber: '+2348000000001',
+      status: 'COMPLETED', durationSeconds: 47, transcript: 'user: the officer at the registry took a bribe',
+    },
+  });
+  await prisma.ticket.create({
+    data: {
+      organizationId: org.id, contactId: whistle.id, ticketNumber: `ANON-${tag}`, subject: 'Bribe at the registry',
+      description: 'Bribe.', caseStage: 'CLASSIFIED', category: 'misconduct', channel: 'VOICE', isAnonymous: true,
+      events: { create: [{ organizationId: org.id, type: 'CALL_RECORDED', actorLabel: 'system:voice-agent', body: `Call recorded: ${anonCall.id} (0m 47s). The transcript and recording are on the call record.` }] },
+    },
+  });
+  const officer = await prisma.user.create({
+    data: { organizationId: org.id, email: `${tag}-agent@mda.test`, passwordHash: 'x', fullName: 'Desk Officer', role: 'AGENT' },
+  });
+  const sign = (u: any, role: string) =>
+    jwt.sign({ userId: u.id, email: u.email, fullName: u.fullName, organizationId: org.id, role, tokenVersion: u.tokenVersion ?? 0 }, secret, { expiresIn: '1h' });
+  const token = sign(user, 'OWNER');
+  const agentToken = sign(officer, 'AGENT');
+  return { token, agentToken, playableCallId: played.id, unrecordedCallId: unrecorded.id, ticketNumber: ticket.ticketNumber, anonPhone };
+}
+
+test.afterAll(async () => {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { prisma } = require('@ace/database');
+  for (const id of createdOrgIds) {
+    await prisma.callLog.deleteMany({ where: { organizationId: id } }).catch(() => {});
+    await prisma.organization.delete({ where: { id } }).catch(() => {});
+  }
+  await prisma.$disconnect();
+});
+
+async function signIn(page: Page, token: string) {
+  await page.addInitScript((t) => {
+    window.localStorage.setItem('ace_token', t as string);
+    window.localStorage.setItem('ace_user', JSON.stringify({ fullName: 'Amina Officer', email: 'amina@mda.test', role: 'OWNER', organizationName: 'E2E' }));
+  }, token);
+}
+
+/** Answer the audio request for one call, recording what was asked. */
+async function stubAudio(page: Page, callId: string) {
+  const asked: Array<{ url: string; auth: string | undefined }> = [];
+  await page.route(`**/api/calls/${callId}/recording`, (route) => {
+    asked.push({ url: route.request().url(), auth: route.request().headers()['authorization'] });
+    return route.fulfill({ status: 200, contentType: 'audio/mpeg', body: FAKE_MP3 });
+  });
+  return asked;
+}
+
+test.describe('Playing call recordings', () => {
+  test('the call list plays a call through the API, with the officer’s session', async ({ page }) => {
+    const s = await seed();
+    const asked = await stubAudio(page, s.playableCallId);
+    await signIn(page, s.token);
+    await page.goto('/telephony');
+
+    // 95 seconds is 1m 35s (it used to read 2m 35s), and the call has a time
+    // (it used to read "—" for every call).
+    const row = page.locator('tr', { hasText: '1m 35s' });
+    await expect(row).toBeVisible({ timeout: 20000 });
+    await expect(row).toContainText(String(new Date().getFullYear()));
+    await row.getByRole('button', { name: /Play Audio/ }).click();
+
+    await expect(row.locator('audio[aria-label="Call recording"]')).toBeVisible();
+    expect(asked).toHaveLength(1);
+    expect(asked[0].auth).toBe(`Bearer ${s.token}`);
+  });
+
+  test('shows the API’s own reason when there is nothing it can play', async ({ page }) => {
+    const s = await seed();
+    await signIn(page, s.token);
+    await page.goto('/telephony');
+
+    const row = page.locator('tr', { hasText: '0m 30s' });
+    await expect(row).toBeVisible({ timeout: 20000 });
+    await row.getByRole('button', { name: /Play Audio/ }).click();
+
+    // Real API: this agency has an agent but no ElevenLabs key of its own.
+    const alert = row.getByRole('alert');
+    await expect(alert).toContainText('Agent Provisioning → Credentials');
+    await expect(row.locator('audio')).toHaveCount(0);
+  });
+
+  test('the case keeps the call it was opened on: transcript and recording', async ({ page }) => {
+    const s = await seed();
+    const asked = await stubAudio(page, s.playableCallId);
+    await signIn(page, s.token);
+    await page.goto('/cases');
+
+    await page.getByRole('button', { name: new RegExp(s.ticketNumber) }).click();
+    const section = page.locator('article', { has: page.getByRole('heading', { name: 'Call record' }) });
+    await expect(section).toBeVisible({ timeout: 20000 });
+    await expect(section).toContainText('Caller reported a collapsed culvert.');
+    await section.getByText('Transcript').click();
+    await expect(section).toContainText('The culvert at Pantami Junction has collapsed.');
+
+    await section.getByRole('button', { name: /Play Audio/ }).click();
+    await expect(section.locator('audio[aria-label="Call recording"]')).toBeVisible();
+    expect(asked).toHaveLength(1);
+  });
+
+  test('a confidential report’s call is listed without its caller or transcript for an officer', async ({ page }) => {
+    const s = await seed();
+    await signIn(page, s.agentToken);
+    await page.goto('/telephony');
+
+    const row = page.locator('tr', { hasText: '0m 47s' });
+    await expect(row).toBeVisible({ timeout: 20000 });
+    await expect(row).toContainText('Confidential report');
+    await expect(row.getByRole('button', { name: /Transcript/ })).toBeDisabled();
+    await expect(row.getByRole('button', { name: /Play Audio/ })).toBeDisabled();
+    // Nowhere on the page: the reporter's number, name or words.
+    const body = page.locator('body');
+    await expect(body).not.toContainText(s.anonPhone);
+    await expect(body).not.toContainText('took a bribe');
+  });
+
+  test('an administrator still sees that call in full', async ({ page }) => {
+    const s = await seed();
+    await signIn(page, s.token);
+    await page.goto('/telephony');
+    const row = page.locator('tr', { hasText: '0m 47s' });
+    await expect(row).toBeVisible({ timeout: 20000 });
+    await expect(row).toContainText(s.anonPhone);
+    await expect(row.getByRole('button', { name: /Transcript/ })).toBeEnabled();
+  });
+  test('a call history that could not be loaded is never shown as "No calls yet"', async ({ page }) => {
+    // While the API restarted after a deploy every request was dropped, and
+    // the screen said "No calls yet" — a statement about the line made when
+    // nothing was known about it.
+    const s = await seed();
+    await page.route('**/api/telephony/calls*', (route) => route.abort('connectionclosed'));
+    await signIn(page, s.token);
+    await page.goto('/telephony');
+    await expect(page.getByText('Call history unavailable')).toBeVisible();
+    await expect(page.getByText('No calls yet')).toHaveCount(0);
+
+    // Once the server answers again, Try again shows the real calls.
+    await page.unroute('**/api/telephony/calls*');
+    await page.getByRole('button', { name: 'Try again' }).click();
+    await expect(page.getByText('Call history unavailable')).toHaveCount(0);
+    await expect(page.getByText('No calls yet')).toHaveCount(0);
+    await expect(page.locator('table tbody tr').first()).toBeVisible();
+  });
+});

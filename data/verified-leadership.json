@@ -1,0 +1,62 @@
+{
+  "_about": "Current heads of Gombe State MDAs, each CONFIRMED by a published source, checked on 2026-11-21. Applied by `npm run leadership:apply`. An agency NOT listed here has its head's name REMOVED and shown as not confirmed: a wrong name said with confidence is worse than none. Permanent Secretaries are not listed at all, because no published source maps them to Gombe ministries.",
+
+  "_whyThisTableHasNoCommissioners": "Gombe State HAS a full cabinet: the Governor swore in 23 Commissioners, 13 Special Advisers and a Permanent Secretary in July 2026, and sent three further commissioner-designates to the Assembly in September 2026 (Dr Ahmed Wali Doho, Nasiru Adamu Degri and Dr Muhammad A. Bello, effective only on confirmation). What no source read on 2026-11-21 gives is WHICH OF THE 23 HOLDS WHICH PORTFOLIO. A name without its ministry is useless to a citizen asking who to see about their land, and guessing the mapping would be the exact failure this table exists to prevent, so none of the 23 is recorded here. Get the list from the Government House or the Secretary to the State Government and add each with its portfolio and a source. Two new ministries — Humanitarian Affairs and Livestock Development — were created in the same period and have no agency record in this platform's MDA list yet.",
+
+  "_lineage": "This file previously held 51 PLATEAU State officials, and was then briefly re-pointed at Bauchi State on a misread client brief. Both sets were deleted rather than translated. Gombe was carved out of Bauchi in 1996, which makes the Bauchi step more dangerous than it looks: the two states share pre-1996 history and are often covered together in the press, so a Bauchi name can read as plausibly Gombe's and is not.",
+
+  "checkedOn": "2026-11-21",
+
+  "cabinetSource": {
+    "description": "Gombe State Executive Council. 23 Commissioners sworn in July 2026; three further nominees sent to the Assembly in September 2026, pending screening. Portfolios not published in any source read.",
+    "urls": [
+      "https://www.channelstv.com/2026/07/22/inuwa-expands-gombe-cabinet-swears-in-23-commissioners/",
+      "https://www.vanguardngr.com/2026/06/gov-inuwa-yahaya-sends-23-commissioner-nominees-to-gombe-assembly/",
+      "https://guardian.ng/breakingnews/yahaya-sends-three-commissioner-nominees-to-gombe-assembly-appoints-six-aides/",
+      "https://von.gov.ng/gombe-governor-creates-humanitarian-livestock-ministries/"
+    ],
+    "asOf": "July 2026"
+  },
+
+  "leaders": {},
+
+  "_notInThisTable": "Every commissioner and every parastatal chief executive. That includes GOHEALTH's own chief executive (the Gombe State Contributory Healthcare Management Agency), GSIRS, GSEMA, GOSIEC, GSPHCB, GICTDA, GSTC, GRTVC, GSUBEB, GSSB, GSSH and the rest. Press reports quote these offices without naming the holders.",
+
+  "principalOfficers": [
+    {
+      "position": "Executive Governor",
+      "name": "His Excellency, Muhammadu Inuwa Yahaya",
+      "asOf": "November 2026",
+      "source": "https://nigeria.gov.ng/states/gombe/",
+      "note": "In office since 29 May 2019, serving a second term after re-election in 2023. Swore in new local council chairmen after the 27 June 2026 council elections."
+    },
+    {
+      "position": "Deputy Governor",
+      "name": "His Excellency, Manassah Daniel Jatau",
+      "asOf": "not re-confirmed for 2026",
+      "source": "https://nigeria.gov.ng/states/gombe/",
+      "note": "Listed on the Federal Government's state profile. No 2026 source read confirms him still in office. Re-verify with Government House before the assistant states this name."
+    },
+    {
+      "position": "Secretary to the State Government (SSG)",
+      "name": "Prof. Ibrahim Abubakar Njodi",
+      "asOf": "September 2026",
+      "source": "https://guardian.ng/breakingnews/yahaya-sends-three-commissioner-nominees-to-gombe-assembly-appoints-six-aides/",
+      "note": "Announced the September 2026 round of appointments in this office."
+    },
+    {
+      "position": "Head of the Civil Service",
+      "name": "Mu'azu Shehu",
+      "asOf": "July 2026",
+      "source": "https://www.channelstv.com/2026/07/22/inuwa-expands-gombe-cabinet-swears-in-23-commissioners/",
+      "note": "Sworn in with the cabinet in July 2026."
+    },
+    {
+      "position": "Speaker, Gombe State House of Assembly",
+      "name": "Rt. Hon. Abubakar Mohammed Luggerewo",
+      "asOf": "June 2026",
+      "source": "https://www.vanguardngr.com/2026/06/gov-inuwa-yahaya-sends-23-commissioner-nominees-to-gombe-assembly/",
+      "note": "Addressee of the June 2026 commissioner-nomination letter."
+    }
+  ]
+}

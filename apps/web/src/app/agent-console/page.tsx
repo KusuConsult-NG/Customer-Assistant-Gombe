@@ -1,0 +1,967 @@
+"use client";
+import React, { useEffect, useState, useRef, useCallback } from 'react';
+import { API_URL, apiFetch } from '@/lib/api';
+import SelfieRequestPanel from '@/components/SelfieRequestPanel';
+import {
+  MessageSquareText, Phone, User, Send, Bot,
+  ToggleLeft, ToggleRight, Search, RefreshCw,
+  Wifi, WifiOff, MessageCircle, Clock, Filter,
+  ChevronDown, Circle, Zap, Tag, ShieldCheck, Mail, FileText, Radio
+} from 'lucide-react';
+import {
+  CHANNEL_LABEL,
+  formatDuration,
+  freshness,
+  liveTitle,
+  type LiveConversation,
+  type LiveConversationsPayload,
+} from '@/lib/live-conversations';
+
+interface Message {
+  id?: string;
+  sender: 'CUSTOMER' | 'AI' | 'HUMAN_AGENT' | 'SYSTEM' | string;
+  content: string;
+  sentAt?: string;
+  createdAt?: string;
+}
+
+interface Conversation {
+  id: string;
+  contactName?: string;
+  contact?: { id?: string; fullName?: string; phoneNumber?: string; email?: string };
+  channel: string;
+  status: string;
+  isHumanHandoffActive?: boolean;
+  updatedAt?: string;
+  messages?: Message[];
+}
+
+/**
+ * Canned replies an agent can insert with one click.
+ *
+ * Deliberately free of any payment details, any price, and any URL. One of
+ * these used to read "Transfer to Providus Bank Acc: 9928374102" — an account
+ * no tenant on this platform owns — one click away from being sent to a paying
+ * customer. Payment instructions must come from the organization's own
+ * configured details (Settings → payout account), which the AI
+ * payment-guidance tool reads.
+ *
+ * The same defect came back in another costume: a reply quoting a health
+ * scheme's two premium amounts and linking to /pay/informal, a page that no
+ * longer exists. An operator sending that gave a citizen a stale price and a
+ * dead link. These are generic on purpose — an agency's own wording belongs in
+ * its knowledge base, not compiled into the console.
+ */
+const QUICK_REPLIES = [
+  "Hello, thank you for contacting us. How can I help you today?",
+  "Could you please confirm your full name and the phone number registered with us?",
+  "Which Local Government Area are you contacting us from, so I can direct you to your nearest office?",
+  "I have logged your request. Your reference number is on the way — please keep it for any follow-up.",
+  "I am passing this to a colleague who can help with it directly. They will come back to you on this number.",
+  "I have logged your complaint. It will be reviewed as a priority and someone will contact you.",
+];
+
+export default function AgentConsolePage() {
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [msgLoading, setMsgLoading] = useState(false);
+  const [isHumanActive, setIsHumanActive] = useState(false);
+  const [handoffError, setHandoffError] = useState<string | null>(null);
+  const [replyText, setReplyText] = useState('');
+  const [sending, setSending] = useState(false);
+  const [search, setSearch] = useState('');
+  const [channelFilter, setChannelFilter] = useState<string>('ALL');
+  const [wsConnected, setWsConnected] = useState(false);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // ── Conversations the hosted agent is running right now ────────────────────
+  //
+  // Separate state, separate list, separate selection. These are not rows in
+  // our database — they exist only on ElevenLabs until the call ends and the
+  // post-call webhook lands. Merging them into `conversations` would put a
+  // reply box in front of a call that cannot receive one.
+  const [live, setLive] = useState<LiveConversation[]>([]);
+  const [livePolledAt, setLivePolledAt] = useState<string | null>(null);
+  const [liveId, setLiveId] = useState<string | null>(null);
+  const [takingOver, setTakingOver] = useState(false);
+  const [takeoverNote, setTakeoverNote] = useState<{ ok: boolean; text: string } | null>(null);
+  // Re-renders the "updated Ns ago" label as it ages, so a stalled feed looks
+  // stalled instead of looking current.
+  const [, setClockTick] = useState(0);
+
+  const token = typeof window !== 'undefined' ? localStorage.getItem('ace_token') : '';
+  const headers = { Authorization: `Bearer ${token}` };
+
+  const fetchConversations = useCallback(async () => {
+    try {
+      const res = await apiFetch(`${API_URL}/api/conversations`, { headers });
+      if (res.ok) {
+        const data = await res.json();
+        setConversations(data || []);
+      } else {
+        setConversations([]);
+      }
+    } catch {
+      setConversations([]);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const fetchMessages = useCallback(async (convId: string) => {
+    setMsgLoading(true);
+    try {
+      const res = await apiFetch(`${API_URL}/api/conversations/${convId}/messages`, { headers });
+      if (res.ok) {
+        const data = await res.json();
+        setMessages(data || []);
+      } else {
+        setMessages([]);
+      }
+    } catch {
+      setMessages([]);
+    } finally {
+      setMsgLoading(false);
+    }
+  }, []);
+
+  /**
+   * The live snapshot on first paint.
+   *
+   * The socket delivers these every few seconds anyway, but a console that has
+   * just loaded should not sit empty for a poll interval — an operator looking
+   * at a blank panel during a live call assumes the feature is broken.
+   */
+  const fetchLive = useCallback(async () => {
+    try {
+      const res = await apiFetch(`${API_URL}/api/agent-provisioning/live`, { headers });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (Array.isArray(data)) {
+        setLive(data);
+        setLivePolledAt(new Date().toISOString());
+      }
+    } catch {
+      // Leave whatever the socket last delivered. Clearing the list on a failed
+      // fetch would make a live call vanish from the console mid-call.
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchConversations();
+    const interval = setInterval(fetchConversations, 8000);
+    return () => clearInterval(interval);
+  }, [fetchConversations]);
+
+  useEffect(() => {
+    fetchLive();
+  }, [fetchLive]);
+
+  useEffect(() => {
+    const tick = setInterval(() => setClockTick(t => t + 1), 1000);
+    return () => clearInterval(tick);
+  }, []);
+
+  useEffect(() => {
+    if (activeId) {
+      fetchMessages(activeId);
+    }
+  }, [activeId, fetchMessages]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
+
+  // The open thread, read from inside socket handlers without making the socket
+  // depend on it. This effect used to list `activeId` in its dependencies, so
+  // every click on a conversation tore the socket down and opened a new one —
+  // and on the server each disconnect/connect pair churns the live-feed watcher
+  // count that decides whether ElevenLabs is polled at all.
+  const activeIdRef = useRef<string | null>(null);
+  useEffect(() => { activeIdRef.current = activeId; }, [activeId]);
+
+  // Socket.IO real-time
+  useEffect(() => {
+    let socket: any = null;
+    let cleanup = false;
+
+    const connectSocket = async () => {
+      try {
+        const { io } = await import('socket.io-client');
+        socket = io(API_URL + '/events', {
+          transports: ['websocket', 'polling'],
+          auth: { token },
+        });
+
+        socket.on('connect', () => { if (!cleanup) setWsConnected(true); });
+        socket.on('disconnect', () => { if (!cleanup) setWsConnected(false); });
+
+        socket.on('new_message_received', (data: any) => {
+          if (!cleanup && data.conversationId === activeIdRef.current) {
+            setMessages(prev => [...prev, data.message]);
+          }
+          fetchConversations();
+        });
+
+        // Full snapshots, not deltas — replacing wholesale is the point. The
+        // server sends the entire transcript each poll precisely so a console
+        // that connected mid-call, or received a duplicate from another pod,
+        // ends up correct rather than appending the same turns twice.
+        socket.on('live_conversations', (data: LiveConversationsPayload) => {
+          if (cleanup) return;
+          setLive(data?.conversations ?? []);
+          setLivePolledAt(data?.polledAt ?? new Date().toISOString());
+        });
+
+        socket.on('live_conversation_ended', (data: { conversationId: string }) => {
+          if (cleanup) return;
+          setLive(prev => prev.filter(c => c.conversationId !== data?.conversationId));
+        });
+
+        const storedUser = localStorage.getItem('ace_user');
+        if (storedUser) {
+          const u = JSON.parse(storedUser);
+          socket.emit('join_organization', { organizationId: u.organizationId, userId: u.id || u.sub });
+        }
+      } catch {
+        setWsConnected(false);
+      }
+    };
+
+    connectSocket();
+
+    return () => {
+      cleanup = true;
+      socket?.disconnect();
+    };
+  }, [fetchConversations, token]);
+
+  const handleSend = async (e?: React.FormEvent, customText?: string) => {
+    if (e) e.preventDefault();
+    const text = customText || replyText;
+    if (!text.trim() || !activeId || !isHumanActive) return;
+
+    setSending(true);
+    if (!customText) setReplyText('');
+
+    const tempMsg: Message = {
+      id: 'temp-' + Date.now(),
+      sender: 'HUMAN_AGENT',
+      content: text,
+      sentAt: new Date().toISOString(),
+    };
+    setMessages(prev => [...prev, tempMsg]);
+
+    try {
+      // Use the WhatsApp-aware endpoint — this saves to DB AND delivers
+      // the message to the customer's WhatsApp number via the Cloud API.
+      // The generic /api/conversations/:id/messages only saves to DB.
+      const activeConvChannel = conversations.find(c => c.id === activeId)?.channel;
+      const endpoint = activeConvChannel === 'WHATSAPP'
+        ? `${API_URL}/api/whatsapp/conversations/${activeId}/messages`
+        : `${API_URL}/api/conversations/${activeId}/messages`;
+
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: text }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        console.error('Failed to send message:', err);
+        // Remove optimistic message on failure
+        setMessages(prev => prev.filter(m => m.id !== tempMsg.id));
+        setReplyText(text);
+      }
+    } catch (err) {
+      console.error('Failed to send message:', err);
+      setMessages(prev => prev.filter(m => m.id !== tempMsg.id));
+      setReplyText(text);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const activeConv = conversations.find(c => c.id === activeId);
+  const activeLive = live.find(c => c.conversationId === liveId) ?? null;
+
+  useEffect(() => {
+    if (activeConv) {
+      setIsHumanActive(Boolean(activeConv.isHumanHandoffActive));
+    }
+  }, [activeConv?.id, activeConv?.isHumanHandoffActive]);
+
+  /** Selecting one clears the other — they are different panes, not one list. */
+  const selectStored = (id: string) => {
+    setLiveId(null);
+    setActiveId(id);
+    setTakeoverNote(null);
+    const found = conversations.find(c => c.id === id);
+    setIsHumanActive(Boolean(found?.isHumanHandoffActive));
+  };
+  const selectLive = (id: string) => { setActiveId(null); setLiveId(id); setTakeoverNote(null); };
+
+  /**
+   * Hand a live call to a person.
+   *
+   * The server redirects the carrier call and reports what actually happened,
+   * so whatever comes back is shown verbatim — including a refusal. Inventing a
+   * cheerier message here would put an operator back at their desk believing a
+   * customer was rescued when they are still talking to the agent.
+   */
+  const handleTakeover = async () => {
+    if (!liveId || takingOver) return;
+    setTakingOver(true);
+    setTakeoverNote(null);
+    try {
+      const res = await apiFetch(`${API_URL}/api/agent-provisioning/live/${liveId}/takeover`, {
+        method: 'POST',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        setTakeoverNote({
+          ok: false,
+          text: data?.message || 'The transfer could not be attempted. The caller is still with the agent.',
+        });
+        return;
+      }
+      setTakeoverNote(
+        data?.taken
+          ? { ok: true, text: data.message }
+          : { ok: false, text: data?.reason || 'The call could not be transferred.' }
+      );
+      if (data?.taken) fetchLive();
+    } catch {
+      // A failed request is not a failed transfer — we genuinely do not know
+      // which. Say that rather than guessing either way.
+      setTakeoverNote({
+        ok: false,
+        text: 'Could not reach the server, so the transfer may or may not have happened. Check the call before trying again.',
+      });
+    } finally {
+      setTakingOver(false);
+    }
+  };
+
+  // A call that ended while it was open: keep the operator informed rather than
+  // silently emptying the pane.
+  const selectedLiveEnded = liveId !== null && activeLive === null;
+
+  const filteredConvs = conversations.filter(c => {
+    const name = (c.contact?.fullName || c.contactName || '').toLowerCase();
+    const matchSearch = name.includes(search.toLowerCase());
+    const matchChannel = channelFilter === 'ALL' || c.channel === channelFilter;
+    return matchSearch && matchChannel;
+  });
+
+  const channelBadge = (channel: string) => {
+    const map: Record<string, string> = {
+      WHATSAPP: 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/20',
+      VOICE: 'bg-purple-500/15 text-purple-700 dark:text-purple-400 border-purple-200 dark:border-purple-500/20',
+      WEBCHAT: 'bg-blue-500/15 text-blue-700 dark:text-blue-400 border-blue-200 dark:border-blue-500/20',
+    };
+    return map[channel] || 'bg-gray-500/15 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-500/20';
+  };
+
+  const handleToggleHandoff = async () => {
+    if (!activeId) return;
+    const newStatus = !isHumanActive;
+    setIsHumanActive(newStatus);
+    try {
+      // The channel-agnostic route. This used to call a WhatsApp-specific
+      // duplicate, with a comment claiming it was needed because it "updates
+      // assignedUserId + handoff flag" — which this route has always done. The
+      // difference was the other way round: only this one calls
+      // `notifyHandoffChanged`, so taking a thread over was invisible to every
+      // other console and two officers could each think they owned the citizen.
+      const res = await apiFetch(`${API_URL}/api/conversations/${activeId}/handoff`, {
+        method: 'PATCH',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ handoff: newStatus }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        throw new Error(
+          (Array.isArray(body?.message) ? body.message.join(' ') : body?.message) ||
+          'Could not change who is handling this conversation.'
+        );
+      }
+      fetchConversations();
+    } catch (err: any) {
+      console.error('Failed to toggle handoff:', err);
+      setIsHumanActive(!newStatus);
+      setHandoffError(err?.message || 'Could not change who is handling this conversation.');
+    }
+  };
+
+  return (
+    <div className="flex h-[calc(100vh-8.5rem)] gap-4">
+      {/*
+        Full-height split pane with no room for a visible title, but it still
+        needs a page heading: without one the document's only h1 is the app
+        shell's "Customer Care Agent", so every route announces identically to a
+        screen reader.
+      */}
+      <h1 className="sr-only">Agent Console</h1>
+      {/* Left: Conversation List */}
+      <div className="w-80 flex-shrink-0 flex flex-col border border-slate-200 dark:border-slate-800 rounded-2xl bg-white dark:bg-slate-900/80 overflow-hidden">
+        <div className="p-4 border-b border-slate-200 dark:border-slate-800 space-y-3">
+          <div className="flex items-center justify-between">
+            <h2 className="font-bold text-slate-900 dark:text-white text-sm flex items-center gap-2">
+              <MessageSquareText className="w-4 h-4 text-blue-700 dark:text-blue-400" />
+              Live Inbox
+              <span className="text-xs px-1.5 py-0.5 rounded bg-blue-100 dark:bg-blue-500/20 text-blue-700 dark:text-blue-400 font-bold">
+                {conversations.length}
+              </span>
+            </h2>
+            <div className="flex items-center gap-2">
+              {wsConnected
+                ? <span className="flex items-center gap-1 text-[10px] text-emerald-700 dark:text-emerald-400 font-bold"><Wifi className="w-3 h-3" /> Live</span>
+                : <span className="flex items-center gap-1 text-[10px] text-slate-500 dark:text-slate-400"><WifiOff className="w-3 h-3" /> Offline</span>
+              }
+              <button onClick={fetchConversations} className="text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:text-slate-300 transition-colors">
+                <RefreshCw className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+
+          <div className="relative">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-500 dark:text-slate-400" />
+            <input
+              type="text"
+              placeholder="Search contacts..."
+              value={search}
+              onChange={e => setSearch(e.target.value)}
+              className="w-full pl-9 pr-3 py-2 rounded-lg bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-800 text-xs text-slate-900 dark:text-white placeholder-gray-600 focus:outline-none focus:ring-1 focus:ring-blue-500/30"
+            />
+          </div>
+
+          {/* Channel Filters */}
+          <div className="flex gap-1">
+            {['ALL', 'WHATSAPP', 'VOICE', 'WEBCHAT'].map(ch => (
+              <button
+                key={ch}
+                onClick={() => setChannelFilter(ch)}
+                className={`flex-1 py-1 rounded text-[10px] font-bold uppercase tracking-wider transition-colors ${
+                  channelFilter === ch ? 'bg-brand-600 text-white' : 'text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:bg-slate-800/60'
+                }`}
+              >
+                {ch === 'WHATSAPP' ? 'WA' : ch}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/*
+          Live now — conversations the hosted agent is running at this moment.
+
+          Deliberately a separate section above the stored list, not merged into
+          it. These have no row in our database yet, cannot be replied to, and
+          disappear when the call ends; a stored conversation does none of those
+          things. Listed together, the only thing telling them apart would be a
+          badge, and an operator would eventually type into one.
+        */}
+        {live.length > 0 && (
+          <div className="border-b border-slate-200 dark:border-slate-800">
+            <div className="px-4 pt-3 pb-2 flex items-center justify-between">
+              <h3 className="text-[10px] font-bold uppercase tracking-wider text-rose-600 dark:text-rose-400 flex items-center gap-1.5">
+                <Radio className="w-3 h-3" /> AI on a call now
+                <span className="px-1.5 py-0.5 rounded bg-rose-100 dark:bg-rose-500/20">{live.length}</span>
+              </h3>
+              {/*
+                The feed is polled every few seconds, not streamed. Saying how
+                old it is keeps the console from promising something it cannot
+                deliver — and makes a stalled poller visible instead of leaving
+                a frozen transcript looking like a quiet call.
+              */}
+              <span className="text-[10px] text-slate-500 dark:text-slate-400" title="This view is polled, not streamed">
+                {freshness(livePolledAt)}
+              </span>
+            </div>
+            <div className="px-2 pb-2 space-y-1">
+              {live.map(conv => {
+                const isActive = liveId === conv.conversationId;
+                const last = conv.turns[conv.turns.length - 1];
+                return (
+                  <button
+                    key={conv.conversationId}
+                    onClick={() => selectLive(conv.conversationId)}
+                    className={`w-full text-left p-3 rounded-xl transition-all ${
+                      isActive
+                        ? 'bg-rose-50 dark:bg-rose-500/10 border border-rose-200 dark:border-rose-500/20'
+                        : 'hover:bg-slate-50 dark:hover:bg-slate-800/60 border border-transparent'
+                    }`}
+                  >
+                    <div className="flex items-start gap-2.5">
+                      <div className="w-8 h-8 rounded-full flex-shrink-0 flex items-center justify-center bg-rose-100 dark:bg-rose-500/20 text-rose-600 dark:text-rose-400">
+                        {conv.channel === 'voice' ? <Phone className="w-3.5 h-3.5" /> : <MessageCircle className="w-3.5 h-3.5" />}
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center justify-between gap-1">
+                          <span className="text-xs font-semibold text-slate-800 dark:text-slate-200 truncate font-mono">
+                            {liveTitle(conv)}
+                          </span>
+                          <span className="text-[9px] px-1.5 py-0.5 rounded-full font-bold border border-rose-200 dark:border-rose-500/20 bg-rose-500/15 text-rose-600 dark:text-rose-400">
+                            {formatDuration(conv.durationSecs)}
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-500 dark:text-slate-400 truncate mt-0.5">
+                          {last ? `${last.role === 'user' ? 'Customer' : 'AI'}: ${last.message}` : 'Connecting…'}
+                        </p>
+                      </div>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* List */}
+        <div className="flex-1 overflow-y-auto p-2 space-y-1">
+          {loading ? (
+            [1, 2, 3].map(i => <div key={i} className="h-16 bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 shadow-sm rounded-xl animate-pulse" />)
+          ) : filteredConvs.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-12 text-slate-500 dark:text-slate-400 px-4 text-center">
+              <MessageCircle className="w-8 h-8 mb-2 opacity-30" />
+              <p className="text-sm text-slate-500 dark:text-slate-400">No conversations</p>
+              <p className="text-xs mt-1">Incoming customer chats will appear here automatically.</p>
+            </div>
+          ) : (
+            filteredConvs.map(conv => {
+              const name = conv.contact?.fullName || conv.contactName || 'Unknown Contact';
+              const isActive = activeId === conv.id;
+              return (
+                <button
+                  key={conv.id}
+                  onClick={() => selectStored(conv.id)}
+                  className={`w-full text-left p-3 rounded-xl transition-all ${
+                    isActive ? 'bg-blue-50 dark:bg-blue-500/10 border border-blue-200 dark:border-blue-500/20' : 'hover:bg-slate-50 dark:hover:bg-slate-800/60 border border-transparent'
+                  }`}
+                >
+                  <div className="flex items-start gap-2.5">
+                    <div className={`w-8 h-8 rounded-full flex-shrink-0 flex items-center justify-center text-xs font-bold ${
+                      isActive ? 'bg-blue-500/30 text-blue-700 dark:text-blue-300' : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400'
+                    }`}>
+                      {name[0]?.toUpperCase() || '?'}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center justify-between gap-1">
+                        <span className="text-xs font-semibold text-slate-800 dark:text-slate-200 truncate">{name}</span>
+                        <span className={`text-[9px] px-1.5 py-0.5 rounded-full font-bold border ${channelBadge(conv.channel)}`}>
+                          {conv.channel}
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-slate-500 dark:text-slate-400 truncate mt-0.5">
+                        {conv.messages?.[0]?.content || 'Active conversation'}
+                      </p>
+                    </div>
+                  </div>
+                </button>
+              );
+            })
+          )}
+        </div>
+      </div>
+
+      {/* Middle: Chat Window */}
+      <div className="flex-1 flex flex-col border border-slate-200 dark:border-slate-800 rounded-2xl bg-white dark:bg-slate-900/80 overflow-hidden">
+        {liveId ? (
+          /*
+            A live call, read-only.
+
+            No reply box, deliberately. The conversation is being run by
+            ElevenLabs; anything typed here would be saved nowhere and spoken to
+            nobody. Taking over means telling ElevenLabs to stop responding
+            first, which is C3 — until that exists, offering an input would be a
+            control that silently does nothing.
+          */
+          <>
+            <div className="h-16 px-5 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between flex-shrink-0">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-full bg-rose-100 dark:bg-rose-500/20 text-rose-600 dark:text-rose-400 flex items-center justify-center">
+                  {activeLive?.channel === 'voice' ? <Phone className="w-4 h-4" /> : <MessageCircle className="w-4 h-4" />}
+                </div>
+                <div>
+                  <h3 className="font-bold text-slate-900 dark:text-slate-100 text-sm font-mono">
+                    {activeLive ? liveTitle(activeLive) : 'Call ended'}
+                  </h3>
+                  <div className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
+                    {activeLive && (
+                      <>
+                        <span className={`px-1.5 py-0.5 rounded-full text-[10px] font-bold border ${channelBadge(CHANNEL_LABEL[activeLive.channel])}`}>
+                          {CHANNEL_LABEL[activeLive.channel]}
+                        </span>
+                        <span className="flex items-center gap-1"><Clock className="w-3 h-3" /> {formatDuration(activeLive.durationSecs)}</span>
+                      </>
+                    )}
+                  </div>
+                </div>
+              </div>
+              <span className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border bg-rose-50 dark:bg-rose-500/10 text-rose-600 dark:text-rose-400 border-rose-200 dark:border-rose-500/30">
+                <Radio className="w-3.5 h-3.5" /> AI is handling this
+              </span>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-5 space-y-3">
+              {selectedLiveEnded ? (
+                <div className="flex flex-col items-center justify-center h-full text-slate-500 dark:text-slate-400 text-center px-6">
+                  <Phone className="w-10 h-10 mb-3 opacity-20" />
+                  <p className="text-sm font-semibold text-slate-600 dark:text-slate-400">This call has ended.</p>
+                  <p className="text-xs mt-1 max-w-sm">
+                    The full transcript is saved to the customer&apos;s record once ElevenLabs
+                    delivers it — usually within a few seconds.
+                  </p>
+                  <button
+                    onClick={() => setLiveId(null)}
+                    className="mt-4 px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300"
+                  >
+                    Back to inbox
+                  </button>
+                </div>
+              ) : activeLive && activeLive.turns.length === 0 ? (
+                <div className="flex flex-col items-center justify-center h-full text-slate-500 dark:text-slate-400">
+                  <Radio className="w-10 h-10 mb-3 opacity-20 animate-pulse" />
+                  <p className="text-sm">Connected. Nothing said yet.</p>
+                </div>
+              ) : (
+                activeLive?.turns.map((turn, i) => {
+                  const isCustomer = turn.role === 'user';
+                  return (
+                    <div key={`${turn.timeInCallSecs}-${i}`} className={`flex ${isCustomer ? 'justify-start' : 'justify-end'}`}>
+                      {isCustomer && (
+                        <div className="w-7 h-7 rounded-full bg-slate-100 dark:bg-slate-800 flex items-center justify-center mr-2 flex-shrink-0 mt-1">
+                          <User className="w-3.5 h-3.5 text-slate-600 dark:text-slate-400" />
+                        </div>
+                      )}
+                      <div className={`max-w-[65%] rounded-2xl px-4 py-2.5 text-sm ${
+                        isCustomer
+                          ? 'bg-white/[0.06] text-slate-800 dark:text-slate-200 rounded-tl-sm border border-slate-200 dark:border-slate-800'
+                          : 'bg-blue-600/80 text-white rounded-tr-sm'
+                      }`}>
+                        {!isCustomer && (
+                          <div className="flex items-center gap-1.5 mb-1 opacity-70">
+                            <Bot className="w-3 h-3" />
+                            <span className="text-[9px] uppercase font-bold tracking-wider">AI Assistant</span>
+                          </div>
+                        )}
+                        <p className="leading-relaxed">{turn.message}</p>
+                        <span className="text-[9px] opacity-50 mt-1 block text-right">
+                          {formatDuration(turn.timeInCallSecs)}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+
+            {!selectedLiveEnded && (
+              <div className="p-4 border-t border-slate-200 dark:border-slate-800 flex-shrink-0 space-y-2">
+                {takeoverNote && (
+                  <div
+                    role="status"
+                    className={`px-3 py-2 rounded-lg text-xs border flex items-start gap-2 ${
+                      takeoverNote.ok
+                        ? 'bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-500/30'
+                        : 'bg-amber-50 dark:bg-amber-500/10 text-amber-800 dark:text-amber-300 border-amber-200 dark:border-amber-500/30'
+                    }`}
+                  >
+                    <span>{takeoverNote.text}</span>
+                  </div>
+                )}
+
+                {activeLive?.channel === 'voice' ? (
+                  <div className="flex items-center gap-3">
+                    <button
+                      onClick={handleTakeover}
+                      disabled={takingOver}
+                      className="px-3 py-2 rounded-lg text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 text-white disabled:opacity-50 flex items-center gap-2 transition-colors"
+                    >
+                      <Phone className="w-3.5 h-3.5" />
+                      {takingOver ? 'Transferring…' : 'Transfer to a person'}
+                    </button>
+                    {/*
+                      Says where the call is going and what happens to the AI,
+                      because "take over" on its own reads like joining the call.
+                      It does not: the call leaves the agent entirely.
+                    */}
+                    <span className="text-xs text-slate-500 dark:text-slate-400">
+                      Sends this call to your forwarding number. The AI drops off.
+                    </span>
+                  </div>
+                ) : (
+                  <div className="px-3 py-2 rounded-lg bg-slate-100 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-800 text-xs text-slate-600 dark:text-slate-400 flex items-start gap-2">
+                    <Bot className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+                    {/*
+                      No button at all for WhatsApp, and the reason stated. The
+                      only lever ElevenLabs offers silences the agent for every
+                      customer on the number — that is an outage, not a handoff,
+                      and it lives in settings under its own name.
+                    */}
+                    <span>
+                      Read-only. A WhatsApp conversation cannot be taken over one at a time —
+                      the hosted agent answers the whole line, and the only way to stop it
+                      affects every customer messaging that number.
+                    </span>
+                  </div>
+                )}
+              </div>
+            )}
+          </>
+        ) : activeConv ? (
+          <>
+            {/* Header */}
+            <div className="h-16 px-5 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between flex-shrink-0">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-full bg-blue-100 dark:bg-blue-500/20 text-blue-700 dark:text-blue-400 flex items-center justify-center text-sm font-bold">
+                  {(activeConv.contact?.fullName || activeConv.contactName || '?')[0].toUpperCase()}
+                </div>
+                <div>
+                  <h3 className="font-bold text-slate-900 dark:text-slate-100 text-sm">{activeConv.contact?.fullName || activeConv.contactName || 'Unknown Contact'}</h3>
+                  <div className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
+                    <span className={`px-1.5 py-0.5 rounded-full text-[10px] font-bold border ${channelBadge(activeConv.channel)}`}>
+                      {activeConv.channel}
+                    </span>
+                    <span>{activeConv.contact?.phoneNumber || ''}</span>
+                  </div>
+                </div>
+              </div>
+
+              {activeConv.channel !== 'VOICE' && (
+                <button
+                  onClick={handleToggleHandoff}
+                  className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all ${
+                    isHumanActive
+                      ? 'bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/30'
+                      : 'bg-slate-50 dark:bg-slate-800/60 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700 hover:border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  {isHumanActive ? <ToggleRight className="w-4 h-4" /> : <ToggleLeft className="w-4 h-4" />}
+                  {isHumanActive ? 'Human Takeover Active' : 'AI Assistant Handling'}
+                </button>
+              )}
+            </div>
+
+            {/* The toggle reverts on failure; this says why, because a silent
+                revert reads as a button that does not work. */}
+            {handoffError && (
+              <div className="px-5 py-2 bg-red-50 dark:bg-red-500/10 border-b border-red-200 dark:border-red-500/20 flex items-center justify-between gap-3">
+                <span className="text-xs text-red-700 dark:text-red-300">{handoffError}</span>
+                <button
+                  onClick={() => setHandoffError(null)}
+                  aria-label="Dismiss"
+                  className="text-xs font-bold text-red-700 dark:text-red-300 hover:underline shrink-0"
+                >
+                  Dismiss
+                </button>
+              </div>
+            )}
+
+            {/* Messages */}
+            <div className="flex-1 overflow-y-auto p-5 space-y-3">
+              {msgLoading ? (
+                <div className="flex items-center justify-center py-20">
+                  <div className="w-6 h-6 rounded-full border-2 border-blue-500 border-t-transparent animate-spin" />
+                </div>
+              ) : messages.length === 0 ? (
+                <div className="flex flex-col items-center justify-center h-full text-slate-500 dark:text-slate-400">
+                  <MessageCircle className="w-10 h-10 mb-3 opacity-20" />
+                  <p className="text-sm">No messages yet.</p>
+                </div>
+              ) : (
+                messages.map((msg, i) => {
+                  const isCustomer = msg.sender === 'CUSTOMER';
+                  const isHumanMsg = msg.sender === 'HUMAN_AGENT';
+                  return (
+                    <div key={msg.id || i} className={`flex ${isCustomer ? 'justify-start' : 'justify-end'}`}>
+                      {isCustomer && (
+                        <div className="w-7 h-7 rounded-full bg-slate-100 dark:bg-slate-800 flex items-center justify-center mr-2 flex-shrink-0 mt-1">
+                          <User className="w-3.5 h-3.5 text-slate-600 dark:text-slate-400" />
+                        </div>
+                      )}
+                      <div className={`max-w-[65%] rounded-2xl px-4 py-2.5 text-sm ${
+                        isCustomer
+                          ? 'bg-white/[0.06] text-slate-800 dark:text-slate-200 rounded-tl-sm border border-slate-200 dark:border-slate-800'
+                          : isHumanMsg
+                            ? 'bg-emerald-600/80 text-white rounded-tr-sm'
+                            : 'bg-blue-600/80 text-white rounded-tr-sm'
+                      }`}>
+                        {!isCustomer && (
+                          <div className="flex items-center gap-1.5 mb-1 opacity-70">
+                            {isHumanMsg ? <User className="w-3 h-3" /> : <Bot className="w-3 h-3" />}
+                            <span className="text-[9px] uppercase font-bold tracking-wider">
+                              {isHumanMsg ? 'Human Agent' : 'AI Assistant'}
+                            </span>
+                          </div>
+                        )}
+                        <p className="leading-relaxed">{msg.content}</p>
+                        {(msg.sentAt || msg.createdAt) && (
+                          <span className="text-[9px] opacity-50 mt-1 block text-right">
+                            {new Date(msg.sentAt || msg.createdAt || '').toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+              <div ref={messagesEndRef} />
+            </div>
+
+            {/* Quick replies bar */}
+            {isHumanActive && activeConv.channel !== 'VOICE' && (
+              <div className="px-4 py-2 bg-slate-100 dark:bg-slate-800/60 border-t border-slate-200 dark:border-slate-800 flex items-center gap-2 overflow-x-auto">
+                <span className="text-[10px] font-bold text-slate-500 dark:text-slate-400 uppercase flex items-center gap-1 flex-shrink-0">
+                  <Zap className="w-3 h-3 text-amber-700 dark:text-amber-400" /> Quick Snippets:
+                </span>
+                {QUICK_REPLIES.map((reply, idx) => (
+                  <button
+                    key={idx}
+                    onClick={() => handleSend(undefined, reply)}
+                    className="px-2.5 py-1 rounded-lg bg-slate-50 dark:bg-slate-800/60 hover:bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 text-xs truncate max-w-[200px] flex-shrink-0 border border-slate-200 dark:border-slate-800 transition-colors"
+                  >
+                    {reply}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {/* Input box */}
+            <div className="p-4 border-t border-slate-200 dark:border-slate-800 flex-shrink-0">
+              {activeConv.channel === 'VOICE' ? (
+                <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-2.5 bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 rounded-xl">
+                  <div className="text-xs text-slate-600 dark:text-slate-300">
+                    <span className="font-bold text-slate-900 dark:text-white">Voice Call Transcript</span> — Completed voice call record. Use Voice / Telephony to call back or Cases to follow up.
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <a
+                      href="/telephony"
+                      className="px-3 py-1.5 rounded-lg text-xs font-bold bg-brand-600 hover:bg-blue-700 text-white transition-colors"
+                    >
+                      Call Citizen Back
+                    </a>
+                    <a
+                      href="/cases"
+                      className="px-3 py-1.5 rounded-lg text-xs font-bold bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-100 transition-colors"
+                    >
+                      View Cases
+                    </a>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  {!isHumanActive && (
+                    <div className="mb-2 px-3 py-1.5 rounded-lg bg-blue-50 dark:bg-blue-500/10 border border-blue-200 dark:border-blue-500/20 text-xs text-blue-700 dark:text-blue-300 flex items-center gap-2">
+                      <Bot className="w-3.5 h-3.5" />
+                      AI Agent is currently answering automatically. Click "Human Takeover" above to take control.
+                    </div>
+                  )}
+                  <form onSubmit={e => handleSend(e)} className="flex gap-2">
+                    <input
+                      type="text"
+                      value={replyText}
+                      onChange={e => setReplyText(e.target.value)}
+                      placeholder={isHumanActive ? "Type your message to customer..." : "Enable Human Takeover to type"}
+                      disabled={!isHumanActive || sending}
+                      className="flex-1 px-4 py-2.5 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white placeholder-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500/40 disabled:opacity-40 text-sm"
+                    />
+                    <button
+                      type="submit"
+                      disabled={!isHumanActive || !replyText.trim() || sending}
+                      className="px-4 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white flex items-center justify-center disabled:opacity-40 transition-all shadow-lg shadow-brand-600/20"
+                    >
+                      <Send className="w-4 h-4" />
+                    </button>
+                  </form>
+                </>
+              )}
+            </div>
+          </>
+        ) : (
+          <div className="flex-1 flex flex-col items-center justify-center text-slate-500 dark:text-slate-400">
+            <MessageSquareText className="w-14 h-14 mb-3 opacity-20" />
+            <h3 className="text-slate-600 dark:text-slate-400 font-semibold text-sm">Select a Conversation</h3>
+            <p className="text-xs text-center max-w-xs text-slate-500 dark:text-slate-400 mt-1">
+              Choose a customer thread from the left panel to inspect message history and engage in real time.
+            </p>
+          </div>
+        )}
+      </div>
+
+      {/* Right: Contact Context Panel */}
+      {activeConv && (
+        <div className="w-72 flex-shrink-0 border border-slate-200 dark:border-slate-800 rounded-2xl bg-white dark:bg-slate-900/80 p-4 space-y-4 overflow-y-auto hidden xl:block">
+          <div className="text-center pb-4 border-b border-slate-200 dark:border-slate-800">
+            <div className="w-14 h-14 rounded-full bg-blue-100 dark:bg-blue-500/20 text-blue-700 dark:text-blue-400 font-bold text-lg flex items-center justify-center mx-auto mb-2">
+              {(activeConv.contact?.fullName || activeConv.contactName || '?')[0].toUpperCase()}
+            </div>
+            <h4 className="font-bold text-slate-900 dark:text-white text-sm">{activeConv.contact?.fullName || activeConv.contactName || 'Unknown Customer'}</h4>
+            <p className="text-xs font-mono text-blue-700 dark:text-blue-400 mt-0.5">{activeConv.contact?.phoneNumber || 'No phone'}</p>
+          </div>
+
+          <div className="space-y-3">
+            <div>
+              <p className="text-[10px] font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-1">Email</p>
+              <p className="text-xs text-slate-700 dark:text-slate-300 flex items-center gap-1.5"><Mail className="w-3.5 h-3.5 text-slate-500 dark:text-slate-400" /> {activeConv.contact?.email || 'Not specified'}</p>
+            </div>
+
+            <div>
+              <p className="text-[10px] font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-1">Channel Source</p>
+              <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${channelBadge(activeConv.channel)}`}>
+                {activeConv.channel}
+              </span>
+            </div>
+
+            <div>
+              <p className="text-[10px] font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-1">Tags</p>
+              <div className="flex gap-1 flex-wrap">
+                <span className="px-2 py-0.5 rounded text-[10px] bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 border border-blue-200 dark:border-blue-500/20">{activeConv.channel}</span>
+                {isHumanActive
+                  ? <span className="px-2 py-0.5 rounded text-[10px] bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-500/20">Human Takeover</span>
+                  : <span className="px-2 py-0.5 rounded text-[10px] bg-purple-50 dark:bg-purple-500/10 text-purple-700 dark:text-purple-400 border border-purple-200 dark:border-purple-500/20">AI Handling</span>
+                }
+              </div>
+            </div>
+
+            {/* Onboarding selfie. Needs a real contact id — a conversation whose contact
+                was never resolved has nothing to attach a photo to. */}
+            {activeConv.contact?.id && (
+              <div className="pt-3 border-t border-slate-200 dark:border-slate-800">
+                <SelfieRequestPanel
+                  contactId={activeConv.contact.id}
+                  contactName={activeConv.contact.fullName || activeConv.contactName}
+                  conversationId={activeConv.id}
+                  channel={activeConv.channel === 'VOICE' ? 'VOICE' : 'WHATSAPP'}
+                />
+              </div>
+            )}
+
+            <div className="pt-3 border-t border-slate-200 dark:border-slate-800 space-y-2">
+              <p className="text-[10px] font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider">Last Message</p>
+              <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 text-xs text-slate-600 dark:text-slate-400 leading-relaxed">
+                {messages.length > 0
+                  ? <>
+                      <span className="text-[9px] uppercase font-bold text-slate-500 dark:text-slate-400 block mb-1">
+                        {messages[messages.length - 1]?.sender === 'CUSTOMER' ? '👤 Customer' :
+                         messages[messages.length - 1]?.sender === 'HUMAN_AGENT' ? '🧑‍💼 Agent' : '🤖 AI'}
+                      </span>
+                      {(messages[messages.length - 1]?.content || '').slice(0, 100)}
+                      {(messages[messages.length - 1]?.content || '').length > 100 ? '…' : ''}
+                    </>
+                  : <span className="text-slate-500 dark:text-slate-400 italic">No messages yet</span>
+                }
+              </div>
+              {messages.length > 0 && (
+                <p className="text-[10px] text-slate-500 dark:text-slate-400">{messages.length} message{messages.length !== 1 ? 's' : ''} in thread</p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

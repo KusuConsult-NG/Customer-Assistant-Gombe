@@ -1,0 +1,1028 @@
+/**
+ * Behavioural guards for ConversationOrchestrator.
+ *
+ * These lock in the fixes for things the orchestrator used to assert to real
+ * customers: that it was a human, that a fabricated appointment was confirmed, and
+ * that money should be sent to a hardcoded bank account.
+ *
+ * Prisma is mocked, so these run without a database.
+ */
+
+const mockPrisma = {
+  organization: { findUnique: jest.fn() },
+  conversation: { findUnique: jest.fn(), findFirst: jest.fn(), update: jest.fn(), upsert: jest.fn() },
+  booking: { findFirst: jest.fn(), findMany: jest.fn(), create: jest.fn(), update: jest.fn() },
+  reservation: { findFirst: jest.fn(), findMany: jest.fn(), create: jest.fn(), update: jest.fn() },
+  contact: { findFirst: jest.fn(), create: jest.fn() },
+  ticket: { create: jest.fn() },
+  deal: { findMany: jest.fn() },
+  documentChunk: { findMany: jest.fn() },
+};
+
+/**
+ * Only `prisma` is replaced. The pure helpers stay real.
+ *
+ * Replacing the whole module used to be fine — it exported little else that the
+ * orchestrator touched. Then phone-number normalisation landed, the orchestrator
+ * started calling `phoneNumberVariants` on the contact lookup, and this mock
+ * handed it `undefined`. Every tool that resolves a contact first threw, took
+ * the honest `toolFailureReply()` path, and three tests failed claiming bookings
+ * were no longer created — a real-looking regression in code that was fine.
+ *
+ * Required from the source file rather than the package entrypoint on purpose:
+ * the entrypoint constructs a PrismaClient at import time, which is the whole
+ * reason `prisma` is mocked here.
+ */
+jest.mock('@ace/database', () => ({
+  ...jest.requireActual('../../database/src/cases'),
+  ...jest.requireActual('../../database/src/knowledge-gaps'),
+  ...jest.requireActual('../../database/src/state-geography'),
+  ...jest.requireActual('../../database/src/budget'),
+  ...jest.requireActual('../../database/src/phone-number'),
+  ...jest.requireActual('../../database/src/callback'),
+  ...jest.requireActual('../../database/src/credentials'),
+  ...jest.requireActual('../../database/src/ticket-number'),
+  ...jest.requireActual('../../database/src/faq-match'),
+  ...jest.requireActual('../../database/src/document-chunks'),
+  ...jest.requireActual('../../database/src/outbound-hours'),
+  // `ensureContactForPhone` lives here, and these suites replace the whole
+  // module: leaving it out makes it `undefined`, the flow throws where it
+  // creates the citizen's record, and every booking test fails as a silent
+  // fallback to BOOK_APPOINTMENT rather than as a missing import.
+  ...jest.requireActual('../../database/src/contact-identity'),
+  ...jest.requireActual('../../database/src/availability'),
+  ...jest.requireActual('../../database/src/service-hours'),
+  ...jest.requireActual('../../database/src/service-catalogue'),
+  ...jest.requireActual('../../database/src/booking-conflicts'),
+  prisma: mockPrisma,
+  upsertEnrollee: jest.fn(),
+  // Stubbed, not required actual: audit.ts imports the real prisma client
+  // from ./index, and these suites exist to avoid constructing one.
+  recordAgencyAuditBestEffort: jest.fn(),
+  // selfie-request.ts imports the real prisma client from ./index, which is
+  // the thing these suites exist to avoid — so it is stubbed, like audit.
+  createSelfieRequest: jest.fn(),
+  selfieUploadUrl: jest.fn(),
+  Prisma: { DbNull: null },
+}));
+
+import { ConversationOrchestrator } from '../src/index';
+import { ChannelType, MessageSender } from '@ace/shared-types';
+
+const baseContext = () => ({
+  conversationId: 'conv_abc123def',
+  organizationId: 'org_1',
+  customerPhoneNumber: '+2348031234567',
+  channel: ChannelType.WHATSAPP,
+  history: [],
+  slots: {},
+  isHumanHandoffActive: false,
+});
+
+describe('ConversationOrchestrator', () => {
+  let orchestrator: ConversationOrchestrator;
+  let storedFlowState: any = null;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    // No OpenAI key: exercise the deterministic paths, not the LLM.
+    delete process.env.OPENAI_API_KEY;
+
+    mockPrisma.organization.findUnique.mockResolvedValue({
+      name: 'Apex Care',
+      aiPersonaPrompt: null,
+      welcomeMessage: 'Hello from Apex Care!',
+      payoutBankName: null,
+      payoutAccountName: null,
+      payoutAccountNumber: null,
+      payoutUssdCode: null,
+    });
+    mockPrisma.documentChunk.findMany.mockResolvedValue([]);
+    mockPrisma.booking.findMany.mockResolvedValue([]);
+    mockPrisma.reservation.findMany.mockResolvedValue([]);
+    mockPrisma.contact.findFirst.mockResolvedValue({ id: 'contact_1', fullName: 'Ada' });
+
+    // The mocked conversation row REMEMBERS its flowState, so a multi-turn flow
+    // can be driven to completion here the way a real one is. Without this a
+    // flow starts, saves state into a mock that forgets it, and the next
+    // message begins again from nothing — which looks exactly like the flow
+    // being broken rather than the mock being too shallow.
+    storedFlowState = null;
+    mockPrisma.conversation.findUnique.mockImplementation(async () => ({
+      id: 'conv_abc123def',
+      flowState: storedFlowState,
+    }));
+    mockPrisma.conversation.findFirst.mockImplementation(async () => ({
+      id: 'conv_abc123def',
+      flowState: storedFlowState,
+    }));
+    mockPrisma.conversation.upsert.mockResolvedValue({ id: 'conv_abc123def' });
+    mockPrisma.conversation.update.mockImplementation(async ({ data }: any) => {
+      storedFlowState = data.flowState ?? null;
+      return {};
+    });
+
+    orchestrator = new ConversationOrchestrator();
+  });
+
+  describe('AI disclosure', () => {
+    const questions = [
+      'are you an ai?',
+      'is this a bot',
+      'am i talking to a machine',
+      'are you human?',
+      'is this a real person',
+
+      // Every one of these MISSED, because the matcher was a list of exact
+      // phrases that happened to contain "am i talking to a machine" and not
+      // "am i talking to a real person" — which is how people ask it on a
+      // phone call. The question fell through to the model, and when the model
+      // was unreachable the caller was handed to a queue having never been
+      // told they were speaking to an AI. Disclosure is a regulatory
+      // requirement, so it cannot depend on guessing the wording.
+      'am i talking to a real person?',
+      'am i speaking to a human',
+      'am i chatting with a bot',
+      'who am i speaking to',
+      'is this automated',
+      'is this a recording',
+      'r u a robot',
+    ];
+
+    it.each(questions)('answers "%s" honestly', async (question) => {
+      const result = await orchestrator.processIncomingMessage(baseContext(), question);
+
+      expect(result.intentDetected).toBe('AI_DISCLOSURE');
+      expect(result.replyText).toMatch(/AI assistant/i);
+
+      // Regression guard: this used to reply "Haha, no! I'm a customer support
+      // representative here at ${orgName}" under a "Stealth Human Persona" heading.
+      expect(result.replyText).not.toMatch(/haha,?\s*no/i);
+      expect(result.replyText).not.toMatch(/I'?m a customer support representative/i);
+    });
+  });
+
+  describe('A request for a person is not a question about the assistant', () => {
+    // Same nouns, opposite meaning. "am i speaking to a human" asks what it is
+    // talking to; "can i speak to a human" asks for one. Answering the second
+    // with a disclosure strands somebody who asked for help, which is why the
+    // matcher keys on the interrogative frame rather than the noun.
+    const escalations = [
+      'i want to speak to a human',
+      'can i speak to a real person',
+      'put me through to an agent',
+      'transfer me to a person',
+      'please connect me to an agent',
+    ];
+
+    it.each(escalations)('does not answer "%s" with a disclosure', async (text) => {
+      const result = await orchestrator.processIncomingMessage(baseContext(), text);
+      expect(result.intentDetected).not.toBe('AI_DISCLOSURE');
+    });
+  });
+
+  describe('Payment guidance', () => {
+    it('refuses to invent bank details when the organization has configured none', async () => {
+      const result = await orchestrator.processIncomingMessage(baseContext(), 'how do i pay?');
+
+      expect(result.intentDetected).toBe('PROVIDE_PAYMENT_GUIDANCE');
+      // Regression guard: it used to read out a hardcoded Providus Bank account
+      // number and three invented USSD codes for every tenant.
+      expect(result.replyText).not.toContain('9928374102');
+      expect(result.replyText).not.toMatch(/providus/i);
+      expect(result.replyText).not.toMatch(/\*737\*/);
+      // And it hands over rather than guessing.
+      expect(result.shouldHandoff).toBe(true);
+    });
+
+    it('uses the organization\'s own configured details when present', async () => {
+      mockPrisma.organization.findUnique.mockResolvedValue({
+        name: 'Apex Care',
+        payoutBankName: 'Zenith Bank',
+        payoutAccountName: 'Apex Care Ltd',
+        payoutAccountNumber: '1234567890',
+        payoutUssdCode: '*966*1#',
+      });
+
+      const result = await orchestrator.processIncomingMessage(baseContext(), 'send me your account number');
+
+      expect(result.replyText).toContain('Zenith Bank');
+      expect(result.replyText).toContain('1234567890');
+      expect(result.shouldHandoff).toBe(false);
+    });
+  });
+
+  /**
+   * The service name written into a real calendar and read back to the customer.
+   *
+   * "book me an appointment" produced the service name "Me an" — scraped out of
+   * "book **me an** appointment" — and the customer was told "I've put you down
+   * for *Me an*". Nothing failed; it wrote nonsense into a real booking and
+   * asserted it as fact, which is invariant 1 in the engine serving every
+   * customer today.
+   *
+   * Found by `npm run parity`: the agent path refused the same input, so a
+   * cutover would have silently changed the answer.
+   */
+  describe('The service a booking is filed under', () => {
+    /**
+     * Book, the way a customer does: ask, then pick a time.
+     *
+     * Booking is two turns now — it offers the free slots and writes the one
+     * the customer chooses, rather than picking for them. The invariant these
+     * tests exist for is unchanged: whatever ends up in `serviceName` must not
+     * be filler scraped out of the sentence.
+     */
+    const bookedService = async (message: string) => {
+      mockPrisma.booking.create.mockImplementation(({ data }: any) =>
+        Promise.resolve({ id: 'booking_12345678', ...data })
+      );
+      const offered = await orchestrator.processIncomingMessage(baseContext(), message);
+      expect(offered.intentDetected).toBe('FLOW_COLLECTING');
+      // Nothing is written until a time is chosen.
+      expect(mockPrisma.booking.create).not.toHaveBeenCalled();
+
+      const result = await orchestrator.processIncomingMessage(baseContext(), '1');
+      expect(mockPrisma.booking.create).toHaveBeenCalledTimes(1);
+      return {
+        stored: mockPrisma.booking.create.mock.calls[0][0].data.serviceName,
+        said: result.replyText,
+      };
+    };
+
+    it('does not file a booking under filler scraped from the sentence', async () => {
+      const { stored, said } = await bookedService('book me an appointment');
+
+      expect(stored).toBe('General Consultation');
+      // The bug as the customer met it.
+      expect(said).not.toMatch(/\bMe an\b/);
+    });
+
+    it.each([
+      // Filler scraped from between the verb and "appointment".
+      'book me an appointment for the 45th of Neveruary at 99:99',
+      'schedule me an appointment',
+      // No filler, but no service either — the customer named only the generic
+      // word for a booking. Filed as "Appointment", it reads in a calendar
+      // exactly like a service the business offers.
+      'i want an appointment',
+      'i need an appointment please',
+      // The pattern anchors on the first trigger verb, so a second one lands
+      // inside the capture. This filed as "Book".
+      'i want to book an appointment',
+      'i would like to schedule an appointment',
+      'can i set up an appointment',
+    ])('falls back to the default rather than inventing a service for %j', async (message) => {
+      const { stored } = await bookedService(message);
+      // Honest: it says a service was not identified, instead of naming one the
+      // business does not offer.
+      expect(stored).toBe('General Consultation');
+    });
+
+    it('still keeps a real service the customer named', async () => {
+      // The whole point of extracting at all — a regression here would file
+      // every booking as "General Consultation" and lose the detail.
+      const { stored } = await bookedService('i want to book a dental cleaning appointment');
+      expect(stored).toMatch(/dental cleaning/i);
+    });
+
+    it("keeps the customer's own casing for a named service", async () => {
+      const { stored } = await bookedService('book an MRI Scan appointment');
+      expect(stored).toBe('MRI Scan');
+    });
+  });
+
+  /**
+   * Which intent a sentence about an existing booking reaches.
+   *
+   * The branch that CREATES a booking triggered on the bare word "appointment"
+   * and sat above check, cancel and reschedule. So it matched first, every
+   * time, and a customer trying to cancel was told "I've put you down for..."
+   * — left with two bookings and nothing cancelled.
+   *
+   * Guarding only the create branches moved the bug rather than fixing it:
+   * "cancel my appointment" contains "my appointment", so the STATUS branch
+   * then answered with the booking's details and still cancelled nothing. Both
+   * failures are pinned here.
+   */
+  /**
+   * A question about the agency must reach the knowledge base.
+   *
+   * ── The reported failure ───────────────────────────────────────────────────
+   *
+   * A citizen on the live WhatsApp line asked:
+   *
+   *     "I would like to know what GMDB's activities are"
+   *
+   * and was answered with the capability menu — a list of things the assistant
+   * can do, in place of anything about the agency they asked about. The
+   * keyword list never matched that sentence; the LLM classifier returned
+   * CAPABILITIES, because "activities" reads like "what do you do".
+   *
+   * This platform is a State information hub, so a question about an MDA is
+   * the MAIN job, not the fallback. Three intents were removed from what the
+   * classifier may choose — CAPABILITIES, REQUEST_QUOTATION and
+   * MANAGE_RESERVATION — because each one intercepts a question whose answer
+   * belongs in the knowledge base. Their keyword triggers remain, so an
+   * explicit "what can you do" still works.
+   */
+  /**
+   * When it does not know, it ASKS.
+   *
+   * Routing a question to the knowledge base only helps when the knowledge
+   * base has something. When it has nothing the model is holding the citizen's
+   * sentence and whatever it remembers about Gombe State — which is not this
+   * agency's record. Answering from that is a confident wrong answer about
+   * government, which costs somebody a wasted journey to the wrong office.
+   *
+   * The usual reason a question misses is that it is broader than anything
+   * filed, so one narrowing question usually rescues it.
+   */
+  describe('An unknown question is asked about, not guessed at', () => {
+    const realFetch = globalThis.fetch;
+    afterEach(() => {
+      globalThis.fetch = realFetch;
+      delete process.env.OPENAI_API_KEY;
+    });
+
+    const promptFor = async (message: string, kbRows: any[]) => {
+      process.env.OPENAI_API_KEY = 'sk-test-key';
+      mockPrisma.documentChunk.findMany.mockResolvedValue(kbRows);
+      const prompts: string[] = [];
+      globalThis.fetch = (async (_url: any, init: any) => {
+        const body = JSON.parse(String(init.body));
+        prompts.push(body.messages.find((m: any) => m.role === 'system')?.content ?? '');
+        return new Response(
+          JSON.stringify({ choices: [{ message: { content: '{"intent":"NONE","confidence":0.9}' } }] }),
+          { status: 200 }
+        );
+      }) as any;
+      await orchestrator.processIncomingMessage(baseContext(), message);
+      // The synthesis prompt, not the classifier's.
+      return prompts.find((p) => p.includes('Non-negotiable rules')) ?? '';
+    };
+
+    it('is told to ask one narrowing question when nothing matched', async () => {
+      const prompt = await promptFor("I would like to know what GMDB's activities are", []);
+      expect(prompt).toMatch(/NOTHING in our records matched/i);
+      expect(prompt).toMatch(/ask ONE specific question/i);
+      // The failure this prevents: answering a question about a government
+      // agency out of training data.
+      expect(prompt).toMatch(/Do NOT answer it from your own knowledge/i);
+    });
+
+    it('does not nag when the knowledge base DID match', async () => {
+      const prompt = await promptFor('what does the board do about land applications', [
+        { content: 'The board processes land applications at its Gombe office.', documentId: 'd1', id: 'c1' },
+      ]);
+      // With real context the model should answer, not interrogate.
+      expect(prompt).not.toMatch(/NOTHING in our records matched/i);
+      expect(prompt).not.toMatch(/ask ONE specific question/i);
+    });
+
+    it('keeps the invention guardrails either way', async () => {
+      for (const rows of [[], [{ content: 'x', documentId: 'd1', id: 'c1' }]]) {
+        const prompt = await promptFor('what are the fees', rows as any);
+        expect(prompt).toMatch(/Never invent prices/i);
+        expect(prompt).toMatch(/you are an AI assistant/i);
+      }
+    });
+  });
+
+  describe('A question about the agency is not hijacked by a menu', () => {
+    const realFetch = globalThis.fetch;
+    afterEach(() => {
+      globalThis.fetch = realFetch;
+      delete process.env.OPENAI_API_KEY;
+    });
+
+    it.each([
+      "I would like to know what GMDB's activities are",
+      'what are the activities of the ministry of health',
+      'what does GOHEALTH do',
+      'tell me about the agency',
+    ])('does not answer %j with the capability menu', async (message) => {
+      const result = await orchestrator.processIncomingMessage(baseContext(), message);
+      expect(result.intentDetected).not.toBe('CAPABILITIES');
+      // The menu's own opening line, in any of the five languages' English.
+      expect(result.replyText).not.toMatch(/here'?s what i can do for you/i);
+    });
+
+    it('still answers an explicit "what can you do" with the menu', async () => {
+      // Removing the guesswork must not remove the feature.
+      const result = await orchestrator.processIncomingMessage(baseContext(), 'what can you do');
+      expect(result.intentDetected).toBe('CAPABILITIES');
+      expect(result.replyText).toMatch(/here'?s what i can do for you/i);
+    });
+
+    it('offers the model no intent that would intercept a question', async () => {
+      process.env.OPENAI_API_KEY = 'sk-test-key-for-prompt-inspection';
+      // EVERY system prompt, not the last one: classification runs first and
+      // then RAG synthesis runs, so capturing a single value inspects the
+      // wrong call and the assertions below would pass against anything.
+      const prompts: string[] = [];
+      globalThis.fetch = (async (_url: any, init: any) => {
+        const body = JSON.parse(String(init.body));
+        prompts.push(body.messages.find((m: any) => m.role === 'system')?.content ?? '');
+        return new Response(
+          JSON.stringify({ choices: [{ message: { content: '{"intent":"NONE","confidence":0.9}' } }] }),
+          { status: 200 }
+        );
+      }) as any;
+
+      await orchestrator.processIncomingMessage(baseContext(), "what are GMDB's activities");
+
+      const systemPrompt = prompts.find((p) => p.includes('intent must be exactly one of')) ?? '';
+      expect(systemPrompt).toContain('intent must be exactly one of');
+      // Each of these answered a knowledge question with something else:
+      // CAPABILITIES with a menu, REQUEST_QUOTATION with a quote built from
+      // CRM deals at stage CLOSED_WON, MANAGE_RESERVATION with a table booking
+      // no government agency offers.
+      expect(systemPrompt).not.toContain('CAPABILITIES -');
+      expect(systemPrompt).not.toContain('REQUEST_QUOTATION -');
+      expect(systemPrompt).not.toContain('MANAGE_RESERVATION -');
+      // And the catch-all still names questions about the agency, so the model
+      // has somewhere correct to put them.
+      expect(systemPrompt).toMatch(/NONE - anything else[^\n]*agency/);
+    });
+
+    it('ignores a CAPABILITIES answer even if a model returns one', async () => {
+      process.env.OPENAI_API_KEY = 'sk-test-key-for-rogue-answer';
+      globalThis.fetch = (async () =>
+        new Response(
+          JSON.stringify({ choices: [{ message: { content: '{"intent":"CAPABILITIES","confidence":0.95}' } }] }),
+          { status: 200 }
+        )) as any;
+
+      // Removing it from the prompt is not enough on its own: a cached, stale
+      // or differently-tuned model could still answer with it, so the branch
+      // that rendered the menu is gone too.
+      const result = await orchestrator.processIncomingMessage(
+        baseContext(),
+        "I would like to know what GMDB's activities are"
+      );
+      expect(result.replyText).not.toMatch(/here'?s what i can do for you/i);
+    });
+  });
+
+  describe('Which booking intent a sentence reaches', () => {
+    const intentOf = async (message: string) => {
+      const result = await orchestrator.processIncomingMessage(baseContext(), message);
+      return result.intentDetected;
+    };
+
+    it.each([
+      'cancel my appointment',
+      'cancel my booking',
+      'i want to cancel',
+      'cancel my reservation',
+    ])('routes %j to cancelling, never to creating', async (message) => {
+      const intent = await intentOf(message);
+      expect(intent).toBe('CANCEL_BOOKING');
+      // The bug as the customer met it: a second appointment, and nothing cancelled.
+      expect(mockPrisma.booking.create).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      'i want to reschedule my appointment',
+      'change my appointment',
+      'move my booking',
+      'postpone my appointment',
+    ])('routes %j to rescheduling, never to creating', async (message) => {
+      expect(await intentOf(message)).toBe('RESCHEDULE_BOOKING');
+      expect(mockPrisma.booking.create).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      'when is my appointment',
+      'my appointment',
+      'check my booking',
+      'booking status',
+    ])('routes %j to the status check, never to creating', async (message) => {
+      expect(await intentOf(message)).toBe('CHECK_BOOKING_STATUS');
+      expect(mockPrisma.booking.create).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      'i want to book an appointment',
+      'book an appointment',
+      'schedule consultation',
+    ])('still routes %j to creating one', async (message) => {
+      // The guard must not swallow the intent it is guarding. Booking is two
+      // turns now — it offers free times first — so this follows through to the
+      // booking rather than stopping at the offer, which is what proves the
+      // message reached the booking branch and not some other one.
+      const offered = await orchestrator.processIncomingMessage(baseContext(), message);
+      expect(offered.intentDetected).toBe('FLOW_COLLECTING');
+      expect(offered.replyText).toMatch(/here is what is free/i);
+
+      mockPrisma.booking.create.mockImplementation(({ data }: any) =>
+        Promise.resolve({ id: 'booking_12345678', ...data })
+      );
+      expect(await intentOf('1')).toBe('BOOK_APPOINTMENT');
+      expect(mockPrisma.booking.create).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  /**
+   * WHICH booking a request about "my appointment" resolves to.
+   *
+   * Prisma is mocked here, so the query itself is the observable behaviour —
+   * and it is the right thing to assert, because both defects below were in the
+   * where/orderBy rather than in anything the reply said.
+   *
+   *   - it ordered by startTime DESC with no lower bound, so it took the LATEST
+   *     booking rather than the NEXT. A customer with an appointment this
+   *     Friday and another next month was told about next month, and "cancel my
+   *     appointment" cancelled next month while Friday silently stayed. Past
+   *     bookings were in scope too, reported as though still to come.
+   *
+   *   - it matched the phone number EXACTLY through the relation, so a booking
+   *     made on WhatsApp ("234…") was invisible to the same person calling in
+   *     ("+234…"). That is the bug phoneNumberVariants exists to remove; these
+   *     six sites filter through `contact: {…}` and were missed by it.
+   */
+  describe('Finding the booking a customer means', () => {
+    /**
+     * Checking needs ONE booking, so it reads one. Rescheduling and cancelling
+     * need every candidate — the customer may have two and has to be asked
+     * which — so they read them all. All three must still ask the same two
+     * things of the database, which is what these assert; the method differs,
+     * the invariant does not.
+     */
+    const CASES: Array<[string, 'findFirst' | 'findMany']> = [
+      ['when is my appointment', 'findFirst'],
+      ['cancel my appointment', 'findMany'],
+      ['reschedule', 'findMany'],
+    ];
+
+    const queryFor = async (message: string, method: 'findFirst' | 'findMany') => {
+      await orchestrator.processIncomingMessage(baseContext(), message);
+      expect(mockPrisma.booking[method]).toHaveBeenCalled();
+      return mockPrisma.booking[method].mock.calls[0][0];
+    };
+
+    it.each(CASES)(
+      'asks for the NEXT upcoming booking, not the latest, for %j',
+      async (message, method) => {
+        const query = await queryFor(message, method);
+
+        expect(query.orderBy).toEqual({ startTime: 'asc' });
+        // A lower bound, so a finished appointment is never offered as upcoming.
+        expect(query.where.startTime?.gte).toBeInstanceOf(Date);
+      }
+    );
+
+    it.each(CASES)(
+      'matches every stored phone shape for %j',
+      async (message, method) => {
+        const query = await queryFor(message, method);
+
+        const shapes = query.where.contact?.phoneNumber?.in;
+        expect(Array.isArray(shapes)).toBe(true);
+        // The caller in baseContext() is +2348031234567; a contact written by
+        // Meta would be 2348031234567, and one typed by staff 08031234567.
+        expect(shapes).toEqual(expect.arrayContaining(['+2348031234567', '2348031234567']));
+      }
+    );
+  });
+
+  /**
+   * What the record says about why a conversation needs a person.
+   *
+   * `handoffReason` is the one field telling staff whether a thread is waiting
+   * on a human because a tool failed or because the customer asked. The
+   * already-handed-off branch asserted CUSTOMER_REQUEST on every subsequent
+   * message, and WhatsappService writes the reason back each time — so a
+   * conversation escalated by a booking failure was relabelled "the customer
+   * asked" the moment they typed again.
+   *
+   * The same branches also returned no intent at all, and the log substitutes
+   * GENERAL_INQUIRY for a missing one. An explicit request for a human is not a
+   * general inquiry, and it is the most useful signal a business has about
+   * where its agent is failing people.
+   */
+  describe('What a handoff records about itself', () => {
+    const reply = (message: string, isHumanHandoffActive = false) =>
+      orchestrator.processIncomingMessage({ ...baseContext(), isHumanHandoffActive }, message);
+
+    it('does not claim a reason it cannot know for an already-open handoff', async () => {
+      const result = await reply('any update please?', true);
+
+      expect(result.shouldHandoff).toBe(true);
+      // undefined, so the Prisma update leaves the original reason intact.
+      expect(result.handoffReason).toBeUndefined();
+      // And the AI stays quiet while a person is handling the thread.
+      expect(result.replyText).toBe('');
+    });
+
+    it('still records CUSTOMER_REQUEST when the customer actually asks', async () => {
+      const result = await reply('i want a human');
+
+      expect(result.shouldHandoff).toBe(true);
+      expect(result.handoffReason).toBe('CUSTOMER_REQUEST');
+    });
+
+    it.each([
+      ['i want a human', 'HUMAN_HANDOFF'],
+      ['speak to a real person', 'HUMAN_HANDOFF'],
+    ])('labels %j so it is not counted as a general inquiry', async (message, intent) => {
+      expect((await reply(message)).intentDetected).toBe(intent);
+    });
+
+    it('labels a message that arrives during a handoff', async () => {
+      expect((await reply('hello?', true)).intentDetected).toBe('HUMAN_HANDOFF_ACTIVE');
+    });
+
+    it('labels an empty message', async () => {
+      expect((await reply('   ')).intentDetected).toBe('EMPTY_MESSAGE');
+    });
+  });
+
+  describe('Appointment booking', () => {
+    it('books a real free slot inside business hours and reports the time it took', async () => {
+      mockPrisma.booking.create.mockImplementation(({ data }: any) =>
+        Promise.resolve({ id: 'booking_12345678', ...data })
+      );
+
+      const offered = await orchestrator.processIncomingMessage(
+        baseContext(),
+        'I want to book an appointment'
+      );
+      // The times offered are the free ones; the customer picks.
+      expect(offered.replyText).toMatch(/here is what is free/i);
+      expect(mockPrisma.booking.create).not.toHaveBeenCalled();
+
+      const result = await orchestrator.processIncomingMessage(baseContext(), '1');
+
+      expect(result.intentDetected).toBe('BOOK_APPOINTMENT');
+      expect(mockPrisma.booking.create).toHaveBeenCalledTimes(1);
+
+      const created = mockPrisma.booking.create.mock.calls[0][0].data;
+      const start: Date = created.startTime;
+
+      // Inside Mon–Fri 08:00–18:00 West Africa Time (UTC+1).
+      const watHour = (start.getUTCHours() + 1) % 24;
+      const watDay = new Date(start.getTime() + 3600_000).getUTCDay();
+      expect(watHour).toBeGreaterThanOrEqual(8);
+      expect(watHour).toBeLessThan(18);
+      expect(watDay).not.toBe(0);
+      expect(watDay).not.toBe(6);
+      expect(start.getTime()).toBeGreaterThan(Date.now());
+
+      // Regression guard: the reply used to be an unconditional
+      // "✅ Your appointment has been confirmed for <tomorrow 10am>" regardless of
+      // what the customer asked for or whether the slot was free.
+      expect(result.replyText).toMatch(/reschedule/i);
+    });
+
+    it('does not double-book an occupied slot', async () => {
+      // Every slot in the search horizon is taken.
+      const now = Date.now();
+      mockPrisma.booking.findMany.mockResolvedValue([
+        { startTime: new Date(now), endTime: new Date(now + 15 * 24 * 3600_000) },
+      ]);
+
+      const result = await orchestrator.processIncomingMessage(
+        baseContext(),
+        'book an appointment please'
+      );
+
+      expect(mockPrisma.booking.create).not.toHaveBeenCalled();
+      expect(result.shouldHandoff).toBe(true);
+    });
+
+    it('hands over instead of guessing when there is no phone number to book under', async () => {
+      mockPrisma.contact.findFirst.mockResolvedValue(null);
+      mockPrisma.contact.create.mockRejectedValue(new Error('no phone'));
+
+      const result = await orchestrator.processIncomingMessage(
+        { ...baseContext(), customerPhoneNumber: undefined },
+        'book an appointment'
+      );
+
+      expect(result.shouldHandoff).toBe(true);
+      expect(mockPrisma.booking.create).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('Reservations', () => {
+    /**
+     * Reserve, the way a customer does: say what you want, then pick a time.
+     *
+     * A party size the customer NAMED is still used without being asked for
+     * again — that is what these two guard. The case where they named none is
+     * in reservation-flow.spec.ts, because "assume a table for two" was the
+     * defect and it needs more than one assertion.
+     */
+    const reserved = async (message: string) => {
+      mockPrisma.reservation.create.mockImplementation(({ data }: any) =>
+        Promise.resolve({ id: 'res_12345678', ...data })
+      );
+      const offered = await orchestrator.processIncomingMessage(baseContext(), message);
+      expect(mockPrisma.reservation.create).not.toHaveBeenCalled();
+
+      await orchestrator.processIncomingMessage(baseContext(), '1');
+      expect(mockPrisma.reservation.create).toHaveBeenCalledTimes(1);
+      return {
+        stored: mockPrisma.reservation.create.mock.calls[0][0].data,
+        offered: offered.replyText,
+      };
+    };
+
+    it('reads the party size from the message instead of always assuming two', async () => {
+      const { stored, offered } = await reserved('book a table for 6 please');
+
+      expect(stored.partySize).toBe(6);
+      // Never asked again, and the number is visible in the question they
+      // answered rather than only appearing after the table is held.
+      expect(offered).toMatch(/table for 6 guests/i);
+      expect(offered).not.toMatch(/how many people/i);
+    });
+
+    it('understands spelled-out party sizes', async () => {
+      const { stored } = await reserved('make a reservation for four');
+      expect(stored.partySize).toBe(4);
+    });
+  });
+
+  describe('Quotations', () => {
+    it('refuses to quote a made-up price when there is no deal history', async () => {
+      mockPrisma.deal.findMany.mockResolvedValue([]);
+
+      const result = await orchestrator.processIncomingMessage(baseContext(), 'how much for a consultation?');
+
+      expect(result.intentDetected).toBe('REQUEST_QUOTATION');
+      // Regression guard: it used to return a flat "₦35,000" for every business, plus
+      // a link to /api/documents/quotation/<n>.pdf — a route that does not exist.
+      expect(result.replyText).not.toContain('35,000');
+      expect(result.replyText).not.toContain('.pdf');
+      expect(result.shouldHandoff).toBe(true);
+    });
+
+    it('quotes an indicative range from the organization\'s own closed deals', async () => {
+      mockPrisma.deal.findMany.mockResolvedValue([
+        { title: 'Retainer', amount: 200_000, currency: 'NGN' },
+        { title: 'Retainer', amount: 500_000, currency: 'NGN' },
+      ]);
+
+      const result = await orchestrator.processIncomingMessage(baseContext(), 'what is your pricing?');
+
+      expect(result.replyText).toContain('200,000');
+      expect(result.replyText).toContain('500,000');
+      expect(result.shouldHandoff).toBe(false);
+    });
+  });
+
+  describe('Escalation', () => {
+    it('hands over when the customer asks for a person', async () => {
+      const result = await orchestrator.processIncomingMessage(baseContext(), 'I want to speak to human');
+      expect(result.shouldHandoff).toBe(true);
+    });
+
+    it('stays silent while a human already has the conversation', async () => {
+      const result = await orchestrator.processIncomingMessage(
+        { ...baseContext(), isHumanHandoffActive: true },
+        'hello?'
+      );
+      expect(result.replyText).toBe('');
+      expect(result.shouldHandoff).toBe(true);
+    });
+  });
+
+  describe('Greeting', () => {
+    it('uses the organization welcome message', async () => {
+      const result = await orchestrator.processIncomingMessage(baseContext(), 'hello');
+      expect(result.intentDetected).toBe('GREETING');
+      expect(result.replyText).toBe('Hello from Apex Care!');
+    });
+  });
+
+  describe('Finding the agency a citizen names in their own words', () => {
+    /**
+     * The keyword fallback is what runs whenever Qdrant is unconfigured or
+     * unreachable, which is every deployment without QDRANT_URL. Two defects in
+     * it meant the live line retrieved NOTHING for the question in the
+     * screenshot that started this work.
+     */
+    const whereOf = async (message: string) => {
+      mockPrisma.documentChunk.findMany.mockResolvedValue([]);
+      mockPrisma.documentChunk.findMany.mockClear();
+      await orchestrator.processIncomingMessage(baseContext(), message);
+      // The keyword pass is the LAST documentChunk query: the exact-phrase pass
+      // runs first and only misses lead to it.
+      const calls = mockPrisma.documentChunk.findMany.mock.calls;
+      expect(calls.length).toBeGreaterThan(0);
+      return calls[calls.length - 1][0];
+    };
+
+    const orTerms = (where: any): string[] =>
+      (where?.where?.OR ?? where?.OR ?? []).map((c: any) =>
+        c.content?.contains ?? c.document?.title?.contains
+      ).filter(Boolean);
+
+    it("splits a possessive instead of welding it into a word that matches nothing", async () => {
+      const where = await whereOf("I would like to know what GMDB's activities are");
+      const terms = orTerms(where);
+
+      // The defect: `replace(/[^a-z0-9\s]/g, '')` turned `gmdb's` into `gmdbs`,
+      // which matches neither an acronym in a title nor a name in a body.
+      expect(terms).toContain('gmdb');
+      expect(terms).not.toContain('gmdbs');
+    });
+
+    it('searches the document TITLE as well as the body, where acronyms live', async () => {
+      const where = await whereOf('tell me about GMDB please');
+      const clauses = (where?.where?.OR ?? where?.OR ?? []) as any[];
+
+      // An agency's short name is usually only in the title, so a body-only
+      // search cannot connect "GMDB" to "Gombe Metropolitan Development Board".
+      expect(clauses.some((c) => c.document?.title?.contains)).toBe(true);
+      expect(clauses.some((c) => c.content?.contains)).toBe(true);
+    });
+
+    it('still drops one- and two-letter fragments the split produces', async () => {
+      const terms = orTerms(await whereOf("what is GMDB's role"));
+      expect(terms).not.toContain('s');
+      expect(terms.every((t) => t.length >= 4)).toBe(true);
+    });
+  });
+
+  describe('Which agency a question actually reaches', () => {
+    /**
+     * The keyword fallback runs on every deployment without QDRANT_URL, so it
+     * is the live retrieval path, and it had no relevance ranking: an OR across
+     * keywords, `take: topK`, ordered by chunkIndex. With one document that is
+     * invisible. With the State's 41 MDAs loaded it was wrong most of the time
+     * — "I would like to know what GMDB's activities are" returned the Office
+     * of the Secretary to the Government, whose long description happens to
+     * contain "activities".
+     *
+     * Feeding the model another agency's text is worse than feeding it none:
+     * it does not decline, it answers confidently about the wrong agency.
+     */
+    const { QdrantRAGService } = require('../src/index');
+
+    const chunk = (id: string, title: string, content: string, chunkIndex = 0) => ({
+      id,
+      documentId: `doc-${id}`,
+      chunkIndex,
+      content,
+      document: { title },
+    });
+
+    /** First findMany is the exact-phrase pass; the second is the keyword pass. */
+    const search = async (query: string, candidates: any[]) => {
+      delete process.env.OPENAI_API_KEY;
+      mockPrisma.documentChunk.findMany
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce(candidates);
+      const svc = new QdrantRAGService();
+      return svc.searchKnowledgeBase('org-1', query, 3);
+    };
+
+    it('puts the agency the citizen NAMED first, not whichever chunk matched one word', async () => {
+      const hits = await search("I would like to know what GMDB's activities are", [
+        // The decoy: a long description that happens to contain "activities".
+        chunk('decoy', 'OSGS — Office of the Secretary to the Government of the State',
+          'Coordinates the activities of all ministries and departments of the State.'),
+        // The right answer: the acronym is in the TITLE.
+        chunk('right', 'GMDB — The Gombe Metropolitan Development Board (GMDB)',
+          'Responsible for planning and development of Gombe city. Through its activities it generates revenue.'),
+      ]);
+
+      expect(hits.length).toBeGreaterThan(0);
+      expect(hits[0].chunkId).toBe('right');
+      // And the score shape the caller filters on (>= 0.5) is preserved.
+      expect(hits[0].score).toBeGreaterThanOrEqual(0.5);
+    });
+
+    it('rejects a chunk that matched one GENERIC word', async () => {
+      // "how much does a passport cost" reduces to passport + cost, and an
+      // energy corporation came back on the strength of "cost" alone.
+      const hits = await search('how much does a passport cost', [
+        chunk('energy', 'GSEC — Gombe State Energy Corporation',
+          'Develops power projects to reduce the cost of electricity in the State.'),
+      ]);
+      expect(hits).toHaveLength(0);
+    });
+
+    it('keeps a chunk that matched one SPECIFIC word, because that is the question', async () => {
+      // A first version of the threshold demanded two keywords and lost this:
+      // drainage really is the Gombe Metropolitan Development Board's remit.
+      const hits = await search('I want to report a broken drainage', [
+        chunk('gmdb', 'GMDB — The Gombe Metropolitan Development Board (GMDB)',
+          'Handles construction and maintenance of urban roads and drainage systems.'),
+      ]);
+      expect(hits).toHaveLength(1);
+      expect(hits[0].chunkId).toBe('gmdb');
+    });
+
+    it('asks the database for the title too, and over-fetches so it has something to rank', async () => {
+      await search('where is the internal revenue service', []);
+      const keywordPass = mockPrisma.documentChunk.findMany.mock.calls[1][0];
+      // Ranking is meaningless over exactly topK rows.
+      expect(keywordPass.take).toBeGreaterThan(3);
+      expect(keywordPass.include).toEqual({ document: { select: { title: true } } });
+    });
+  });
+
+  describe('Naming an agency by its acronym, and saying whose text it is', () => {
+    const { QdrantRAGService } = require('../src/index');
+
+    const chunk = (id: string, title: string, content: string, chunkIndex = 0) => ({
+      id, documentId: `doc-${id}`, chunkIndex, content, document: { title },
+    });
+
+    const searchWith = async (query: string, exact: any[], candidates: any[]) => {
+      delete process.env.OPENAI_API_KEY;
+      mockPrisma.documentChunk.findMany.mockReset();
+      // Mirror the real call sequence. A query under 5 characters SKIPS the
+      // exact-phrase pass, so the keyword pass is then the FIRST findMany —
+      // queueing two values made it receive the exact-phrase one, and both
+      // acronym tests failed on a harness fault while the same queries
+      // succeeded against a real database.
+      if (query.trim().length < 5) {
+        mockPrisma.documentChunk.findMany.mockResolvedValueOnce(candidates);
+      } else {
+        mockPrisma.documentChunk.findMany
+          .mockResolvedValueOnce(exact)
+          .mockResolvedValueOnce(candidates);
+      }
+      return new QdrantRAGService().searchKnowledgeBase('org-1', query, 3);
+    };
+
+    it('reaches the agency for a three-letter acronym, which the length filter used to drop', async () => {
+      // "MOH" is shorter than the >= 4 keyword rule, so before this it was not
+      // a keyword at all and the question retrieved nothing on its own terms.
+      const hits = await searchWith('MOH', [], [
+        chunk('moh', 'MOH — Gombe State Ministry of Health (MOH)', 'Oversees health policy in the State.'),
+      ]);
+      expect(hits).toHaveLength(1);
+      expect(hits[0].chunkId).toBe('moh');
+    });
+
+    it('does not substring-match a short query across the whole corpus', async () => {
+      // `contains` has no word boundary, so "MOH" matched `Murtala Mohammed
+      // Way` in another agency's ADDRESS and returned the wrong body entirely.
+      await searchWith('MOH', [], []);
+      const calls = mockPrisma.documentChunk.findMany.mock.calls;
+      // The exact-phrase pass must not have run at all for a 3-character query.
+      expect(calls).toHaveLength(1);
+      const where = JSON.stringify(calls[0][0]);
+      expect(where).not.toContain('"contains":"MOH"');
+    });
+
+    it('treats a message that is only an acronym as naming an agency, capitals and all', async () => {
+      const hits = await searchWith('GMDB', [], [
+        chunk('gmdb', 'GMDB — The Gombe Metropolitan Development Board (GMDB)', 'Plans and develops Gombe city.'),
+      ]);
+      expect(hits).toHaveLength(1);
+    });
+
+    it('reads no acronyms from a SENTENCE SHOUTED IN CAPITALS, where case says nothing', async () => {
+      // Otherwise every word becomes "specific" and the threshold stops
+      // filtering anything for everyone who writes in caps.
+      const hits = await searchWith('HOW MUCH DOES A PASSPORT COST', [], [
+        chunk('energy', 'GSEC — Gombe State Energy Corporation',
+          'Develops power projects to reduce the cost of electricity.'),
+      ]);
+      expect(hits).toHaveLength(0);
+    });
+
+    it('tells the model WHICH document each excerpt came from', async () => {
+      // Chunking cuts at 1800 characters regardless of structure, so an
+      // excerpt from the middle of an entry often names nobody. Unattributed,
+      // a paragraph of offices and phone numbers gets attached to whichever
+      // agency the citizen asked about.
+      process.env.OPENAI_API_KEY = 'sk-test-key';
+      const realFetch = globalThis.fetch;
+      const sent: string[] = [];
+      try {
+        mockPrisma.documentChunk.findMany.mockReset();
+        mockPrisma.documentChunk.findMany.mockResolvedValue([
+          chunk('c1', 'GMDB — The Gombe Metropolitan Development Board (GMDB)',
+            'Office: Joseph Gomwalk Secretariat, Gombe. Email: admin@example.gov.ng'),
+        ]);
+        globalThis.fetch = (async (_u: any, init: any) => {
+          const body = JSON.parse(String(init.body));
+          for (const m of body.messages ?? []) if (m.role === 'user') sent.push(String(m.content));
+          return new Response(
+            JSON.stringify({ choices: [{ message: { content: '{"intent":"NONE","confidence":0.9}' } }] }),
+            { status: 200 }
+          );
+        }) as any;
+
+        await orchestrator.processIncomingMessage(baseContext(), 'where is the GMDB office');
+
+        const withContext = sent.find((c) => c.includes('knowledge base')) ?? '';
+        expect(withContext).toContain('Joseph Gomwalk Secretariat');
+        // The attribution is the point: the excerpt alone names no agency.
+        expect(withContext).toMatch(/From "GMDB — The Gombe Metropolitan Development Board/);
+      } finally {
+        globalThis.fetch = realFetch;
+        delete process.env.OPENAI_API_KEY;
+      }
+    });
+  });
+});

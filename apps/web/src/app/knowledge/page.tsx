@@ -1,0 +1,1189 @@
+"use client";
+
+import React, { useEffect, useState, useRef, useCallback } from 'react';
+import { api, API_URL, apiFetch } from '@/lib/api';
+import { useToast } from '@/components/ui/Toast';
+import SharedEmptyState from '@/components/ui/EmptyState';
+import { ListSkeleton } from '@/components/ui/Skeleton';
+import { RoleNotice } from '@/components/RoleNotice';
+import {
+  BookOpen, Upload, Search, FileText, Loader2, AlertCircle,
+  CheckCircle2, Clock, Globe, Sparkles, Trash2, RefreshCw,
+  Plus, X, ExternalLink, Database, Zap, Brain, MessageSquare,
+  ChevronRight, Layers, ArrowUp, ArrowDown, Info, Download
+} from 'lucide-react';
+
+interface KnowledgeDoc {
+  id: string;
+  title: string;
+  fileName?: string;
+  fileSize?: number;
+  mimeType?: string;
+  status: 'PENDING' | 'PROCESSING' | 'INDEXED' | 'FAILED';
+  chunkCount?: number;
+  createdAt?: string;
+  sourceUrl?: string;
+}
+
+interface SearchResult {
+  content: string;
+  similarity: number;
+  documentTitle?: string;
+  documentId?: string;
+}
+
+interface FaqPair {
+  id: string;
+  question: string;
+  answer: string;
+  category: string;
+  /** Position, not a label. The AI consults these in this order. */
+  sortOrder: number;
+}
+
+export default function KnowledgePage() {
+  const toast = useToast();
+  const [activeTab, setActiveTab] = useState<'documents' | 'faqs'>('documents');
+  const [downloadingId, setDownloadingId] = useState<string | null>(null);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
+  const [docs, setDocs] = useState<KnowledgeDoc[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [hasSearched, setHasSearched] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+
+  // Selected document for chunk inspection
+  const [selectedDoc, setSelectedDoc] = useState<KnowledgeDoc | null>(null);
+
+  // FAQ Manager state
+  const [faqs, setFaqs] = useState<FaqPair[]>([]);
+  const [editingFaq, setEditingFaq] = useState<string | null>(null);
+  const [editQuestion, setEditQuestion] = useState('');
+  const [editAnswer, setEditAnswer] = useState('');
+  const [showFaqModal, setShowFaqModal] = useState(false);
+  const [faqQuestion, setFaqQuestion] = useState('');
+  const [faqAnswer, setFaqAnswer] = useState('');
+  const [faqCategory, setFaqCategory] = useState('General');
+  const [reordering, setReordering] = useState(false);
+  const [reindexing, setReindexing] = useState(false);
+  const [reindexResult, setReindexResult] = useState<{ ok: boolean; text: string } | null>(null);
+
+  // Website Crawler states
+  const [websiteUrl, setWebsiteUrl] = useState('');
+  const [crawling, setCrawling] = useState(false);
+  const [crawlStatus, setCrawlStatus] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
+  // Text paste modal
+  const [showPasteModal, setShowPasteModal] = useState(false);
+  const [pasteTitle, setPasteTitle] = useState('');
+  const [pasteContent, setPasteContent] = useState('');
+  const [pasting, setPasting] = useState(false);
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const fetchDocs = useCallback(async () => {
+    try {
+      const res = await api.knowledge.getDocuments();
+      setDocs(res || []);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  /**
+   * True from the moment a reorder is optimistically applied until the server
+   * has been told and re-read.
+   *
+   * A ref rather than the `reordering` state flag, because the poll below
+   * closes over its initial value and would always see `false`.
+   */
+  const reorderInFlight = useRef(false);
+
+  const fetchFaqs = useCallback(async (force = false) => {
+    // The 8-second poll must not land between the optimistic reorder and the
+    // write that confirms it: it would return the OLD order and snap the list
+    // back under the operator's cursor, then forward again a moment later.
+    if (reorderInFlight.current && !force) return;
+    try {
+      const res = await apiFetch(`${API_URL}/api/knowledge/faqs`, { headers: authHeaders });
+      if (res.ok) {
+        const data = await res.json();
+        setFaqs(data || []);
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchDocs();
+    fetchFaqs();
+    const interval = setInterval(() => { fetchDocs(); fetchFaqs(); }, 8000);
+    return () => clearInterval(interval);
+  }, [fetchDocs, fetchFaqs]);
+
+  const token = typeof window !== 'undefined' ? localStorage.getItem('ace_token') : '';
+  const authHeaders = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+
+  const handleCrawlWebsite = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!websiteUrl.trim()) return;
+    setCrawling(true);
+    setCrawlStatus(null);
+    try {
+      const res = await apiFetch(`${API_URL}/api/knowledge/crawl-website`, {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({ url: websiteUrl }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setCrawlStatus({ type: 'success', text: data.message || 'Website crawled and indexed successfully!' });
+        setWebsiteUrl('');
+        await fetchDocs();
+      } else {
+        const err = await res.json().catch(() => ({ message: 'Failed to crawl' }));
+        setCrawlStatus({ type: 'error', text: err.message || 'Could not crawl website.' });
+      }
+    } catch {
+      setCrawlStatus({ type: 'error', text: 'Network error. Check the URL and try again.' });
+    } finally {
+      setCrawling(false);
+    }
+  };
+
+  const handleSearch = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!searchQuery.trim()) return;
+    setSearching(true);
+    setHasSearched(true);
+    try {
+      const res = await api.knowledge.search(searchQuery);
+      setSearchResults(res || []);
+    } catch (err) {
+      console.error(err);
+      setSearchResults([]);
+    } finally {
+      setSearching(false);
+    }
+  };
+
+  const toBase64 = (file: File): Promise<string> =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.readAsDataURL(file);
+      reader.onload = () => {
+        let encoded = reader.result?.toString().replace(/^data:(.*,)?/, '') || '';
+        if (encoded.length % 4 > 0) encoded += '='.repeat(4 - (encoded.length % 4));
+        resolve(encoded);
+      };
+      reader.onerror = reject;
+    });
+
+  /**
+   * Upload one or MANY documents, and say what happened to each.
+   *
+   * Two defects here, both found loading the State's 41 MDAs:
+   *
+   * 1. It took `files[0]`. A knowledge base therefore had to go in one file
+   *    per click, which for a 41-agency directory is 41 interactions — so the
+   *    realistic alternative was one giant file, and that costs retrieval
+   *    quality: the document TITLE is where an agency's acronym lives, and
+   *    merging 41 agencies into one document leaves one title, so a citizen
+   *    asking about "GMDB" can no longer reach the Gombe Metropolitan
+   *    Development Board by name.
+   *
+   * 2. A failure was DISCARDED. `catch (err) { console.error(err) }` — and
+   *    `handleResponse` throws with the server's own message, so the reason
+   *    existed and was thrown away. A refused upload (a VIEWER who lacks the
+   *    role, a type the API rejects, Supabase Storage misconfigured) looked
+   *    identical to a successful one: no toast, and the list simply did not
+   *    grow. That is the failure CLAUDE.md's first invariant names — a
+   *    mutation whose failure is invisible.
+   *
+   * Sequential rather than parallel on purpose: each upload is a Supabase
+   * Storage write plus an indexing job, and forty at once is a burst that the
+   * free tier answers with rate limits, which would look like random files
+   * failing for no reason.
+   */
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? []);
+    if (!files.length) return;
+
+    setUploading(true);
+    setUploadProgress(0);
+
+    // Declared outside the try so a throw in toBase64 cannot leak a timer
+    // that keeps ticking against an unmounted progress bar.
+    let progressInterval: ReturnType<typeof setInterval> | undefined;
+    const failures: Array<{ name: string; reason: string }> = [];
+    let uploaded = 0;
+
+    try {
+      for (const [index, file] of files.entries()) {
+        // Real progress across the batch, not a fake crawl to 90%.
+        const floor = Math.round((index / files.length) * 100);
+        const ceiling = Math.round(((index + 1) / files.length) * 100);
+        setUploadProgress(floor);
+        progressInterval = setInterval(() => {
+          setUploadProgress(p => Math.min(p + 2, Math.max(floor, ceiling - 2)));
+        }, 150);
+
+        try {
+          const base64 = await toBase64(file);
+          await api.knowledge.uploadDocument({
+            // The filename becomes the title, which is why the files this is
+            // given are named "<ACRONYM> — <Full name>".
+            title: file.name.replace(/\.[^/.]+$/, ''),
+            fileName: file.name,
+            fileSize: file.size,
+            mimeType: file.type || 'application/octet-stream',
+            fileBufferBase64: base64,
+          });
+          uploaded++;
+        } catch (err: any) {
+          failures.push({ name: file.name, reason: err?.message || 'the server gave no reason' });
+        } finally {
+          clearInterval(progressInterval);
+          progressInterval = undefined;
+          setUploadProgress(ceiling);
+        }
+      }
+
+      await fetchDocs();
+
+      // Say what happened, including when only some of it worked. An error
+      // toast has no timeout, so a partial failure stays on screen.
+      if (failures.length && uploaded) {
+        toast.error(
+          `${uploaded} of ${files.length} uploaded. ${failures.length} failed: ` +
+            failures.map(f => `${f.name} — ${f.reason}`).join('; ')
+        );
+      } else if (failures.length) {
+        toast.error(
+          failures.length === 1
+            ? `${failures[0].name} was not uploaded: ${failures[0].reason}`
+            : `None of the ${files.length} files uploaded. ` +
+              failures.map(f => `${f.name} — ${f.reason}`).join('; ')
+        );
+      } else {
+        toast.success(
+          files.length === 1
+            ? `"${files[0].name.replace(/\.[^/.]+$/, '')}" uploaded. Indexing may take a minute.`
+            : `${files.length} documents uploaded. Indexing may take a minute.`
+        );
+      }
+
+      setTimeout(() => setUploadProgress(0), 800);
+    } finally {
+      if (progressInterval) clearInterval(progressInterval);
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
+  const handlePasteSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!pasteTitle.trim() || !pasteContent.trim()) return;
+    setPasting(true);
+    try {
+      const base64 = btoa(unescape(encodeURIComponent(pasteContent)));
+      await api.knowledge.uploadDocument({
+        title: pasteTitle,
+        fileName: `${pasteTitle}.txt`,
+        fileSize: pasteContent.length,
+        mimeType: 'text/plain',
+        fileBufferBase64: base64,
+      });
+      setShowPasteModal(false);
+      setPasteTitle('');
+      setPasteContent('');
+      await fetchDocs();
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setPasting(false);
+    }
+  };
+
+  /**
+   * The server's own reason a write was refused.
+   *
+   * These handlers each reported a generic "Could not add/save/delete the
+   * FAQ", which discards the only useful part of the response. Writing is
+   * OWNER/ADMIN, so the commonest failure is now a 403 whose message says
+   * exactly that — and "Could not add the FAQ" would send somebody hunting
+   * for a fault instead of asking an admin.
+   */
+  const refusalFrom = async (res: Response, fallback: string) => {
+    const body = await res.json().catch(() => ({} as any));
+    const message = Array.isArray(body?.message) ? body.message.join(' ') : body?.message;
+    if (message) return String(message);
+    return res.status === 403
+      ? 'Only an OWNER or ADMIN can change FAQ answers — they are what the assistant reads to citizens verbatim.'
+      : fallback;
+  };
+
+  /**
+   * Move one FAQ up or down the order the AI consults them in.
+   *
+   * Buttons rather than drag-and-drop, for two reasons that both matter here.
+   * This page REFETCHES EVERY 8 SECONDS, so a drag in progress would be
+   * overwritten mid-gesture by a poll; and a list that decides what citizens
+   * are told should be reorderable from a keyboard, not only with a pointer.
+   *
+   * The whole list is sent, because `sortOrder` is a position: the API refuses
+   * a partial order rather than leaving two entries in the same place.
+   */
+  const moveFaq = async (id: string, direction: -1 | 1) => {
+    const from = faqs.findIndex(f => f.id === id);
+    const to = from + direction;
+    if (from < 0 || to < 0 || to >= faqs.length) return;
+
+    const next = [...faqs];
+    [next[from], next[to]] = [next[to], next[from]];
+
+    // Shown immediately, then reconciled with the server. If the write fails
+    // the refetch puts the old order back rather than leaving the screen
+    // claiming a change that did not happen.
+    setFaqs(next);
+    setReordering(true);
+    reorderInFlight.current = true;
+    try {
+      const res = await apiFetch(`${API_URL}/api/knowledge/faqs/reorder`, {
+        method: 'PATCH',
+        headers: authHeaders,
+        body: JSON.stringify({ ids: next.map(f => f.id) }),
+      });
+      if (!res.ok) {
+        toast.error(await refusalFrom(res, 'Could not save the new order.'));
+      }
+    } catch {
+      toast.error('Could not reach the server to save the new order.');
+    } finally {
+      // `force`, because the guard above is still set — this is the read that
+      // reconciles the optimistic order with what was actually stored, and on
+      // a failed write it is what puts the old order back rather than leaving
+      // the screen claiming a change that did not happen.
+      reorderInFlight.current = false;
+      await fetchFaqs(true);
+      setReordering(false);
+    }
+  };
+
+  /**
+   * Re-embed every stored chunk into the vector index.
+   *
+   * Worth a button because the index and the database can genuinely drift —
+   * documents indexed while Qdrant was unreachable are in Postgres and not in
+   * the vector store, and RAG simply does not find them. Nothing on this page
+   * previously said so or offered a way to fix it.
+   *
+   * The server's own message is shown verbatim, success or failure: it names
+   * the chunk and document counts, and on failure it names what to check
+   * (credits, and the Qdrant URL it actually tried).
+   */
+  const handleReindex = async () => {
+    setReindexing(true);
+    setReindexResult(null);
+    try {
+      const res = await apiFetch(`${API_URL}/api/knowledge/reindex`, {
+        method: 'POST',
+        headers: authHeaders,
+      });
+      const body = await res.json().catch(() => ({} as any));
+      if (!res.ok) {
+        setReindexResult({ ok: false, text: body.message || `Re-indexing failed (${res.status}).` });
+        return;
+      }
+      // `vectorised: false` with no chunks is not a success to celebrate —
+      // there was nothing to index, and saying "done" would imply otherwise.
+      setReindexResult({
+        ok: body.vectorised === true,
+        text: body.message || 'Re-indexing finished.',
+      });
+      fetchDocs();
+    } catch {
+      setReindexResult({ ok: false, text: 'Could not reach the server to start re-indexing.' });
+    } finally {
+      setReindexing(false);
+    }
+  };
+
+  const handleAddFaq = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!faqQuestion.trim() || !faqAnswer.trim()) return;
+
+    try {
+      const res = await apiFetch(`${API_URL}/api/knowledge/faqs`, {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({ question: faqQuestion, answer: faqAnswer, category: faqCategory })
+      });
+      if (res.ok) {
+        fetchFaqs();
+        setShowFaqModal(false);
+        setFaqQuestion('');
+        setFaqAnswer('');
+      } else {
+        toast.error(await refusalFrom(res, 'Could not add the FAQ.'));
+      }
+    } catch (err) {
+      toast.error('Could not reach the server to add the FAQ.');
+    }
+  };
+
+  const handleEditFaq = async (id: string) => {
+    if (!editQuestion.trim() || !editAnswer.trim()) return;
+    try {
+      const res = await apiFetch(`${API_URL}/api/knowledge/faqs/${id}`, {
+        method: 'PATCH',
+        headers: authHeaders,
+        body: JSON.stringify({ question: editQuestion, answer: editAnswer })
+      });
+      if (res.ok) {
+        fetchFaqs();
+        setEditingFaq(null);
+      } else {
+        toast.error(await refusalFrom(res, 'Could not save the FAQ.'));
+      }
+    } catch (err) {
+      toast.error('Could not reach the server to save the FAQ.');
+    }
+  };
+
+  const handleDeleteFaq = async (id: string) => {
+    if (!confirm('Delete this FAQ rule?')) return;
+    try {
+      const res = await apiFetch(`${API_URL}/api/knowledge/faqs/${id}`, {
+        method: 'DELETE',
+        headers: authHeaders
+      });
+      if (res.ok) {
+        fetchFaqs();
+      } else {
+        toast.error(await refusalFrom(res, 'Could not delete the FAQ.'));
+      }
+    } catch (err) {
+      toast.error('Could not reach the server to delete the FAQ.');
+    }
+  };
+
+  /**
+   * Retrieve an uploaded document.
+   *
+   * `GET /documents/:id/download` returns a SHORT-LIVED SIGNED URL rather than
+   * the bytes — the bucket is private, which is why `storageUrl` holds a path
+   * and not a URL. So the flow is: ask for the URL, then open it. Nothing is
+   * linked directly, because a direct link to the storage path 404s and a
+   * signed URL pasted into the page would still be in the DOM after it expired.
+   *
+   * A crawled page has no stored file at all. Offering "download" for one would
+   * be a button that can only fail, so the row shows its source link instead.
+   */
+  const handleDownload = async (id: string) => {
+    const token = localStorage.getItem('ace_token');
+    setDownloadingId(id);
+    setDownloadError(null);
+    try {
+      const res = await apiFetch(`${API_URL}/api/knowledge/documents/${id}/download`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const body = await res.json().catch(() => null);
+      if (!res.ok || !body?.url) {
+        // The service explains the cases it cannot serve — a document that
+        // failed extraction, or one with no stored file. Showing its words
+        // beats "download failed".
+        throw new Error(
+          (Array.isArray(body?.message) ? body.message.join(' ') : body?.message) ||
+          'This document could not be retrieved.'
+        );
+      }
+      window.open(body.url, '_blank', 'noopener,noreferrer');
+    } catch (err: any) {
+      setDownloadError(err?.message || 'This document could not be retrieved.');
+    } finally {
+      setDownloadingId(null);
+    }
+  };
+
+  /**
+   * Delete a document, and only then remove it from the list.
+   *
+   * The row used to be filtered out whatever the response was — so a refused
+   * delete (this is OWNER/ADMIN) looked exactly like a successful one, and the
+   * operator walked away believing the document was gone while it was still
+   * indexed and still answering citizens in RAG. Deleting knowledge is one of
+   * the few actions here whose failure is invisible from the outside.
+   */
+  const handleDelete = async (id: string) => {
+    if (!confirm('Delete this document from the knowledge base?')) return;
+    setDeletingId(id);
+    setDownloadError(null);
+    try {
+      const res = await apiFetch(`${API_URL}/api/knowledge/documents/${id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        throw new Error(
+          (Array.isArray(body?.message) ? body.message.join(' ') : body?.message) ||
+          'That document was not deleted. It is still indexed and still answering questions.'
+        );
+      }
+      setDocs(prev => prev.filter(d => d.id !== id));
+    } catch (err: any) {
+      setDownloadError(err?.message || 'That document was not deleted.');
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  const statusConfig: Record<string, { label: string; className: string; icon: React.ReactNode }> = {
+    PENDING: { label: 'Pending', className: 'bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-500/20', icon: <Clock className="w-3 h-3" /> },
+    PROCESSING: { label: 'Processing', className: 'bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 border-blue-200 dark:border-blue-500/20', icon: <Loader2 className="w-3 h-3 animate-spin" /> },
+    INDEXED: { label: 'Indexed', className: 'bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/20', icon: <CheckCircle2 className="w-3 h-3" /> },
+    FAILED: { label: 'Failed', className: 'bg-red-50 dark:bg-red-500/10 text-red-700 dark:text-red-400 border-red-200 dark:border-red-500/20', icon: <AlertCircle className="w-3 h-3" /> },
+  };
+
+  const safeDocs = Array.isArray(docs) ? docs : [];
+  const indexedCount = safeDocs.filter(d => d.status === 'INDEXED').length;
+  const totalChunks = safeDocs.reduce((sum, d) => sum + (d.chunkCount || 0), 0);
+
+  return (
+    <div className="space-y-6 max-w-7xl pb-12">
+      <RoleNotice path="/knowledge" />
+      {/* Header */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-bold text-slate-900 dark:text-white flex items-center gap-2">
+            <Brain className="w-6 h-6 text-brand-700 dark:text-brand-300" /> Knowledge Base &amp; FAQs
+          </h1>
+          <p className="text-sm text-slate-600 dark:text-slate-400 mt-1">Official guidance, service information and FAQ answers the AI assistant draws on. Voice Agent.</p>
+        </div>
+        <div className="flex gap-2">
+          <button
+            onClick={() => setShowFaqModal(true)}
+            className="flex items-center gap-2 px-3.5 py-2.5 rounded-xl bg-brand-500/20 hover:bg-brand-500/30 text-brand-700 dark:text-brand-300 border border-brand-500/30 text-sm font-semibold transition-all"
+          >
+            <Plus className="w-4 h-4" /> Add FAQ Policy
+          </button>
+          <button
+            onClick={() => setShowPasteModal(true)}
+            className="flex items-center gap-2 px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white text-sm font-semibold transition-all"
+          >
+            <Plus className="w-4 h-4" /> Paste Text
+          </button>
+          <input
+            type="file"
+            ref={fileInputRef}
+            onChange={handleFileUpload}
+            multiple
+            accept=".pdf,.txt,.md,.docx,.csv,.json"
+            className="hidden"
+          />
+          <button
+            disabled={uploading}
+            onClick={() => fileInputRef.current?.click()}
+            className="flex items-center gap-2 px-4 py-2.5 rounded-xl text-white font-semibold transition-all text-sm shadow-md disabled:opacity-50"
+            style={{ background: 'linear-gradient(135deg, #3b6102, #4d7d02)' }}
+          >
+            {uploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
+            Upload Policy Docs
+          </button>
+        </div>
+      </div>
+
+      {/* Upload progress indicator */}
+      {uploading && uploadProgress > 0 && (
+        <div className="rounded-xl bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 shadow-sm p-4">
+          <div className="flex items-center justify-between mb-2 text-sm">
+            <span className="text-slate-700 dark:text-slate-300 font-medium">Extracting & Vectorizing Document Chunks...</span>
+            <span className="text-blue-700 dark:text-blue-400 font-mono font-bold">{uploadProgress}%</span>
+          </div>
+          <div className="w-full h-2 bg-slate-50 dark:bg-slate-800/60 rounded-full overflow-hidden">
+            <div
+              className="h-full bg-gradient-to-r from-blue-600 to-blue-400 rounded-full transition-all duration-300"
+              style={{ width: `${uploadProgress}%` }}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* KPI Stats */}
+      <div className="grid grid-cols-3 gap-4">
+        <div className="p-4 rounded-2xl bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 shadow-sm flex items-center gap-4">
+          <div className="w-10 h-10 rounded-xl bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 flex items-center justify-center flex-shrink-0">
+            <FileText className="w-5 h-5" />
+          </div>
+          <div>
+            <p className="text-2xl font-bold text-slate-900 dark:text-white">{docs.length}</p>
+            <p className="text-xs text-slate-500 dark:text-slate-400">Indexed Sources</p>
+          </div>
+        </div>
+        <div className="p-4 rounded-2xl bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 shadow-sm flex items-center gap-4">
+          <div className="w-10 h-10 rounded-xl bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 flex items-center justify-center flex-shrink-0">
+            <CheckCircle2 className="w-5 h-5" />
+          </div>
+          <div>
+            <p className="text-2xl font-bold text-slate-900 dark:text-white">{indexedCount}</p>
+            <p className="text-xs text-slate-500 dark:text-slate-400">Active & Ready</p>
+          </div>
+        </div>
+        <div className="p-4 rounded-2xl bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 shadow-sm flex items-center gap-4">
+          <div className="w-10 h-10 rounded-xl bg-purple-50 dark:bg-purple-500/10 text-purple-700 dark:text-purple-400 flex items-center justify-center flex-shrink-0">
+            <Database className="w-5 h-5" />
+          </div>
+          <div>
+            <p className="text-2xl font-bold text-slate-900 dark:text-white">{totalChunks}</p>
+            <p className="text-xs text-slate-500 dark:text-slate-400">Vector Embeddings</p>
+          </div>
+        </div>
+      </div>
+
+      {/* Website Crawler Box */}
+      <div className="rounded-2xl border border-blue-200 dark:border-blue-500/20 bg-blue-500/[0.04] p-5 space-y-3">
+        <div className="flex items-center gap-3">
+          <div className="w-9 h-9 rounded-xl bg-blue-600/20 flex items-center justify-center text-blue-700 dark:text-blue-400">
+            <Globe className="w-5 h-5" />
+          </div>
+          <div>
+            <h2 className="text-sm font-bold text-slate-900 dark:text-white">Import Knowledge From Any Website</h2>
+            <p className="text-xs text-slate-600 dark:text-slate-400">Enter a website URL below. The AI crawler will scrape and index all text content automatically.</p>
+          </div>
+        </div>
+        <form onSubmit={handleCrawlWebsite} className="flex gap-3">
+          <input
+            type="url"
+            value={websiteUrl}
+            onChange={e => setWebsiteUrl(e.target.value)}
+            placeholder="https://yourcompany.com or https://apexcare.ng"
+            className="flex-1 px-4 py-2.5 rounded-xl bg-slate-100 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white text-sm focus:outline-none focus:border-blue-500/60 placeholder-gray-600"
+            required
+          />
+          <button
+            type="submit"
+            disabled={crawling}
+            className="px-5 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-sm transition-all flex items-center gap-2 disabled:opacity-50 flex-shrink-0 shadow-lg shadow-brand-600/20"
+          >
+            {crawling ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+            {crawling ? 'Crawling Website...' : 'Crawl & Index URL'}
+          </button>
+        </form>
+        {crawlStatus && (
+          <div className={`p-3 rounded-xl flex items-center gap-2 text-sm ${crawlStatus.type === 'success' ? 'bg-emerald-50 dark:bg-emerald-500/10 border border-emerald-200 dark:border-emerald-500/20 text-emerald-700 dark:text-emerald-400' : 'bg-red-50 dark:bg-red-500/10 border border-red-200 dark:border-red-500/20 text-red-700 dark:text-red-400'}`}>
+            {crawlStatus.type === 'success' ? <CheckCircle2 className="w-4 h-4 flex-shrink-0" /> : <AlertCircle className="w-4 h-4 flex-shrink-0" />}
+            {crawlStatus.text}
+          </div>
+        )}
+      </div>
+
+      {/* Tabs Bar */}
+      <div className="flex gap-1 p-1 rounded-xl bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 shadow-sm w-fit">
+        <button
+          onClick={() => setActiveTab('documents')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${
+            activeTab === 'documents' ? 'bg-brand-600 text-white shadow-lg shadow-brand-600/20' : 'text-slate-600 dark:text-slate-400 hover:text-slate-800 dark:text-slate-200'
+          }`}
+        >
+          <FileText className="w-4 h-4" /> Documents & Websites ({docs.length})
+        </button>
+        <button
+          onClick={() => setActiveTab('faqs')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${
+            activeTab === 'faqs' ? 'bg-brand-600 text-white shadow-lg shadow-brand-600/20' : 'text-slate-600 dark:text-slate-400 hover:text-slate-800 dark:text-slate-200'
+          }`}
+        >
+          <MessageSquare className="w-4 h-4" /> Custom FAQ Rules ({faqs.length})
+        </button>
+      </div>
+
+      {/* Main Grid */}
+      <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
+        {/* Left Column (Docs or FAQs list) */}
+        <div className="lg:col-span-3 space-y-3">
+          {activeTab === 'documents' ? (
+            <>
+              <div className="flex items-center justify-between gap-3">
+                <h2 className="text-sm font-semibold text-slate-900 dark:text-white">Indexed Knowledge Sources</h2>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={handleReindex}
+                    disabled={reindexing}
+                    title="Re-embed every stored chunk into the vector index"
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50 transition-all"
+                  >
+                    {reindexing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Database className="w-3.5 h-3.5" />}
+                    {reindexing ? 'Re-indexing...' : 'Rebuild search index'}
+                  </button>
+                  <button onClick={fetchDocs} title="Refresh this list" className="text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:text-slate-300 transition-colors">
+                    <RefreshCw className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+
+              {/* The server's own words. On failure it names what to check —
+                  the API credits and the Qdrant URL it actually tried — which
+                  is the part an operator has to act on. */}
+              {reindexResult && (
+                <div className={`p-3 rounded-xl flex items-start gap-2 text-xs ${
+                  reindexResult.ok
+                    ? 'bg-emerald-50 dark:bg-emerald-500/10 border border-emerald-200 dark:border-emerald-500/20 text-emerald-700 dark:text-emerald-300'
+                    : 'bg-amber-50 dark:bg-amber-500/10 border border-amber-200 dark:border-amber-500/20 text-amber-700 dark:text-amber-300'
+                }`}>
+                  {reindexResult.ok
+                    ? <CheckCircle2 className="w-4 h-4 flex-shrink-0 mt-0.5" />
+                    : <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />}
+                  <p className="leading-relaxed break-words">{reindexResult.text}</p>
+                </div>
+              )}
+
+              <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-relaxed">
+                Rebuild when a document shows as indexed but the assistant cannot find it — a
+                document stored while the vector index was unreachable is in the database and not
+                in the index, and search silently misses it.
+              </p>
+              {loading ? (
+                <div className="space-y-2">
+                  {[1, 2, 3].map(i => <div key={i} className="h-16 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-800/40 animate-pulse" />)}
+                </div>
+              ) : docs.length === 0 ? (
+                <SharedEmptyState
+                  icon={FileText}
+                  title="No documents yet"
+                  description="Upload a document or crawl your website, and the AI will answer from it instead of falling back to a human."
+                  actions={[{ label: 'Crawl your website', primary: true, onClick: () => setShowPasteModal(true) }]}
+                  hint="Without any knowledge, every question the AI cannot answer becomes a handover."
+                />
+              ) : (
+                <div className="space-y-2">
+                  {docs.map(doc => {
+                    const cfg = statusConfig[doc.status] || statusConfig.PENDING;
+                    return (
+                      <div
+                        key={doc.id}
+                        onClick={() => setSelectedDoc(doc)}
+                        className={`flex items-center gap-3 p-4 rounded-xl border transition-all cursor-pointer group ${
+                          selectedDoc?.id === doc.id
+                            ? 'bg-blue-50 dark:bg-blue-500/10 border-blue-200 dark:border-blue-500/30'
+                            : 'bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 shadow-sm border-slate-200 dark:border-slate-800 hover:bg-slate-50 dark:hover:bg-slate-800/60'
+                        }`}
+                      >
+                        <div className={`w-9 h-9 rounded-xl flex-shrink-0 flex items-center justify-center ${
+                          doc.mimeType === 'text/html' || doc.sourceUrl ? 'bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400' : 'bg-purple-50 dark:bg-purple-500/10 text-purple-700 dark:text-purple-400'
+                        }`}>
+                          {doc.mimeType === 'text/html' || doc.sourceUrl ? <Globe className="w-4 h-4" /> : <FileText className="w-4 h-4" />}
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-semibold text-slate-800 dark:text-slate-200 truncate">{doc.title || doc.fileName}</p>
+                          <div className="flex items-center gap-3 mt-0.5">
+                            {doc.fileSize && <span className="text-xs text-slate-500 dark:text-slate-400">{(doc.fileSize / 1024).toFixed(1)} KB</span>}
+                            {doc.chunkCount && <span className="text-xs text-slate-500 dark:text-slate-400">{doc.chunkCount} vector chunks</span>}
+                          </div>
+                          <GovernanceRow doc={doc} onChanged={(next) => setDocs(prev => prev.map(d => d.id === next.id ? { ...d, ...next } : d))} />
+                        </div>
+                        <div className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold border flex-shrink-0 ${cfg.className}`}>
+                          {cfg.icon} {cfg.label}
+                        </div>
+                        {doc.mimeType === 'text/html' && doc.sourceUrl ? (
+                          <a
+                            href={doc.sourceUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            onClick={(e) => e.stopPropagation()}
+                            title="Open the page this was crawled from"
+                            aria-label={`Open the source page for ${doc.title || doc.fileName}`}
+                            className="opacity-0 group-hover:opacity-100 text-slate-500 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400 transition-all p-1 flex-shrink-0"
+                          >
+                            <Globe className="w-4 h-4" />
+                          </a>
+                        ) : (
+                          <button
+                            onClick={(e) => { e.stopPropagation(); handleDownload(doc.id); }}
+                            disabled={downloadingId === doc.id}
+                            title="Download the uploaded file"
+                            aria-label={`Download ${doc.title || doc.fileName}`}
+                            className="opacity-0 group-hover:opacity-100 text-slate-500 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400 transition-all p-1 flex-shrink-0 disabled:opacity-50"
+                          >
+                            {downloadingId === doc.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+                          </button>
+                        )}
+                        <button
+                          onClick={(e) => { e.stopPropagation(); handleDelete(doc.id); }}
+                          disabled={deletingId === doc.id}
+                          aria-label={`Delete ${doc.title || doc.fileName}`}
+                          className="opacity-0 group-hover:opacity-100 text-slate-500 dark:text-slate-400 hover:text-red-600 dark:text-red-400 transition-all p-1 flex-shrink-0"
+                        >
+                          {deletingId === doc.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
+                        </button>
+                      </div>
+                    );
+                  })}
+                  <KnowledgeGaps />
+                  {downloadError && (
+                    <div className="p-3 rounded-xl bg-red-500/[0.06] border border-red-200 dark:border-red-500/20 text-xs text-red-700 dark:text-red-300">
+                      {downloadError}
+                    </div>
+                  )}
+                </div>
+              )}
+            </>
+          ) : (
+            <div className="space-y-3">
+              <div className="flex items-center justify-between gap-3">
+                <h2 className="text-sm font-semibold text-slate-900 dark:text-white">Explicit Question & Answer Rules</h2>
+                {reordering && (
+                  <span className="flex items-center gap-1.5 text-[11px] text-slate-500 dark:text-slate-400">
+                    <Loader2 className="w-3 h-3 animate-spin" /> Saving order
+                  </span>
+                )}
+              </div>
+
+              {/* Ordering is not cosmetic, and nothing said so before. When two
+                  FAQs match a question equally well, the one higher up is the
+                  answer the citizen gets. */}
+              {faqs.length > 1 && (
+                <div className="flex gap-2.5 p-3 rounded-xl bg-blue-500/[0.06] border border-blue-200 dark:border-blue-500/20">
+                  <Info className="w-4 h-4 text-blue-700 dark:text-blue-400 flex-shrink-0 mt-0.5" />
+                  <p className="text-[11px] text-blue-700 dark:text-blue-300 leading-relaxed">
+                    Order decides ties. When two of these match a citizen&rsquo;s question equally
+                    well, the assistant answers with whichever is higher in this list — so put the
+                    more specific wording above the general one.
+                  </p>
+                </div>
+              )}
+
+              <div className="space-y-3">
+                {faqs.map((faq, i) => (
+                  <div key={faq.id} className="p-4 rounded-xl bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 shadow-sm space-y-3">
+                    {editingFaq === faq.id ? (
+                      <div className="space-y-3">
+                        <input type="text" value={editQuestion} onChange={e => setEditQuestion(e.target.value)} className="w-full px-3 py-1.5 rounded bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-white text-sm" />
+                        <textarea value={editAnswer} onChange={e => setEditAnswer(e.target.value)} className="w-full px-3 py-1.5 rounded bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-white text-sm" rows={2} />
+                        <div className="flex gap-2">
+                          <button onClick={() => handleEditFaq(faq.id)} className="px-3 py-1 bg-emerald-100 dark:bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 text-xs rounded hover:bg-emerald-500/30">Save</button>
+                          <button onClick={() => setEditingFaq(null)} className="px-3 py-1 bg-slate-200 dark:bg-slate-500/20 text-slate-700 dark:text-slate-300 text-xs rounded hover:bg-gray-500/30">Cancel</button>
+                        </div>
+                      </div>
+                    ) : (
+                      <>
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="flex items-start gap-2 min-w-0">
+                            {/* The position, so "higher in the list" is a thing
+                                an operator can actually see and refer to. */}
+                            <span className="text-[10px] font-bold w-5 h-5 rounded-md bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 flex items-center justify-center flex-shrink-0 mt-0.5 tabular-nums">
+                              {i + 1}
+                            </span>
+                            <span className="text-xs font-bold text-blue-700 dark:text-blue-400 uppercase tracking-wider">Q: {faq.question}</span>
+                          </div>
+                          <div className="flex items-center gap-2 flex-shrink-0">
+                            <div className="flex items-center">
+                              <button
+                                onClick={() => moveFaq(faq.id, -1)}
+                                disabled={i === 0 || reordering}
+                                aria-label={`Move "${faq.question}" up`}
+                                className="p-1 rounded text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-30 disabled:hover:bg-transparent transition-all"
+                              >
+                                <ArrowUp className="w-3.5 h-3.5" />
+                              </button>
+                              <button
+                                onClick={() => moveFaq(faq.id, 1)}
+                                disabled={i === faqs.length - 1 || reordering}
+                                aria-label={`Move "${faq.question}" down`}
+                                className="p-1 rounded text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-30 disabled:hover:bg-transparent transition-all"
+                              >
+                                <ArrowDown className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                            <span className="text-[10px] px-2 py-0.5 rounded bg-white/[0.06] text-slate-600 dark:text-slate-400">{faq.category}</span>
+                            <button onClick={() => { setEditingFaq(faq.id); setEditQuestion(faq.question); setEditAnswer(faq.answer); }} className="text-xs text-blue-700 dark:text-blue-400 hover:underline">Edit</button>
+                            <button onClick={() => handleDeleteFaq(faq.id)} className="text-xs text-red-700 dark:text-red-400 hover:underline">Delete</button>
+                          </div>
+                        </div>
+                        <p className="text-xs text-slate-700 dark:text-slate-300 leading-relaxed">A: {faq.answer}</p>
+                      </>
+                    )}
+                  </div>
+                ))}
+                {loading ? (
+                  <ListSkeleton rows={4} />
+                ) : faqs.length === 0 ? (
+                  <SharedEmptyState
+                    icon={MessageSquare}
+                    title="No FAQs yet"
+                    description="An FAQ is an exact answer the AI gives verbatim — useful for prices, opening hours, and policies you do not want it paraphrasing."
+                    actions={[{ label: 'Add your first FAQ', primary: true, onClick: () => setShowFaqModal(true) }]}
+                  />
+                ) : null}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Right Column: Search Playground */}
+        <div className="lg:col-span-2 space-y-3">
+          <h2 className="text-sm font-semibold text-slate-900 dark:text-white flex items-center gap-2">
+            <Zap className="w-4 h-4 text-amber-700 dark:text-amber-400" /> RAG Search Playground
+          </h2>
+          <div className="rounded-2xl bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 shadow-sm overflow-hidden">
+            <form onSubmit={handleSearch} className="p-4 border-b border-slate-200 dark:border-slate-800">
+              <div className="relative">
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500 dark:text-slate-400" />
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={e => setSearchQuery(e.target.value)}
+                  placeholder="Ask anything your AI should know..."
+                  className="w-full pl-10 pr-20 py-2.5 rounded-xl bg-slate-100 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white text-sm placeholder-gray-600 focus:outline-none focus:border-blue-500/50"
+                />
+                <button
+                  type="submit"
+                  disabled={searching}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 px-3 py-1 bg-brand-600 hover:bg-brand-700 text-white text-xs font-semibold rounded-lg disabled:opacity-50 transition-all"
+                >
+                  {searching ? 'Searching...' : 'Search'}
+                </button>
+              </div>
+            </form>
+            <div className="p-4 space-y-3 max-h-96 overflow-y-auto">
+              {searching ? (
+                <div className="flex items-center justify-center py-10">
+                  <Loader2 className="w-6 h-6 text-blue-700 dark:text-blue-400 animate-spin" />
+                </div>
+              ) : searchResults.length > 0 ? (
+                searchResults.map((r, i) => (
+                  <div key={i} className="p-3.5 rounded-xl bg-black/20 border border-slate-200 dark:border-slate-800 space-y-2">
+                    <p className="text-xs text-slate-700 dark:text-slate-300 leading-relaxed">{r.content}</p>
+                    <div className="flex items-center justify-between">
+                      <span className="text-[10px] text-slate-500 dark:text-slate-400">
+                        {r.documentTitle && `Source: ${r.documentTitle}`}
+                      </span>
+                      <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
+                        r.similarity > 0.8 ? 'bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400' :
+                        r.similarity > 0.6 ? 'bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400' :
+                        'bg-slate-100 dark:bg-slate-500/10 text-slate-600 dark:text-slate-400'
+                      }`}>
+                        {(r.similarity * 100).toFixed(0)}% match
+                      </span>
+                    </div>
+                  </div>
+                ))
+              ) : hasSearched ? (
+                <div className="text-center py-10 text-slate-500 dark:text-slate-400">
+                  <Search className="w-8 h-8 mx-auto mb-2 opacity-20" />
+                  <p className="text-sm">No vector matches found for your query.</p>
+                </div>
+              ) : (
+                <div className="text-center py-10 text-slate-500 dark:text-slate-400">
+                  <Brain className="w-8 h-8 mx-auto mb-2 opacity-20" />
+                  <p className="text-sm">Search vector memory to test AI context.</p>
+                  <p className="text-xs mt-1">Try: "What are your prices?" or "Working hours"</p>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Paste text modal */}
+      {showPasteModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm">
+          <div className="w-full max-w-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-2xl space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-3">
+              <h2 className="text-lg font-bold text-slate-900 dark:text-white">Paste Knowledge Text</h2>
+              <button onClick={() => setShowPasteModal(false)} className="text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:text-slate-300">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <form onSubmit={handlePasteSubmit} className="space-y-4">
+              <div>
+                <label className="text-xs font-semibold text-slate-600 dark:text-slate-400 mb-1.5 block">Document Title</label>
+                <input
+                  type="text"
+                  required
+                  value={pasteTitle}
+                  onChange={e => setPasteTitle(e.target.value)}
+                  placeholder="e.g. Return Policy, Product Details"
+                  className="w-full px-4 py-2.5 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/40 placeholder-gray-600"
+                />
+              </div>
+              <div>
+                <label className="text-xs font-semibold text-slate-600 dark:text-slate-400 mb-1.5 block">Content Body</label>
+                <textarea
+                  required
+                  rows={8}
+                  value={pasteContent}
+                  onChange={e => setPasteContent(e.target.value)}
+                  placeholder="Paste text content here..."
+                  className="w-full px-4 py-2.5 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/40 resize-none placeholder-gray-600"
+                />
+              </div>
+              <button
+                type="submit"
+                disabled={pasting}
+                className="w-full py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-sm disabled:opacity-50 transition-all flex items-center justify-center gap-2"
+              >
+                {pasting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
+                {pasting ? 'Indexing...' : 'Index Content'}
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Add FAQ Modal */}
+      {showFaqModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm">
+          <div className="w-full max-w-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-2xl space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-3">
+              <h2 className="text-lg font-bold text-slate-900 dark:text-white">Add FAQ Rule</h2>
+              <button onClick={() => setShowFaqModal(false)} className="text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:text-slate-300">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <form onSubmit={handleAddFaq} className="space-y-4">
+              <div>
+                <label className="text-xs font-semibold text-slate-600 dark:text-slate-400 mb-1.5 block">Customer Question</label>
+                <input
+                  type="text"
+                  required
+                  value={faqQuestion}
+                  onChange={e => setFaqQuestion(e.target.value)}
+                  placeholder="e.g. Do you offer nationwide delivery?"
+                  className="w-full px-4 py-2.5 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/40 placeholder-gray-600"
+                />
+              </div>
+              <div>
+                <label className="text-xs font-semibold text-slate-600 dark:text-slate-400 mb-1.5 block">Exact Answer for AI</label>
+                <textarea
+                  required
+                  rows={4}
+                  value={faqAnswer}
+                  onChange={e => setFaqAnswer(e.target.value)}
+                  placeholder="e.g. Yes, we deliver across all 36 states in Nigeria via Red Star Express..."
+                  className="w-full px-4 py-2.5 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/40 resize-none placeholder-gray-600"
+                />
+              </div>
+              <button
+                type="submit"
+                className="w-full py-2.5 rounded-xl bg-purple-600 hover:bg-purple-500 text-white font-semibold text-sm transition-all flex items-center justify-center gap-2"
+              >
+                <Plus className="w-4 h-4" /> Save FAQ Rule
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Governance for one document (PRD §12): whether citizens can hear it, where it
+ * came from, and when it must be re-checked. Approval by a different person is
+ * enforced by the API; this row shows its refusal rather than hiding the button.
+ */
+function GovernanceRow({ doc, onChanged }: { doc: any; onChanged: (d: any) => void }) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const status: string = doc.publicationStatus ?? 'APPROVED';
+  const reviewOverdue = doc.reviewDueAt && new Date(doc.reviewDueAt).getTime() < Date.now();
+
+  const call = async (url: string, method: 'POST' | 'PATCH', body?: unknown) => {
+    setBusy(true);
+    setErr(null);
+    try {
+      const res = await apiFetch(url, { method, headers: { 'Content-Type': 'application/json' }, ...(body ? { body: JSON.stringify(body) } : {}) });
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(Array.isArray(out?.message) ? out.message.join(' ') : out?.message || `Failed (${res.status})`);
+      onChanged(out);
+    } catch (e: any) {
+      setErr(e?.message || 'Failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const tone =
+    status === 'APPROVED' ? 'text-emerald-700 dark:text-emerald-400' : status === 'WITHDRAWN' ? 'text-slate-500' : 'text-amber-700 dark:text-amber-400';
+
+  return (
+    <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px]" onClick={(e) => e.stopPropagation()}>
+      <span className={`font-bold ${tone}`}>
+        {status === 'APPROVED' ? 'Answering citizens' : status === 'WITHDRAWN' ? 'Withdrawn — not used' : 'Draft — not used until approved'}
+      </span>
+      {doc.mdaOwner && <span className="text-slate-500">Owner: {doc.mdaOwner}</span>}
+      {doc.verifiedAt && <span className="text-slate-500">Verified {new Date(doc.verifiedAt).toLocaleDateString()}</span>}
+      {reviewOverdue && <span className="font-bold text-red-700 dark:text-red-400">Review overdue</span>}
+      {status !== 'APPROVED' && (
+        <button className="underline font-semibold text-slate-700 dark:text-slate-200" disabled={busy}
+          onClick={() => call(`${API_URL}/api/knowledge/documents/${doc.id}/approve`, 'POST')}>Approve</button>
+      )}
+      {status === 'APPROVED' && (
+        <button className="underline text-slate-600 dark:text-slate-300" disabled={busy}
+          onClick={() => { const reason = window.prompt('Why withdraw this? It stops answering citizens at once.'); if (reason) call(`${API_URL}/api/knowledge/documents/${doc.id}/withdraw`, 'POST', { reason }); }}>Withdraw</button>
+      )}
+      <button className="underline text-slate-600 dark:text-slate-300" disabled={busy}
+        onClick={() => {
+          const sourceUrl = window.prompt('Official source link (leave as is to keep):', doc.sourceUrl ?? '');
+          if (sourceUrl === null) return;
+          const mdaOwner = window.prompt('MDA responsible for keeping it correct:', doc.mdaOwner ?? '') ?? undefined;
+          const reviewDueAt = window.prompt('Re-check by (YYYY-MM-DD):', doc.reviewDueAt ? String(doc.reviewDueAt).slice(0, 10) : '') ?? undefined;
+          call(`${API_URL}/api/knowledge/documents/${doc.id}/metadata`, 'PATCH', { sourceUrl, mdaOwner, reviewDueAt });
+        }}>Source &amp; review</button>
+      {err && <span role="alert" className="text-red-700 dark:text-red-400">{err}</span>}
+    </div>
+  );
+}
+
+/** Questions citizens asked that no approved knowledge answered (PRD §12). */
+function KnowledgeGaps() {
+  const [gaps, setGaps] = useState<any[] | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const load = useCallback(() => {
+    apiFetch(`${API_URL}/api/knowledge/gaps`)
+      .then(async (r) => { if (!r.ok) throw new Error(`Could not load (${r.status})`); setGaps(await r.json()); })
+      .catch((e) => setErr(String(e?.message ?? e)));
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  const update = async (id: string, body: Record<string, unknown>) => {
+    const r = await apiFetch(`${API_URL}/api/knowledge/gaps/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (!r.ok) {
+      const out = await r.json().catch(() => ({}));
+      setErr(out?.message || `Failed (${r.status})`);
+      return;
+    }
+    load();
+  };
+
+  if (err) return <p role="alert" className="text-xs text-red-700 dark:text-red-400 mt-4">{err}</p>;
+  if (!gaps || gaps.length === 0) return null;
+  return (
+    <section className="mt-6 rounded-xl border border-amber-200 dark:border-amber-900/40 bg-amber-50/60 dark:bg-amber-950/20 p-4" aria-labelledby="gaps">
+      <h3 id="gaps" className="text-sm font-bold text-slate-900 dark:text-white">Questions the assistant could not answer ({gaps.length})</h3>
+      <p className="text-xs text-slate-600 dark:text-slate-300 mt-1">Most-asked first. Publish an answer, then mark it resolved with where the answer now lives.</p>
+      <ul className="mt-3 divide-y divide-amber-100 dark:divide-amber-900/30">
+        {gaps.map((g) => (
+          <li key={g.id} className="py-2 flex flex-wrap items-start justify-between gap-2">
+            <div className="min-w-0">
+              <p className="text-sm text-slate-800 dark:text-slate-100">“{g.sampleText}”</p>
+              <p className="text-[11px] text-slate-500">Asked {g.count} time{g.count === 1 ? '' : 's'} · last {new Date(g.lastAskedAt).toLocaleDateString()}{g.status === 'ASSIGNED' ? ' · assigned' : ''}</p>
+            </div>
+            <div className="flex gap-2 text-xs">
+              <button className="underline font-semibold" onClick={() => { const resolution = window.prompt('Where is the answer now? (document or FAQ title)'); if (resolution) update(g.id, { status: 'RESOLVED', resolution }); }}>Resolved</button>
+              <button className="underline text-slate-500" onClick={() => update(g.id, { status: 'DISMISSED' })}>Not a real gap</button>
+            </div>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}

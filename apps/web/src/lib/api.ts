@@ -1,0 +1,785 @@
+export const getApiUrl = () => {
+  if (typeof window !== 'undefined' && ['localhost', '127.0.0.1'].includes(window.location.hostname)) {
+    return 'http://localhost:4000';
+  }
+  if (process.env.NEXT_PUBLIC_API_URL) return process.env.NEXT_PUBLIC_API_URL.replace(/\/+$/, '');
+  return 'http://localhost:4000';
+};
+
+export const API_URL = getApiUrl();
+
+const getHeaders = () => {
+  const token = typeof window !== "undefined" ? localStorage.getItem("ace_token") : null;
+  return {
+    "Content-Type": "application/json",
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  };
+};
+
+export const clearSession = () => {
+  if (typeof window === "undefined") return;
+  localStorage.removeItem("ace_token");
+  localStorage.removeItem("ace_refresh_token");
+  localStorage.removeItem("ace_user");
+};
+
+/**
+ * Exchanges the stored refresh token for a fresh access token.
+ *
+ * The login response has always included a 7-day refreshToken and the API has always
+ * exposed /api/auth/refresh, but the dashboard stored neither and called neither —
+ * so every session hard-expired after the access token's lifetime and dumped the
+ * user at the login screen mid-task. Concurrent 401s share one in-flight refresh.
+ */
+let refreshInFlight: Promise<boolean> | null = null;
+
+export const refreshSession = async (): Promise<boolean> => {
+  if (typeof window === "undefined") return false;
+  if (refreshInFlight) return refreshInFlight;
+
+  const refreshToken = localStorage.getItem("ace_refresh_token");
+  if (!refreshToken) return false;
+
+  refreshInFlight = (async () => {
+    try {
+      const res = await fetch(`${API_URL}/api/auth/refresh`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refreshToken }),
+      });
+      if (!res.ok) return false;
+
+      const data = await res.json();
+      if (!data?.accessToken) return false;
+
+      localStorage.setItem("ace_token", data.accessToken);
+      if (data.refreshToken) localStorage.setItem("ace_refresh_token", data.refreshToken);
+      if (data.user) localStorage.setItem("ace_user", JSON.stringify(data.user));
+      return true;
+    } catch {
+      return false;
+    } finally {
+      refreshInFlight = null;
+    }
+  })();
+
+  return refreshInFlight;
+};
+
+const parseError = async (res: Response) => {
+  const body = await res.json().catch(() => ({} as any));
+  const message = (body as any).message;
+  // class-validator returns an array of messages on 400.
+  return Array.isArray(message) ? message.join(" ") : message || `Request failed (${res.status})`;
+};
+
+const handleResponse = async (res: Response, retryFn?: () => Promise<Response>) => {
+  if (!res.ok) {
+    if (res.status === 401 && typeof window !== "undefined") {
+      const refreshed = await refreshSession();
+      if (refreshed && retryFn) {
+        const retryRes = await retryFn();
+        if (retryRes.ok) return retryRes.json();
+      }
+      clearSession();
+      window.location.replace("/login");
+    }
+    const msg = await parseError(res);
+    throw new Error(msg);
+  }
+  return res.json();
+};
+
+/**
+ * Rebuilds the request with the token that is in storage RIGHT NOW.
+ *
+ * The dashboard pages capture `authHeaders` once when a component mounts, so
+ * the Authorization they pass is whatever was current then — which is exactly
+ * the token that just got refused. Overriding it here is what makes a retry
+ * mean anything; reusing the caller's header would re-send the dead token and
+ * fail identically.
+ */
+const withCurrentToken = (init: RequestInit): RequestInit => {
+  const headers = new Headers(init.headers as HeadersInit | undefined);
+  const token = typeof window !== "undefined" ? localStorage.getItem("ace_token") : null;
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  else headers.delete("Authorization");
+  // Only when there is a body: forcing it on a GET is noise, and on a
+  // multipart upload it would corrupt the boundary.
+  if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  return { ...init, headers };
+};
+
+/**
+ * `fetch`, with the session kept alive.
+ *
+ * Deliberately shaped exactly like the global `fetch` — a URL in, a `Response`
+ * out — because the pages that need it already do their own `res.ok` and
+ * `res.json()` handling. Swapping the function name is the whole migration;
+ * anything that returned parsed JSON instead would have meant rewriting
+ * seventy call sites by hand.
+ *
+ * ── Why this exists at all ─────────────────────────────────────────────────
+ *
+ * `handleResponse` has refreshed a rejected token for some time, but only for
+ * callers that went through the `api` client. Most dashboard pages did not:
+ * they called the API with raw `fetch` and swallowed failures, so an expired
+ * token produced a page with no data, no error and no redirect. The settings
+ * form rendered every field blank — and offered to save that over the
+ * agency's real configuration.
+ *
+ * The layout guard did not catch it either, because it checks whether a token
+ * EXISTS rather than whether the API still accepts one.
+ *
+ * Three outcomes, and none of them is "carry on with nothing":
+ *   - the token still works, or the refresh succeeds → the caller gets its data
+ *   - the refresh fails → the session is cleared and the operator is sent to
+ *     sign in, because there is nothing to recover with
+ *   - any other status → returned untouched, so a 404 or a 400 still reaches
+ *     the caller's own error handling rather than being treated as expiry
+ *
+ * Not for the signed-out pages (register, password reset, email verification,
+ * the citizen's selfie link). They have no session to refresh, and bouncing a
+ * citizen with a bad reset link to /login would be wrong.
+ */
+/**
+ * Set once the session has been given up on, so the redirect happens once.
+ *
+ * A page issues several requests at a time. When the session cannot be
+ * recovered they ALL reach the sign-out below, and each calling
+ * `location.replace` thrashes navigation — the browser starts the same
+ * navigation repeatedly and may never settle on it. That showed up as this
+ * file's own e2e timing out under a full suite run while passing in
+ * isolation, which is the shape of a race rather than a slow test.
+ */
+let signedOut = false;
+
+export const apiFetch = async (input: string, init: RequestInit = {}): Promise<Response> => {
+  const send = () => fetch(input, withCurrentToken(init));
+
+  let res = await send();
+  if (res.status !== 401 || typeof window === "undefined") return res;
+
+  // refreshSession() writes the new token to storage, which is where the
+  // retry picks it up. Concurrent 401s share one in-flight refresh.
+  if (await refreshSession()) {
+    res = await send();
+    if (res.status !== 401) return res;
+  }
+
+  clearSession();
+  if (!signedOut) {
+    signedOut = true;
+    window.location.replace("/login");
+  }
+  return res;
+};
+
+/**
+ * Authenticated fetch that transparently refreshes an expired access token once
+ * before giving up and redirecting to /login.
+ */
+export const authFetch = async (path: string, init: RequestInit = {}) => {
+  const send = () => fetch(`${API_URL}${path}`, { ...init, headers: { ...getHeaders(), ...(init.headers || {}) } });
+
+  let res = await send();
+  if (res.status === 401 && typeof window !== "undefined") {
+    if (await refreshSession()) {
+      res = await send();
+    }
+  }
+  return handleResponse(res);
+};
+
+export const api = {
+  auth: {
+    login: async (email?: string, password?: string) => {
+      const res = await fetch(`${API_URL}/api/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password }),
+      });
+      return handleResponse(res);
+    },
+    // ── Two-step sign-in (PRD §17) ──────────────────────────────────────────
+    mfaVerify: async (mfaToken: string, code: string) => {
+      const res = await fetch(`${API_URL}/api/auth/mfa/verify`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mfaToken, code }),
+      });
+      return handleResponse(res);
+    },
+    mfaEnrolSetup: async (mfaToken: string) => {
+      const res = await fetch(`${API_URL}/api/auth/mfa/enrol/setup`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mfaToken }),
+      });
+      return handleResponse(res);
+    },
+    mfaEnrolEnable: async (mfaToken: string, code: string) => {
+      const res = await fetch(`${API_URL}/api/auth/mfa/enrol/enable`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mfaToken, code }),
+      });
+      return handleResponse(res);
+    },
+    mfaStatus: async () => {
+      const res = await fetch(`${API_URL}/api/auth/mfa/status`, { headers: getHeaders() });
+      return handleResponse(res);
+    },
+    mfaSetup: async () => {
+      const res = await fetch(`${API_URL}/api/auth/mfa/setup`, { method: "POST", headers: getHeaders() });
+      return handleResponse(res);
+    },
+    mfaEnable: async (code: string) => {
+      const res = await fetch(`${API_URL}/api/auth/mfa/enable`, { method: "POST", headers: getHeaders(), body: JSON.stringify({ code }) });
+      return handleResponse(res);
+    },
+    mfaDisable: async (code: string) => {
+      const res = await fetch(`${API_URL}/api/auth/mfa/disable`, { method: "POST", headers: getHeaders(), body: JSON.stringify({ code }) });
+      return handleResponse(res);
+    },
+  },
+
+  crm: {
+    getContacts: async () => {
+      const res = await fetch(`${API_URL}/api/crm/contacts`, { headers: getHeaders() });
+      return handleResponse(res);
+    },
+    getLeads: async () => {
+      const res = await fetch(`${API_URL}/api/crm/leads`, { headers: getHeaders() });
+      return handleResponse(res);
+    },
+    getDeals: async () => {
+      const res = await fetch(`${API_URL}/api/crm/deals`, { headers: getHeaders() });
+      return handleResponse(res);
+    },
+    addContact: async (data: any) => {
+      const res = await fetch(`${API_URL}/api/crm/contacts`, {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify(data),
+      });
+      return handleResponse(res);
+    },
+  },
+
+  conversations: {
+  },
+
+  knowledge: {
+    getDocuments: async () => {
+      const res = await fetch(`${API_URL}/api/knowledge/documents`, { headers: getHeaders() });
+      return handleResponse(res);
+    },
+    uploadDocument: async (data: any) => {
+      const res = await fetch(`${API_URL}/api/knowledge/documents`, {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify(data),
+      });
+      return handleResponse(res);
+    },
+    search: async (q: string) => {
+      const res = await fetch(`${API_URL}/api/knowledge/search?q=${encodeURIComponent(q)}`, {
+        headers: getHeaders(),
+      });
+      return handleResponse(res);
+    },
+  },
+
+  /**
+   * The operating ministry's console. Every one of these refuses a caller who
+   * is not a platform operator, checked server-side against the database — the
+   * `isPlatformAdmin` flag the dashboard stores is only what decides whether to
+   * SHOW the link, never what decides access.
+   */
+  platform: {
+    getOverview: async () => {
+      const res = await fetch(`${API_URL}/api/platform/overview`, { headers: getHeaders() });
+      return handleResponse(res);
+    },
+    listAgencies: async () => {
+      const res = await fetch(`${API_URL}/api/platform/agencies`, { headers: getHeaders() });
+      return handleResponse(res);
+    },
+    getAgency: async (id: string) => {
+      const res = await fetch(`${API_URL}/api/platform/agencies/${id}`, { headers: getHeaders() });
+      return handleResponse(res);
+    },
+    createAgency: async (body: {
+      name: string;
+      category?: string;
+      ownerEmail: string;
+      ownerFullName: string;
+      phone?: string;
+    }) => {
+      const res = await fetch(`${API_URL}/api/platform/agencies`, {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify(body),
+      });
+      return handleResponse(res);
+    },
+    suspendAgency: async (id: string, reason: string) => {
+      const res = await fetch(`${API_URL}/api/platform/agencies/${id}/suspend`, {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify({ reason }),
+      });
+      return handleResponse(res);
+    },
+    reinstateAgency: async (id: string) => {
+      const res = await fetch(`${API_URL}/api/platform/agencies/${id}/reinstate`, {
+        method: "POST",
+        headers: getHeaders(),
+      });
+      return handleResponse(res);
+    },
+    getAudit: async (params: { organizationId?: string; limit?: number } = {}) => {
+      const q = new URLSearchParams();
+      if (params.organizationId) q.set("organizationId", params.organizationId);
+      if (params.limit) q.set("limit", String(params.limit));
+      const res = await fetch(`${API_URL}/api/platform/audit?${q.toString()}`, { headers: getHeaders() });
+      return handleResponse(res);
+    },
+  },
+
+  /**
+   * The agency's own services and locations — what the AI offers a citizen and
+   * where it sends them. Reading is open to any member; writing is OWNER/ADMIN
+   * and the API enforces that, not this.
+   */
+  cases: {
+    list: async (q: { stage?: string; category?: string; lga?: string; overdue?: boolean; mine?: boolean } = {}) => {
+      const p = new URLSearchParams();
+      if (q.stage) p.set('stage', q.stage);
+      if (q.category) p.set('category', q.category);
+      if (q.lga) p.set('lga', q.lga);
+      if (q.overdue) p.set('overdue', 'true');
+      if (q.mine) p.set('mine', 'true');
+      const res = await fetch(`${API_URL}/api/cases?${p}`, { headers: getHeaders() });
+      return handleResponse(res);
+    },
+    summary: async () => {
+      const res = await fetch(`${API_URL}/api/cases/summary`, { headers: getHeaders() });
+      return handleResponse(res);
+    },
+    get: async (id: string) => {
+      const res = await fetch(`${API_URL}/api/cases/${id}`, { headers: getHeaders() });
+      return handleResponse(res);
+    },
+    moveStage: async (id: string, body: { stage: string; outcome?: string; note?: string }) => {
+      const res = await fetch(`${API_URL}/api/cases/${id}/stage`, { method: "POST", headers: getHeaders(), body: JSON.stringify(body) });
+      return handleResponse(res);
+    },
+    assign: async (id: string, userId: string | null) => {
+      const res = await fetch(`${API_URL}/api/cases/${id}/assign`, { method: "POST", headers: getHeaders(), body: JSON.stringify({ userId }) });
+      return handleResponse(res);
+    },
+    classify: async (id: string, body: { category?: string; lga?: string; ward?: string; community?: string; responsibleMda?: string; summary?: string; dueAt?: string; priority?: string; isSensitive?: boolean }) => {
+      const res = await fetch(`${API_URL}/api/cases/${id}/classify`, { method: "POST", headers: getHeaders(), body: JSON.stringify(body) });
+      return handleResponse(res);
+    },
+    addNote: async (id: string, body: string) => {
+      const res = await fetch(`${API_URL}/api/cases/${id}/notes`, { method: "POST", headers: getHeaders(), body: JSON.stringify({ body }) });
+      return handleResponse(res);
+    },
+    refer: async (id: string, body: { mdaName: string; liaisonName?: string; liaisonContact?: string; liaisonUserId?: string; note?: string; dueAt?: string }) => {
+      const res = await fetch(`${API_URL}/api/cases/${id}/refer`, { method: "POST", headers: getHeaders(), body: JSON.stringify(body) });
+      return handleResponse(res);
+    },
+    respondToReferral: async (referralId: string, body: { status: string; response?: string }) => {
+      const res = await fetch(`${API_URL}/api/cases/referrals/${referralId}/respond`, { method: "POST", headers: getHeaders(), body: JSON.stringify(body) });
+      return handleResponse(res);
+    },
+    citizenNotified: async (id: string, body: { channel: string; note?: string }) => {
+      const res = await fetch(`${API_URL}/api/cases/${id}/citizen-notified`, { method: "POST", headers: getHeaders(), body: JSON.stringify(body) });
+      return handleResponse(res);
+    },
+  },
+  budget: {
+    documents: async () => {
+      const res = await fetch(`${API_URL}/api/budget/documents`, { headers: getHeaders() });
+      return handleResponse(res);
+    },
+    createDocument: async (body: {
+      title: string; documentType: string; fiscalYear: number; sourceUrl?: string;
+      reportingPeriod?: string; declaredTotal?: string; notes?: string;
+    }) => {
+      const res = await fetch(`${API_URL}/api/budget/documents`, {
+        method: "POST", headers: getHeaders(), body: JSON.stringify(body),
+      });
+      return handleResponse(res);
+    },
+    importLines: async (id: string, csv: string) => {
+      const res = await fetch(`${API_URL}/api/budget/documents/${id}/lines`, {
+        method: "POST", headers: getHeaders(), body: JSON.stringify({ csv }),
+      });
+      return handleResponse(res);
+    },
+    validation: async (id: string) => {
+      const res = await fetch(`${API_URL}/api/budget/documents/${id}/validation`, { headers: getHeaders() });
+      return handleResponse(res);
+    },
+    approve: async (id: string) => {
+      const res = await fetch(`${API_URL}/api/budget/documents/${id}/approve`, { method: "POST", headers: getHeaders() });
+      return handleResponse(res);
+    },
+    withdraw: async (id: string, reason: string) => {
+      const res = await fetch(`${API_URL}/api/budget/documents/${id}/withdraw`, {
+        method: "POST", headers: getHeaders(), body: JSON.stringify({ reason }),
+      });
+      return handleResponse(res);
+    },
+    facets: async () => {
+      const res = await fetch(`${API_URL}/api/budget/facets`, { headers: getHeaders() });
+      return handleResponse(res);
+    },
+    query: async (q: { year: number; stage: string; mda?: string; sector?: string }) => {
+      const params = new URLSearchParams({ year: String(q.year), stage: q.stage });
+      if (q.mda) params.set('mda', q.mda);
+      if (q.sector) params.set('sector', q.sector);
+      const res = await fetch(`${API_URL}/api/budget/query?${params}`, { headers: getHeaders() });
+      return handleResponse(res);
+    },
+    projects: async () => {
+      const res = await fetch(`${API_URL}/api/budget/projects`, { headers: getHeaders() });
+      return handleResponse(res);
+    },
+    importProjects: async (csv: string) => {
+      const res = await fetch(`${API_URL}/api/budget/projects/import`, {
+        method: "POST", headers: getHeaders(), body: JSON.stringify({ csv }),
+      });
+      return handleResponse(res);
+    },
+    approveProject: async (id: string) => {
+      const res = await fetch(`${API_URL}/api/budget/projects/${id}/approve`, { method: "POST", headers: getHeaders() });
+      return handleResponse(res);
+    },
+    observations: async () => {
+      const res = await fetch(`${API_URL}/api/budget/observations`, { headers: getHeaders() });
+      return handleResponse(res);
+    },
+    markReferred: async (id: string) => {
+      const res = await fetch(`${API_URL}/api/budget/observations/${id}/referred`, { method: "POST", headers: getHeaders() });
+      return handleResponse(res);
+    },
+  },
+  catalogue: {
+    lgas: async () => {
+      const res = await fetch(`${API_URL}/api/catalogue/lgas`, { headers: getHeaders() });
+      return handleResponse(res);
+    },
+    listServices: async () => {
+      const res = await fetch(`${API_URL}/api/catalogue/services`, { headers: getHeaders() });
+      return handleResponse(res);
+    },
+    createService: async (body: Record<string, unknown>) => {
+      const res = await fetch(`${API_URL}/api/catalogue/services`, {
+        method: "POST", headers: getHeaders(), body: JSON.stringify(body),
+      });
+      return handleResponse(res);
+    },
+    updateService: async (id: string, body: Record<string, unknown>) => {
+      const res = await fetch(`${API_URL}/api/catalogue/services/${id}`, {
+        method: "PATCH", headers: getHeaders(), body: JSON.stringify(body),
+      });
+      return handleResponse(res);
+    },
+    deleteService: async (id: string) => {
+      const res = await fetch(`${API_URL}/api/catalogue/services/${id}`, {
+        method: "DELETE", headers: getHeaders(),
+      });
+      return handleResponse(res);
+    },
+    listLocations: async () => {
+      const res = await fetch(`${API_URL}/api/catalogue/locations`, { headers: getHeaders() });
+      return handleResponse(res);
+    },
+    createLocation: async (body: Record<string, unknown>) => {
+      const res = await fetch(`${API_URL}/api/catalogue/locations`, {
+        method: "POST", headers: getHeaders(), body: JSON.stringify(body),
+      });
+      return handleResponse(res);
+    },
+    updateLocation: async (id: string, body: Record<string, unknown>) => {
+      const res = await fetch(`${API_URL}/api/catalogue/locations/${id}`, {
+        method: "PATCH", headers: getHeaders(), body: JSON.stringify(body),
+      });
+      return handleResponse(res);
+    },
+    deleteLocation: async (id: string) => {
+      const res = await fetch(`${API_URL}/api/catalogue/locations/${id}`, {
+        method: "DELETE", headers: getHeaders(),
+      });
+      return handleResponse(res);
+    },
+  },
+
+  telephony: {
+    getCallLogs: async () => {
+      const res = await fetch(`${API_URL}/api/telephony/calls`, { headers: getHeaders() });
+      return handleResponse(res);
+    },
+  },
+
+  analytics: {
+    // Route is /api/analytics/dashboard. `/overview` has never existed on the API.
+  },
+
+  organizations: {
+    /**
+     * This agency's own audit trail. OWNER/ADMIN.
+     *
+     * Scoped to the caller's organization from the token — there is no
+     * organizationId to pass, deliberately, so there is nothing a caller could
+     * substitute. Actors who are not this agency's own staff come back
+     * described by their role rather than named, so the agency learns that the
+     * ministry acted without learning which official it was.
+     */
+    getAudit: async (params: { action?: string; limit?: number } = {}) => {
+      const q = new URLSearchParams();
+      if (params.action) q.set("action", params.action);
+      if (params.limit) q.set("limit", String(params.limit));
+      const res = await fetch(`${API_URL}/api/organizations/audit?${q.toString()}`, { headers: getHeaders() });
+      return handleResponse(res);
+    },
+    addTeamMember: async (data: any) => {
+      const res = await fetch(`${API_URL}/api/organizations/members`, {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify(data),
+      });
+      return handleResponse(res);
+    },
+    getTeamMembers: async () => {
+      const res = await fetch(`${API_URL}/api/organizations/members`, { headers: getHeaders() });
+      return handleResponse(res);
+    },
+    updateMemberRole: async (userId: string, role: string) => {
+      const res = await fetch(`${API_URL}/api/organizations/members/${userId}/role`, {
+        method: "PATCH",
+        headers: getHeaders(),
+        body: JSON.stringify({ role }),
+      });
+      return handleResponse(res);
+    },
+    setMemberMda: async (userId: string, mdaName: string | null) => {
+      const res = await fetch(`${API_URL}/api/organizations/members/${userId}/mda`, {
+        method: "PATCH",
+        headers: getHeaders(),
+        body: JSON.stringify({ mdaName }),
+      });
+      return handleResponse(res);
+    },
+    updateMemberStatus: async (userId: string, isActive: boolean) => {
+      const res = await fetch(`${API_URL}/api/organizations/members/${userId}/status`, {
+        method: "PATCH",
+        headers: getHeaders(),
+        body: JSON.stringify({ isActive }),
+      });
+      return handleResponse(res);
+    },
+    removeTeamMember: async (userId: string) => {
+      const res = await fetch(`${API_URL}/api/organizations/members/${userId}`, {
+        method: "DELETE",
+        headers: getHeaders(),
+      });
+      return handleResponse(res);
+    },
+    getPermissionsMatrix: async () => {
+      const res = await fetch(`${API_URL}/api/organizations/roles/permissions`, { headers: getHeaders() });
+      return handleResponse(res);
+    },
+  },
+
+  /**
+   * The tenant's own ElevenLabs workspace.
+   *
+   * An ElevenLabs workspace has no tenancy of its own — everything in one
+   * belongs to whoever holds the key — so each tenant needs its own, and until
+   * it has one every hosted-agent operation is refused. These two endpoints are
+   * how that gets configured; before this there was no way short of SQL, and a
+   * credential nobody can rotate without a database console does not get
+   * rotated.
+   */
+  agentProvisioning: {
+    /**
+     * Reports `mode`, a fingerprint, `webhookUrl` and `warnings[]`. Never
+     * returns a credential — there is no read-back endpoint at all, by design.
+     */
+    getCredentials: async () => {
+      const res = await fetch(`${API_URL}/api/agent-provisioning/credentials`, { headers: getHeaders() });
+      return handleResponse(res);
+    },
+    /**
+     * Either half, or both. A dedicated workspace needs each: the key to act in
+     * it, and its own webhook signing secret to verify what it sends back.
+     * Returns the full status, so a caller that set one half is told
+     * immediately that the other is still missing.
+     */
+    setCredentials: async (data: { apiKey?: string; webhookSecret?: string }) => {
+      const res = await fetch(`${API_URL}/api/agent-provisioning/credentials`, {
+        method: 'POST',
+        headers: getHeaders(),
+        body: JSON.stringify(data),
+      });
+      return handleResponse(res);
+    },
+    /**
+     * Deletes the agent and rebuilds it from the catalogue. The LAST resort
+     * for drift a sync cannot clear, and it CHANGES THE AGENT ID — so an
+     * imported number, an attached WhatsApp line and post-call attribution
+     * all stop matching until re-pointed. The server refuses without the
+     * confirmation, and reports what it restored and what still needs doing.
+     */
+    recreate: async () => {
+      const res = await fetch(`${API_URL}/api/agent-provisioning/recreate`, {
+        method: 'POST',
+        headers: getHeaders(),
+        body: JSON.stringify({ confirmReplacesAgent: true }),
+      });
+      return handleResponse(res);
+    },
+    /** Read-only comparison of the remote agent against this repo. Writes nothing. */
+    getStatus: async () => {
+      const res = await fetch(`${API_URL}/api/agent-provisioning/status`, { headers: getHeaders() });
+      return handleResponse(res);
+    },
+    /** How the agent's calls ended over the last day, by ElevenLabs' recorded reason. Counts only. */
+    getCallHealth: async () => {
+      const res = await fetch(`${API_URL}/api/agent-provisioning/call-health`, { headers: getHeaders() });
+      return handleResponse(res);
+    },
+
+    /**
+     * Create the agent, its tools and its key in the tenant's workspace.
+     * Returns a SyncReport whose `agentKey` is present only on the run that
+     * minted it, and is unrecoverable afterwards.
+     */
+    create: async () => {
+      const res = await fetch(`${API_URL}/api/agent-provisioning/create`, {
+        method: 'POST',
+        headers: getHeaders(),
+      });
+      return handleResponse(res);
+    },
+
+    /**
+     * Push this repo's tool catalogue and prompt to the existing agent.
+     * Idempotent, and resumable: each tool id is persisted as it is created.
+     */
+    sync: async () => {
+      const res = await fetch(`${API_URL}/api/agent-provisioning/sync`, {
+        method: 'POST',
+        headers: getHeaders(),
+      });
+      return handleResponse(res);
+    },
+
+    /**
+     * Mint a new agent key and revoke the old one.
+     *
+     * The response carries the key ONCE — we store only a SHA-256 hash of it
+     * and the live copy is a workspace secret, so nothing can show it again.
+     */
+    rotateKey: async () => {
+      const res = await fetch(`${API_URL}/api/agent-provisioning/rotate-key`, {
+        method: 'POST',
+        headers: getHeaders(),
+      });
+      return handleResponse(res);
+    },
+
+    listNumbers: async () => {
+      const res = await fetch(`${API_URL}/api/agent-provisioning/numbers`, { headers: getHeaders() });
+      return handleResponse(res);
+    },
+
+    /**
+     * Hand the tenant's Twilio number to ElevenLabs. THIS IS THE VOICE
+     * CUTOVER: afterwards the agent answers the number instead of the
+     * orchestrator. `confirmVoiceCutover` is required by the server and is
+     * never defaulted here either — a client that supplied it silently would
+     * turn a deliberate decision back into a side effect of a button.
+     */
+    importNumber: async (data: { confirmVoiceCutover: boolean; enableSms?: boolean; label?: string }) => {
+      const res = await fetch(`${API_URL}/api/agent-provisioning/numbers/import`, {
+        method: 'POST',
+        headers: getHeaders(),
+        body: JSON.stringify(data),
+      });
+      return handleResponse(res);
+    },
+
+    /**
+     * Hand a SIP trunk to the agent instead of a Twilio number — the path
+     * that removes the Twilio dependency for voice entirely.
+     *
+     * Carries one consequence the Twilio import does not: operator takeover
+     * of a live call does not work on a SIP trunk, because ElevenLabs has no
+     * live-call API and the carrier is not one this platform can redirect
+     * through. The server states that in its refusal and the screen states it
+     * in the gate.
+     */
+    importSipTrunk: async (data: { confirmVoiceCutover: boolean; label?: string }) => {
+      const res = await fetch(`${API_URL}/api/agent-provisioning/numbers/import-sip`, {
+        method: 'POST',
+        headers: getHeaders(),
+        body: JSON.stringify(data),
+      });
+      return handleResponse(res);
+    },
+
+    /** Give the number back. Returns a note naming what is left to do in Twilio. */
+    releaseNumber: async () => {
+      const res = await fetch(`${API_URL}/api/agent-provisioning/numbers/release`, {
+        method: 'POST',
+        headers: getHeaders(),
+      });
+      return handleResponse(res);
+    },
+
+    listWhatsApp: async () => {
+      const res = await fetch(`${API_URL}/api/agent-provisioning/whatsapp`, { headers: getHeaders() });
+      return handleResponse(res);
+    },
+
+    /**
+     * Point an already-connected line at this agency's agent. Connecting the
+     * line itself is a dashboard step — Meta's embedded signup needs a human,
+     * so there is no endpoint for it and this does not pretend otherwise.
+     */
+    attachWhatsApp: async (phoneNumberId: string) => {
+      const res = await fetch(`${API_URL}/api/agent-provisioning/whatsapp/attach`, {
+        method: 'POST',
+        headers: getHeaders(),
+        body: JSON.stringify({ phoneNumberId }),
+      });
+      return handleResponse(res);
+    },
+
+    detachWhatsApp: async () => {
+      const res = await fetch(`${API_URL}/api/agent-provisioning/whatsapp/detach`, {
+        method: 'POST',
+        headers: getHeaders(),
+      });
+      return handleResponse(res);
+    },
+
+    /**
+     * Silence the agent on the WHOLE line, or let it answer again.
+     *
+     * Not a takeover: it stops the agent replying to every customer on that
+     * number. The server requires `confirmAffectsEveryConversation` to pause,
+     * and that flag is passed through from the screen rather than assumed.
+     */
+    pauseWhatsApp: async (data: { paused: boolean; confirmAffectsEveryConversation?: boolean }) => {
+      const res = await fetch(`${API_URL}/api/agent-provisioning/whatsapp/pause`, {
+        method: 'POST',
+        headers: getHeaders(),
+        body: JSON.stringify(data),
+      });
+      return handleResponse(res);
+    },
+  },
+
+};

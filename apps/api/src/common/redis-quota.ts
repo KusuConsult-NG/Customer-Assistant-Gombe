@@ -1,0 +1,93 @@
+/**
+ * Report a spent Redis quota ONCE, instead of on every retry.
+ *
+ * Upstash's free plan answers every command with "ERR max requests limit
+ * exceeded" once its allowance is spent, and BullMQ logs each retry: on the
+ * live deployment that was about seven error lines a second from two workers,
+ * burying everything else in the logs.
+ *
+ * ── Why this only REPORTS, and does not close the worker ───────────────────
+ *
+ * The first version called `worker.close()`. In production that killed the
+ * process one second after boot: closing removes the worker's listener from
+ * its Redis connection, the connection then emitted one more refusal with no
+ * listener, and Node treats an unhandled 'error' event as fatal. The deploy
+ * failed and the old build kept serving. The worker's own retry loop is
+ * harmless by comparison — the old build ran for hours with it — so the guard
+ * keeps the listener attached and only stops the log flood. Ending the retries
+ * properly means removing REDIS_URL or upgrading the plan, which this states.
+ */
+const QUOTA = /max requests limit exceeded|max daily request limit|max monthly request limit/i;
+
+export function isRedisQuotaError(err: unknown): boolean {
+  return QUOTA.test(String((err as any)?.message ?? err ?? ''));
+}
+
+export function reportRedisQuotaOnce(
+  name: string,
+  report: (message: string) => void,
+): (err: unknown) => boolean {
+  let reported = false;
+  return (err: unknown) => {
+    if (!isRedisQuotaError(err)) return false;
+    if (!reported) {
+      reported = true;
+      report(
+        `${name}: the Redis provider is refusing every command on quota (${String((err as any)?.message ?? err).slice(0, 120)}). ` +
+          'Further refusals are not logged. Queued work falls back to the inline path. ' +
+          'Upgrade the Redis plan or unset REDIS_URL, then restart.',
+      );
+    }
+    return true;
+  };
+}
+
+/** Error classes the `redis` client rejects with, by constructor name. */
+const REDIS_CLIENT_ERRORS = new Set([
+  'ErrorReply',
+  'ClientClosedError',
+  'ClientOfflineError',
+  'SocketClosedUnexpectedlyError',
+  'ConnectionTimeoutError',
+  'ReconnectStrategyError',
+]);
+
+/** True for a rejection that came from a Redis client, not from our own code. */
+export function isRedisClientError(err: unknown): boolean {
+  if (isRedisQuotaError(err)) return true;
+  const name = (err as any)?.constructor?.name ?? (err as any)?.name;
+  return typeof name === 'string' && REDIS_CLIENT_ERRORS.has(name);
+}
+
+/**
+ * Keep the API serving when a Redis client rejects a promise nobody awaited.
+ *
+ * ── What it fixes ─────────────────────────────────────────────────────────────
+ *
+ * With the Upstash quota spent, the API crashed one second after every boot:
+ * `@socket.io/redis-adapter` calls `subClient.pSubscribe(...)` and, on every
+ * broadcast, `pubClient.publish(...)` without catching, so the refusal became
+ * an unhandled rejection and Node exits on those. Render restarted it, it
+ * crashed again, and the phone agent's tools answered nothing. Redis here only
+ * carries optional work — cross-pod fan-out, rate-limit counters, queues — so
+ * losing it must cost that work, never the process.
+ *
+ * Only Redis client errors are absorbed. Anything else is rethrown, which is
+ * exactly what Node does without a handler: a real bug still crashes loudly.
+ */
+export function redisRejectionGuard(report: (message: string) => void): (reason: unknown) => void {
+  let reported = 0;
+  return (reason: unknown) => {
+    if (!isRedisClientError(reason)) throw reason;
+    // A handful, then quiet: a spent quota refuses every command.
+    if (reported < 3) {
+      reported++;
+      report(
+        `redis_unhandled_rejection_absorbed: ${String((reason as any)?.message ?? reason).slice(0, 160)}. ` +
+          'The API keeps serving; Redis-backed features (multi-pod events, shared rate limits, queues) are degraded. ' +
+          'Upgrade the Redis plan or unset REDIS_URL, then restart.' +
+          (reported === 3 ? ' Further refusals are not logged.' : ''),
+      );
+    }
+  };
+}

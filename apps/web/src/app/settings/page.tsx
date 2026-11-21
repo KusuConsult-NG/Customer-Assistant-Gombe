@@ -1,0 +1,2868 @@
+"use client";
+import React, { useEffect, useState, useCallback } from 'react';
+import Link from 'next/link';
+import { api, API_URL, apiFetch } from '@/lib/api';
+import { copyToClipboard } from '@/lib/clipboard';
+import { RoleNotice } from '@/components/RoleNotice';
+import {
+  Settings, Building2, Bot, Phone, MessageSquare, Users, User,
+  Save, CheckCircle2, AlertCircle, AlertTriangle, Eye, EyeOff, Copy, Plus,
+  Globe, Zap, Shield, X, Loader2, ChevronDown, KeyRound, ScrollText, Landmark
+} from 'lucide-react';
+
+type Tab = 'profile' | 'general' | 'whatsapp' | 'voice' | 'agent' | 'team' | 'activity' | 'apikeys';
+
+const inputCls = "w-full px-4 py-2.5 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500/40 transition-all placeholder-gray-600";
+const selectCls = `${inputCls} appearance-none cursor-pointer`;
+const labelCls = "text-xs font-semibold text-slate-600 dark:text-slate-400 mb-1.5 block uppercase tracking-wider";
+
+/**
+ * A credential this deployment cannot decrypt.
+ *
+ * `••••` is shown for a readable credential AND for one nothing can read,
+ * so the two were indistinguishable on every settings screen. A deployment
+ * whose ENCRYPTION_KEY had changed therefore showed a fully configured
+ * WhatsApp line and carrier while messages went unanswered — the only
+ * visible symptom being a citizen getting no reply.
+ *
+ * Names the FIELD, because the field is what says which box to retype.
+ */
+const UnreadableCredentials = ({ fields, what }: { fields?: string[]; what: string }) => {
+  if (!fields || fields.length === 0) return null;
+  return (
+    <div className="mb-4 rounded-xl border border-red-300 dark:border-red-500/30 bg-red-50 dark:bg-red-500/10 p-3">
+      <p className="text-sm font-semibold text-red-700 dark:text-red-300">
+        {fields.length === 1 ? 'A credential' : `${fields.length} credentials`} on this {what} cannot be
+        decrypted
+      </p>
+      <p className="mt-1 text-xs text-red-700 dark:text-red-400">
+        {fields.join(', ')} — shown as •••• above, but unreadable: {fields.length === 1 ? 'it was' : 'they were'} saved
+        under a key this platform no longer holds. Enter {fields.length === 1 ? 'a fresh value' : 'fresh values'} here
+        and save, or ask the State platform team to restore the previous key.
+      </p>
+      <p className="mt-1 text-xs text-red-600 dark:text-red-400">
+        Until then this line does not work, whatever the rest of this page shows.
+      </p>
+    </div>
+  );
+};
+
+function Toast({ msg, type }: { msg: string; type: 'success' | 'error' }) {
+  return (
+    <div className={`fixed top-5 right-5 z-50 flex items-center gap-3 px-4 py-3 rounded-xl shadow-2xl border text-sm font-medium animate-fade-in-up ${
+      type === 'success' ? 'bg-emerald-900/80 border-emerald-200 dark:border-emerald-500/30 text-emerald-700 dark:text-emerald-300' : 'bg-red-900/80 border-red-200 dark:border-red-500/30 text-red-700 dark:text-red-300'
+    }`}>
+      {type === 'success' ? <CheckCircle2 className="w-4 h-4" /> : <AlertCircle className="w-4 h-4" />}
+      {msg}
+    </div>
+  );
+}
+
+function Section({ title, description, children }: { title: string; description?: string; children: React.ReactNode }) {
+  return (
+    <div className="rounded-2xl bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 shadow-sm overflow-hidden">
+      <div className="px-6 py-4 border-b border-slate-200 dark:border-slate-800">
+        <h3 className="font-semibold text-slate-900 dark:text-white">{title}</h3>
+        {description && <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">{description}</p>}
+      </div>
+      <div className="p-6 space-y-4">{children}</div>
+    </div>
+  );
+}
+
+export default function SettingsPage() {
+  const [tab, setTab] = useState<Tab>('profile');
+  const [toast, setToast] = useState<{ msg: string; type: 'success' | 'error' } | null>(null);
+  const [org, setOrg] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [role, setRole] = useState<string>('');
+
+  const token = typeof window !== 'undefined' ? localStorage.getItem('ace_token') : '';
+  const authHeaders = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+
+  useEffect(() => {
+    try {
+      const stored = JSON.parse(localStorage.getItem('ace_user') || '{}');
+      setRole(stored?.role || '');
+    } catch {}
+  }, []);
+
+  const isAdmin = role === 'OWNER' || role === 'ADMIN';
+
+  const showToast = (msg: string, type: 'success' | 'error' = 'success') => {
+    setToast({ msg, type });
+    setTimeout(() => setToast(null), 3500);
+  };
+
+  const fetchOrg = useCallback(async () => {
+    try {
+      const res = await apiFetch(`${API_URL}/api/organizations/me`, { headers: authHeaders });
+      if (res.ok) {
+        setOrg(await res.json());
+        return;
+      }
+      showToast('Could not load this agency’s settings. Reload before saving, or you may overwrite them.', 'error');
+    } catch {
+      showToast('Could not reach the server to load settings. Reload before saving.', 'error');
+    }
+    finally { setLoading(false); }
+  }, []);
+
+  useEffect(() => { fetchOrg(); }, [fetchOrg]);
+
+  const allTabs = [
+    { id: 'profile' as Tab, label: 'Profile & Security', icon: <User className="w-4 h-4" />, adminOnly: false },
+    { id: 'general' as Tab, label: 'General', icon: <Building2 className="w-4 h-4" />, adminOnly: true },
+    { id: 'whatsapp' as Tab, label: 'WhatsApp', icon: <MessageSquare className="w-4 h-4" />, adminOnly: true },
+    { id: 'voice' as Tab, label: 'Voice / Telephony', icon: <Phone className="w-4 h-4" />, adminOnly: true },
+    { id: 'agent' as Tab, label: 'Hosted Agent', icon: <Bot className="w-4 h-4" />, adminOnly: true },
+    { id: 'team' as Tab, label: 'Team Members', icon: <Users className="w-4 h-4" />, adminOnly: true },
+    { id: 'apikeys' as Tab, label: 'API Key', icon: <KeyRound className="w-4 h-4" />, adminOnly: true },
+    { id: 'activity' as Tab, label: 'Activity Log', icon: <ScrollText className="w-4 h-4" />, adminOnly: true },
+  ];
+  const tabs = isAdmin ? allTabs : allTabs.filter(t => !t.adminOnly);
+
+  return (
+    <div className="max-w-4xl space-y-6">
+      <RoleNotice path="/settings" />
+      {toast && <Toast msg={toast.msg} type={toast.type} />}
+
+      {/* Header */}
+      <div>
+        <h1 className="text-2xl font-bold text-slate-900 dark:text-white flex items-center gap-2">
+          <Settings className="w-6 h-6 text-brand-700 dark:text-brand-300" /> {isAdmin ? 'Agency Settings' : 'Account & Security Settings'}
+        </h1>
+        <p className="text-sm text-slate-600 dark:text-slate-400 mt-1">
+          {isAdmin
+            ? 'Configure this agency’s identity, serving hours, telephony credentials and voice assistant.'
+            : 'Manage your personal profile, password, and two-step sign-in security.'}
+        </p>
+      </div>
+
+      {/* Tab bar */}
+      <div className="flex flex-wrap gap-1 p-1 rounded-xl bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 shadow-sm w-fit">
+        {tabs.map(t => (
+          <button
+            key={t.id}
+            onClick={() => setTab(t.id)}
+            className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${
+              tab === t.id ? 'bg-brand-600 text-white shadow-md' : 'text-slate-600 dark:text-slate-400 hover:text-slate-800 dark:text-slate-200 hover:bg-slate-100 dark:bg-slate-800/60'
+            }`}
+          >
+            {t.icon} {t.label}
+          </button>
+        ))}
+      </div>
+
+      {loading ? (
+        <div className="flex items-center justify-center py-20"><Loader2 className="w-8 h-8 text-blue-700 dark:text-blue-400 animate-spin" /></div>
+      ) : (
+        <>
+          {tab === 'profile' && <ProfileTab authHeaders={authHeaders} showToast={showToast} />}
+          {tab === 'profile' && <TwoStepPanel org={org} authHeaders={authHeaders} showToast={showToast} onSaved={fetchOrg} />}
+          {isAdmin && tab === 'general' && <GeneralTab org={org} authHeaders={authHeaders} showToast={showToast} onSaved={fetchOrg} />}
+          {isAdmin && tab === 'whatsapp' && <WhatsAppTab org={org} authHeaders={authHeaders} showToast={showToast} />}
+          {isAdmin && tab === 'voice' && <VoiceTab org={org} authHeaders={authHeaders} showToast={showToast} onSaved={fetchOrg} />}
+          {isAdmin && tab === 'agent' && <HostedAgentTab showToast={showToast} />}
+          {isAdmin && tab === 'team' && <TeamTab org={org} authHeaders={authHeaders} showToast={showToast} onSaved={fetchOrg} />}
+          {isAdmin && tab === 'apikeys' && <ApiKeyTab authHeaders={authHeaders} showToast={showToast} />}
+          {isAdmin && tab === 'activity' && <ActivityLogTab showToast={showToast} />}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────── Profile Tab ───────────────────────
+/**
+ * Two-step sign-in (PRD §17). Enrol with an authenticator app; recovery codes
+ * are shown once. Owners/admins can require it for every administrator of the
+ * agency — enforced at sign-in by the API, not by this screen.
+ */
+function TwoStepPanel({ org, authHeaders, showToast, onSaved }: any) {
+  const [status, setStatus] = useState<{ enabled: boolean; recoveryCodesLeft: number; requiredByAgency: boolean } | null>(null);
+  const [setup, setSetup] = useState<{ secret: string; otpauthUrl: string } | null>(null);
+  const [code, setCode] = useState('');
+  const [codes, setCodes] = useState<string[]>([]);
+  const [busy, setBusy] = useState(false);
+  let role = '';
+  try { role = JSON.parse(localStorage.getItem('ace_user') || '{}').role ?? ''; } catch { /* the API decides */ }
+  const isAdmin = role === 'OWNER' || role === 'ADMIN';
+
+  const load = useCallback(() => {
+    api.auth.mfaStatus().then(setStatus).catch(() => setStatus(null));
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  const run = async (fn: () => Promise<void>) => {
+    setBusy(true);
+    try { await fn(); } catch (e: any) { showToast(e?.message || 'That did not work', 'error'); } finally { setBusy(false); }
+  };
+
+  return (
+    <section className="mt-6 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 space-y-4" aria-labelledby="two-step">
+      <h2 id="two-step" className="text-base font-bold text-slate-900 dark:text-white">Two-step sign-in</h2>
+      {!status ? (
+        <p className="text-xs text-slate-500">Could not load the current setting.</p>
+      ) : status.enabled ? (
+        <>
+          <p className="text-sm text-slate-700 dark:text-slate-300">
+            On. Signing in needs a code from your authenticator app. {status.recoveryCodesLeft} recovery code(s) left.
+          </p>
+          {!status.requiredByAgency && (
+            <form className="flex flex-wrap gap-2" onSubmit={(e) => { e.preventDefault(); run(async () => { await api.auth.mfaDisable(code.trim()); setCode(''); showToast('Two-step sign-in turned off. Sign in again.'); load(); }); }}>
+              <input className="px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 text-sm font-mono" value={code} onChange={(e) => setCode(e.target.value)} placeholder="Current code" aria-label="Current code to turn off" required />
+              <button className="px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-bold" disabled={busy}>Turn off</button>
+            </form>
+          )}
+        </>
+      ) : setup ? (
+        <form className="space-y-3" onSubmit={(e) => { e.preventDefault(); run(async () => { const r = await api.auth.mfaEnable(code.trim()); setCodes(r.recoveryCodes); setSetup(null); setCode(''); load(); }); }}>
+          <p className="text-sm text-slate-700 dark:text-slate-300">Add an account in your authenticator app with this key, then enter the code it shows.</p>
+          <p className="font-mono text-sm break-all px-3 py-2 rounded-lg bg-slate-100 dark:bg-slate-800 select-all" aria-label="Setup key">{setup.secret}</p>
+          <a href={setup.otpauthUrl} className="text-xs text-blue-700 dark:text-blue-400 underline">Open in an authenticator app on this device</a>
+          <div className="flex gap-2">
+            <input className="px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 text-sm font-mono" value={code} onChange={(e) => setCode(e.target.value)} placeholder="123456" inputMode="numeric" autoComplete="one-time-code" aria-label="Code from the app" required />
+            <button className="px-3 py-2 rounded-xl text-white bg-[#3b6102] text-xs font-bold" disabled={busy}>Turn on</button>
+          </div>
+        </form>
+      ) : (
+        <div className="flex flex-wrap items-center gap-3">
+          <p className="text-sm text-slate-700 dark:text-slate-300">Off. Anyone with your password can sign in as you.</p>
+          <button className="px-3 py-2 rounded-xl text-white bg-[#3b6102] text-xs font-bold" disabled={busy} onClick={() => run(async () => setSetup(await api.auth.mfaSetup()))}>Set up</button>
+        </div>
+      )}
+      {codes.length > 0 && (
+        <div className="rounded-xl border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 p-4">
+          <p className="text-sm font-semibold text-amber-900 dark:text-amber-200">Save these recovery codes now. They will not be shown again.</p>
+          <ul className="grid grid-cols-2 gap-2 mt-2 font-mono text-sm">{codes.map((c) => <li key={c}>{c}</li>)}</ul>
+        </div>
+      )}
+      {isAdmin && org && (
+        <label className="flex items-start gap-3 text-sm text-slate-700 dark:text-slate-300 pt-2 border-t border-slate-100 dark:border-slate-800">
+          <input
+            type="checkbox"
+            className="mt-1"
+            checked={!!org.requireAdminMfa}
+            disabled={busy}
+            onChange={(e) => run(async () => {
+              const res = await apiFetch(`${API_URL}/api/organizations/settings`, { method: 'PATCH', headers: authHeaders, body: JSON.stringify({ requireAdminMfa: e.target.checked }) });
+              if (!res.ok) throw new Error(`Could not save (${res.status})`);
+              showToast(e.target.checked ? 'Administrators must now use two-step sign-in.' : 'No longer required.');
+              onSaved?.();
+            })}
+          />
+          <span>
+            <strong>Require two-step sign-in for owners and administrators.</strong> Anyone without it is asked to set it up the next time they sign in, before they get in.
+          </span>
+        </label>
+      )}
+    </section>
+  );
+}
+
+function ProfileTab({ authHeaders, showToast }: any) {
+  const [user, setUser] = useState<{ fullName?: string; email?: string; role?: string } | null>(null);
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem('ace_user');
+      if (stored) setUser(JSON.parse(stored));
+    } catch {}
+  }, []);
+
+  const savePassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (newPassword !== confirmPassword) {
+      showToast('Passwords do not match', 'error');
+      return;
+    }
+    setSaving(true);
+    try {
+      const res = await apiFetch(`${API_URL}/api/auth/change-password`, {
+        method: 'POST', headers: authHeaders,
+        body: JSON.stringify({ currentPassword, newPassword }),
+      });
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.message || 'Failed to change password');
+      }
+      showToast('Password updated successfully!');
+      setCurrentPassword('');
+      setNewPassword('');
+      setConfirmPassword('');
+    } catch (err: any) {
+      showToast(err.message, 'error');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="space-y-5">
+      <Section title="User Profile" description="Your personal information">
+        <div className="grid grid-cols-2 gap-4">
+          <div>
+            <label className={labelCls}>Full Name</label>
+            <input type="text" value={user?.fullName || ''} disabled className={`${inputCls} opacity-50 cursor-not-allowed`} />
+          </div>
+          <div>
+            <label className={labelCls}>Email Address</label>
+            <input type="email" value={user?.email || ''} disabled className={`${inputCls} opacity-50 cursor-not-allowed`} />
+          </div>
+          <div>
+            <label className={labelCls}>Role</label>
+            <input type="text" value={user?.role || ''} disabled className={`${inputCls} opacity-50 cursor-not-allowed`} />
+          </div>
+        </div>
+      </Section>
+
+      <Section title="Change Password" description="Update your security credentials">
+        <form onSubmit={savePassword} className="space-y-4">
+          <div>
+            <label className={labelCls}>Current Password</label>
+            <input type="password" required value={currentPassword} onChange={e => setCurrentPassword(e.target.value)} className={inputCls} placeholder="••••••••" />
+          </div>
+          <div>
+            <label className={labelCls}>New Password</label>
+            <input type="password" required minLength={8} value={newPassword} onChange={e => setNewPassword(e.target.value)} className={inputCls} placeholder="Min 8 characters" />
+          </div>
+          <div>
+            <label className={labelCls}>Confirm New Password</label>
+            <input type="password" required minLength={8} value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)} className={inputCls} placeholder="Confirm your new password" />
+          </div>
+          <div className="flex justify-end pt-2">
+            <button type="submit" disabled={saving} className="flex items-center gap-2 px-6 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-sm disabled:opacity-50 transition-all shadow-lg shadow-brand-600/20">
+              {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Shield className="w-4 h-4" />}
+              {saving ? 'Updating...' : 'Update Password'}
+            </button>
+          </div>
+        </form>
+      </Section>
+    </div>
+  );
+}
+
+// ─────────────────────── General Tab ───────────────────────
+function GeneralTab({ org, authHeaders, showToast, onSaved }: any) {
+  const [name, setName] = useState(org?.name || '');
+  const [aiPersonaPrompt, setAiPersonaPrompt] = useState(org?.aiPersonaPrompt || '');
+  const [welcomeMessage, setWelcomeMessage] = useState(org?.welcomeMessage || '');
+  const [emergencyContacts, setEmergencyContacts] = useState(org?.emergencyContacts || '');
+  const [privacyNotice, setPrivacyNotice] = useState(org?.privacyNotice || '');
+  const [requireKnowledgeApproval, setRequireKnowledgeApproval] = useState(!!org?.requireKnowledgeApproval);
+  const [retentionDays, setRetentionDays] = useState<string>(org?.retentionDays ? String(org.retentionDays) : '');
+  // Payment collection details. The AI assistant reads these out verbatim when a
+  // customer asks how to pay; with them blank it says it will fetch a colleague
+  // rather than guessing. (It used to recite a hardcoded account number instead.)
+  const [payoutBankName, setPayoutBankName] = useState(org?.payoutBankName || '');
+  const [payoutAccountName, setPayoutAccountName] = useState(org?.payoutAccountName || '');
+  const [payoutAccountNumber, setPayoutAccountNumber] = useState(org?.payoutAccountNumber || '');
+  const [payoutUssdCode, setPayoutUssdCode] = useState(org?.payoutUssdCode || '');
+  // What the AI opens conversations in until the customer's own language is
+  // detected — once they write in a supported language, the AI follows them.
+  const [defaultLanguage, setDefaultLanguage] = useState(org?.defaultLanguage || 'en');
+  // When this agency serves citizens. Appointment search offers nothing outside
+  // these, so they are the difference between a diary that looks full and one
+  // that is. 0 = Sunday … 6 = Saturday.
+  const [openingHour, setOpeningHour] = useState<number>(org?.openingHour ?? 8);
+  const [closingHour, setClosingHour] = useState<number>(org?.closingHour ?? 18);
+  const [serviceDays, setServiceDays] = useState<number[]>(org?.serviceDays ?? [1, 2, 3, 4, 5]);
+  // When the platform may RING or TEXT a citizen. Empty closing hour means
+  // "same as serving hours", which is what every agency had before this
+  // existed — so leaving it blank changes nothing.
+  const [outboundOpeningHour, setOutboundOpeningHour] = useState<number | ''>(org?.outboundOpeningHour ?? '');
+  const [outboundClosingHour, setOutboundClosingHour] = useState<number | ''>(org?.outboundClosingHour ?? '');
+  const [saving, setSaving] = useState(false);
+
+  const toggleDay = (d: number) =>
+    setServiceDays((prev) => (prev.includes(d) ? prev.filter((x) => x !== d) : [...prev, d].sort()));
+
+  const save = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSaving(true);
+
+    // Worked out before the payload rather than inside it. A ternary in an
+    // object literal reads badly, and apps/api/test/payload-contract.spec.ts
+    // — which compares what the dashboard SENDS against what the endpoint
+    // READS — took the `null` and `0` branches for field names.
+    //
+    // A blank closing hour means "same as serving hours", and null is what
+    // clears it.
+    const outboundClosing = outboundClosingHour === '' ? null : outboundClosingHour;
+    const outboundOpening =
+      outboundClosing === null ? null : (outboundOpeningHour === '' ? 0 : outboundOpeningHour);
+
+    try {
+      // Empty keeps everything; computed here so the request body stays plain fields.
+      const retentionDaysValue = retentionDays.trim() === '' ? null : Number(retentionDays);
+      const res = await apiFetch(`${API_URL}/api/organizations/settings`, {
+        method: 'PATCH', headers: authHeaders,
+        body: JSON.stringify({
+          name, aiPersonaPrompt, welcomeMessage, emergencyContacts, privacyNotice, requireKnowledgeApproval,
+          retentionDays: retentionDaysValue,
+          defaultLanguage,
+          payoutBankName, payoutAccountName, payoutAccountNumber, payoutUssdCode,
+          openingHour, closingHour, serviceDays,
+          outboundOpeningHour: outboundOpening,
+          outboundClosingHour: outboundClosing,
+        }),
+      });
+      // The API rejects hours that cannot produce an appointment and says why.
+      // Showing its reason beats a generic failure for a form whose mistakes
+      // are easy to make and invisible until a citizen is told nothing is free.
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        throw new Error(body?.message || 'Failed');
+      }
+      showToast('Settings saved!');
+      onSaved();
+    } catch (err: any) {
+      // The message thrown just above carries the API's own reason — which
+      // hours cannot produce a slot, or why a name was refused. The catch
+      // discarded it and showed "Failed to save settings", so the comment
+      // above described a behaviour that did not exist and the operator was
+      // left to guess which of eight fields was wrong.
+      showToast(err?.message || 'Failed to save settings', 'error');
+    }
+    finally { setSaving(false); }
+  };
+
+  return (
+    <form onSubmit={save} className="space-y-5">
+      <Section title="Organization Profile" description="Basic info about your business">
+        <div>
+          <label className={labelCls} htmlFor="org-name">Organization Name</label>
+          <input id="org-name" aria-label="Organization Name" type="text" value={name} onChange={e => setName(e.target.value)} className={inputCls} placeholder="e.g. Apex Care Services" />
+        </div>
+        <div>
+          <label className={labelCls}>Industry</label>
+          <input type="text" value={org?.industry || ''} disabled className={`${inputCls} opacity-50 cursor-not-allowed`} />
+        </div>
+      </Section>
+
+      <Section title="AI Agent Personality" description="Control how your AI assistant speaks to customers">
+        <div>
+          <label className={labelCls}>AI Persona Prompt</label>
+          <textarea
+            rows={5}
+            value={aiPersonaPrompt}
+            onChange={e => setAiPersonaPrompt(e.target.value)}
+            className={inputCls}
+            placeholder="You are the information officer for [Agency Name]. People reach you on WhatsApp or by phone, and most just want to know what to do next. Talk like a helpful person, not a form — short sentences, plain Nigerian English, no jargon. Lead with the part they need. Never invent a service, a fee, an office or an opening time: say you do not know and ask one question that would narrow it down..."
+          />
+          <p className="text-xs text-slate-500 dark:text-slate-400 mt-1.5">This is the instruction your AI agent follows in every conversation. Be specific about tone, capabilities, and boundaries.</p>
+        </div>
+        <div>
+          <label className={labelCls}>Welcome Message</label>
+          <textarea
+            rows={2}
+            value={welcomeMessage}
+            onChange={e => setWelcomeMessage(e.target.value)}
+            className={inputCls}
+            placeholder="Hello! 👋 Welcome to [Company]. I'm your AI assistant. How can I help you today?"
+          />
+          <p className="text-xs text-slate-500 dark:text-slate-400 mt-1.5">First message sent to every new customer conversation.</p>
+        </div>
+        <div>
+          <label className={labelCls} htmlFor="privacy-notice">Privacy notice</label>
+          <textarea
+            id="privacy-notice"
+            rows={3}
+            value={privacyNotice}
+            onChange={e => setPrivacyNotice(e.target.value)}
+            className={inputCls}
+            placeholder="This service is run by the Gombe State Government. We keep what you tell us to answer you and follow up. Reply PRIVACY to learn more."
+          />
+          <p className="text-xs text-slate-500 dark:text-slate-400 mt-1.5">
+            Sent once to each citizen before their first answer on WhatsApp, and recorded with the date and exact wording.
+            Have your legal or data-protection officer approve the wording; the platform does not write it for you.
+          </p>
+        </div>
+        <div>
+          <label className={labelCls} htmlFor="retention-days">Keep message text and call transcripts for (days)</label>
+          <input id="retention-days" inputMode="numeric" className={inputCls} value={retentionDays} onChange={e => setRetentionDays(e.target.value)} placeholder="Empty keeps everything" />
+          <p className="text-xs text-slate-500 dark:text-slate-400 mt-1.5">
+            Older text, transcripts and recordings are removed when an operator runs <code>npm run retention:apply</code>.
+            The fact that a conversation or call happened is kept. Agree the period with your data-protection officer. Minimum 30 days.
+          </p>
+        </div>
+        <label className="flex items-start gap-3 text-sm text-slate-700 dark:text-slate-300">
+          <input type="checkbox" className="mt-1" checked={requireKnowledgeApproval} onChange={e => setRequireKnowledgeApproval(e.target.checked)} />
+          <span>
+            <strong>New knowledge needs a second person&apos;s approval.</strong> Uploaded documents and crawled pages start as drafts.
+            The assistant does not use a draft until another administrator approves it in Knowledge.
+          </span>
+        </label>
+        <div>
+          <label className={labelCls} htmlFor="emergency-contacts">Emergency contacts</label>
+          <textarea
+            id="emergency-contacts"
+            rows={3}
+            value={emergencyContacts}
+            onChange={e => setEmergencyContacts(e.target.value)}
+            className={inputCls}
+            placeholder={'Fire Service, Gombe: <approved number>\nState Emergency Management Agency: <approved number>'}
+          />
+          <p className="text-xs text-slate-500 dark:text-slate-400 mt-1.5">
+            When someone reports a fire, attack, accident or medical emergency, the assistant always tells them to call 112.
+            It then lists these lines exactly as written, one per line. Add only numbers your agency has confirmed.
+            The assistant never says help has been sent.
+          </p>
+        </div>
+        <div>
+          <label className={labelCls}>Default Language</label>
+          <select
+            aria-label="Default Language"
+            value={defaultLanguage}
+            onChange={e => setDefaultLanguage(e.target.value)}
+            className={inputCls}
+          >
+            <option value="en">English</option>
+            <option value="pcm">Nigerian Pidgin</option>
+            <option value="ha">Hausa</option>
+            <option value="ig">Igbo</option>
+            <option value="yo">Yoruba</option>
+          </select>
+          <p className="text-xs text-slate-500 dark:text-slate-400 mt-1.5">
+            The language the AI uses until a customer&apos;s own language is known. Once someone writes in
+            English, Pidgin, Hausa, Igbo or Yoruba, the AI follows their language automatically.
+          </p>
+        </div>
+      </Section>
+
+      <Section
+        title="Serving Hours"
+        description="When this agency can see citizens. Appointment search offers times inside these hours only — nothing outside them is ever proposed."
+      >
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div>
+            <label className={labelCls}>Opens at</label>
+            <select aria-label="Opens at" value={openingHour} onChange={e => setOpeningHour(Number(e.target.value))} className={inputCls}>
+              {Array.from({ length: 24 }, (_, h) => (
+                <option key={h} value={h}>{String(h).padStart(2, '0')}:00</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className={labelCls}>Closes at</label>
+            <select aria-label="Closes at" value={closingHour} onChange={e => setClosingHour(Number(e.target.value))} className={inputCls}>
+              {Array.from({ length: 24 }, (_, h) => h + 1).map((h) => (
+                <option key={h} value={h}>{String(h).padStart(2, '0')}:00</option>
+              ))}
+            </select>
+          </div>
+        </div>
+        <div>
+          <label className={labelCls}>Days open</label>
+          <div className="flex flex-wrap gap-2 mt-1.5">
+            {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((label, d) => {
+              const on = serviceDays.includes(d);
+              return (
+                <button
+                  key={d}
+                  type="button"
+                  onClick={() => toggleDay(d)}
+                  aria-pressed={on}
+                  className={`px-3 py-1.5 rounded-xl text-xs font-bold border transition-colors ${
+                    on
+                      ? 'bg-brand-600 text-white border-brand-600'
+                      : 'bg-transparent text-slate-500 dark:text-slate-400 border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800'
+                  }`}
+                >
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+          <p className="text-xs text-slate-500 dark:text-slate-400 mt-2">
+            All times are West Africa Time. A 24-hour service sets 00:00 to 24:00 and selects every day.
+          </p>
+        </div>
+      </Section>
+
+      <Section
+        title="When we may contact a citizen"
+        description="When the assistant may RING or TEXT someone — a callback it promised, a reminder before an appointment. Separate from serving hours on purpose: an agency answering around the clock still does not want a citizen woken at 03:00."
+      >
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div>
+            <label className={labelCls}>Earliest we may call</label>
+            <select
+              aria-label="Earliest we may call"
+              value={outboundOpeningHour}
+              onChange={e => setOutboundOpeningHour(e.target.value === '' ? '' : Number(e.target.value))}
+              className={inputCls}
+            >
+              <option value="">Same as serving hours</option>
+              {Array.from({ length: 24 }, (_, h) => (
+                <option key={h} value={h}>{String(h).padStart(2, '0')}:00</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className={labelCls}>Latest we may call</label>
+            <select
+              aria-label="Latest we may call"
+              value={outboundClosingHour}
+              onChange={e => setOutboundClosingHour(e.target.value === '' ? '' : Number(e.target.value))}
+              className={inputCls}
+            >
+              <option value="">Same as serving hours</option>
+              {Array.from({ length: 24 }, (_, h) => h + 1).map((h) => (
+                <option key={h} value={h}>{String(h).padStart(2, '0')}:00</option>
+              ))}
+            </select>
+          </div>
+        </div>
+        <p className="text-xs text-slate-500 dark:text-slate-400">
+          Leave both as <strong>Same as serving hours</strong> and nothing changes. A promise that
+          falls due outside this window is held, not cancelled — the citizen keeps the reference
+          they were given, and the queue shows it as waiting.
+        </p>
+      </Section>
+
+      <Section
+        title="Payment Collection Details"
+        description="What the AI assistant tells customers when they ask how to pay. Leave blank and it will hand the conversation to a human instead of guessing."
+      >
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div>
+            <label className={labelCls}>Bank Name</label>
+            <input type="text" value={payoutBankName} onChange={e => setPayoutBankName(e.target.value)} className={inputCls} placeholder="e.g. Zenith Bank" />
+          </div>
+          <div>
+            <label className={labelCls}>Account Name</label>
+            <input type="text" value={payoutAccountName} onChange={e => setPayoutAccountName(e.target.value)} className={inputCls} placeholder="e.g. Apex Care Services Ltd" />
+          </div>
+          <div>
+            <label className={labelCls}>Account Number</label>
+            <input type="text" inputMode="numeric" value={payoutAccountNumber} onChange={e => setPayoutAccountNumber(e.target.value)} className={inputCls} placeholder="10-digit NUBAN" />
+          </div>
+          <div>
+            <label className={labelCls}>USSD Code (optional)</label>
+            <input type="text" value={payoutUssdCode} onChange={e => setPayoutUssdCode(e.target.value)} className={inputCls} placeholder="e.g. *966*1234#" />
+          </div>
+        </div>
+        <p className="text-xs text-amber-700 dark:text-amber-400 mt-1.5">
+          Double-check these. They are read out to customers as payment instructions.
+        </p>
+      </Section>
+
+      <div className="flex justify-end">
+        <button type="submit" disabled={saving} className="flex items-center gap-2 px-6 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-sm disabled:opacity-50 transition-all shadow-lg shadow-brand-600/20">
+          {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+          {saving ? 'Saving...' : 'Save Changes'}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+// ─────────────────────── WhatsApp Tab ───────────────────────
+function WhatsAppTab({ org, authHeaders, showToast }: any) {
+  // Fix: the API returns `whatsAppConfigs` (capital A), not `whatsappConfigs`
+  const wa = org?.whatsAppConfigs?.[0] || {};
+  const [phoneNumberId, setPhoneNumberId] = useState(wa.phoneNumberId || '');
+  const [whatsappBusinessId, setWhatsappBusinessId] = useState(wa.whatsappBusinessId || '');
+  const [accessToken, setAccessToken] = useState(''); // never pre-fill — always masked on server
+  const [displayPhoneNumber, setDisplayPhoneNumber] = useState(wa.displayPhoneNumber || '');
+  const [webhookVerifyToken, setWebhookVerifyToken] = useState(''); // never pre-fill — always masked on server
+  const [showToken, setShowToken] = useState(false);
+  const [showVerifyToken, setShowVerifyToken] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  // What Meta says this account holds. `null` is NOT an empty account — it is
+  // "not asked yet" — and `linesError` carries Meta's own refusal, because
+  // "could not load" is what somebody reads instead of the actual cause.
+  const [lines, setLines] = useState<any[] | null>(null);
+  const [linesError, setLinesError] = useState<string | null>(null);
+  const [loadingLines, setLoadingLines] = useState(false);
+
+  // The WIDER SEARCH: every WhatsApp account this credential can see, not
+  // just the one whose id is stored on the line.
+  //
+  // A WhatsApp Business Account is not the business. One Meta portfolio can
+  // own several — a sandbox one from a quickstart and the real one added
+  // later — and a number on the second is invisible from the first. So "this
+  // account holds no numbers" and "the id you saved points somewhere else"
+  // look identical, and the first reads as a verification that did not take.
+  //
+  // `discoveredError` is kept apart from `linesError` so a failed wider
+  // search does not erase a primary listing that worked.
+  const [discovered, setDiscovered] = useState<any | null>(null);
+  const [discoveredError, setDiscoveredError] = useState<string | null>(null);
+  const [searchingAll, setSearchingAll] = useState(false);
+  const [primaryError, setPrimaryError] = useState<string | null>(null);
+
+  // Whether a citizen's message can arrive at all. `null` is "not asked",
+  // never "fine".
+  const [readiness, setReadiness] = useState<any | null>(null);
+
+  // What happened to the last few inbound deliveries. Readiness answers "will
+  // Meta deliver here"; this answers "and what happened when it did" — six
+  // different faults produce the same silence on a citizen's phone.
+  const [deliveries, setDeliveries] = useState<any[] | null>(null);
+  const [deliveriesError, setDeliveriesError] = useState<string | null>(null);
+  const loadDeliveries = async () => {
+    setDeliveriesError(null);
+    try {
+      const res = await apiFetch(`${API_URL}/api/organizations/whatsapp-config/deliveries`, {
+        headers: authHeaders,
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setDeliveries(null);
+        setDeliveriesError(body?.message || `Could not load (HTTP ${res.status}).`);
+        return;
+      }
+      setDeliveries(Array.isArray(body.deliveries) ? body.deliveries : []);
+    } catch (err: any) {
+      setDeliveries(null);
+      setDeliveriesError(err?.message || 'Could not reach the API.');
+    }
+  };
+  const [readinessError, setReadinessError] = useState<string | null>(null);
+  const [loadingReadiness, setLoadingReadiness] = useState(false);
+
+  // Moving a number out of sandbox. There is no button for this in Meta's own
+  // UI — their docs say registration is API-only — so a VERIFIED number can
+  // sit at platformType NOT_APPLICABLE with nothing offering to finish it.
+  const [registerPin, setRegisterPin] = useState('');
+  const [registeringId, setRegisteringId] = useState<string | null>(null);
+  const [registerResult, setRegisterResult] = useState<any | null>(null);
+  const [registerError, setRegisterError] = useState<string | null>(null);
+
+  const registerForCloudApi = async (phoneNumberId: string) => {
+    setRegisterError(null);
+    setRegisterResult(null);
+    if (!/^[0-9]{6}$/.test(registerPin.trim())) {
+      setRegisterError('Enter the 6-digit two-step PIN first.');
+      return;
+    }
+    setRegisteringId(phoneNumberId);
+    try {
+      const res = await apiFetch(`${API_URL}/api/organizations/whatsapp-config/register-number`, {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({ phoneNumberId, pin: registerPin.trim() }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        // Meta allows 10 attempts per number per 72 hours, so a refusal is
+        // shown rather than retried.
+        setRegisterError(body?.message || `Registration failed (HTTP ${res.status}).`);
+        return;
+      }
+      setRegisterResult(body);
+      await loadLines();
+    } catch (err: any) {
+      setRegisterError(err?.message || 'Could not reach the API.');
+    } finally {
+      setRegisteringId(null);
+    }
+  };
+
+  // WhatsApp CALLING. Off by default on every business number, and not
+  // switchable from the WhatsApp Manager screens an operator would look in.
+  const [calling, setCalling] = useState<any | null>(null);
+  const [callingBusy, setCallingBusy] = useState(false);
+  const [callingError, setCallingError] = useState<string | null>(null);
+
+  const loadCalling = async () => {
+    setCallingError(null);
+    try {
+      // Name the line explicitly rather than letting two independent queries
+      // happen to order the same way. They do today, and that is not a
+      // guarantee: an agency can hold several WhatsApp lines, and the one this
+      // tab renders is the one the toggle must act on.
+      const res = await apiFetch(
+        `${API_URL}/api/organizations/whatsapp-config/calling${wa?.id ? `?configId=${encodeURIComponent(wa.id)}` : ''}`,
+        { headers: authHeaders }
+      );
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) { setCalling(null); setCallingError(body?.message || `HTTP ${res.status}`); return; }
+      setCalling(body);
+    } catch (err: any) {
+      setCalling(null);
+      setCallingError(err?.message || 'Could not reach the API.');
+    }
+  };
+
+  const toggleCalling = async (enabled: boolean) => {
+    setCallingBusy(true);
+    setCallingError(null);
+    try {
+      const res = await apiFetch(`${API_URL}/api/organizations/whatsapp-config/calling`, {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({ enabled, ...(wa?.id ? { configId: wa.id } : {}) }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) { setCallingError(body?.message || `HTTP ${res.status}`); return; }
+      // Meta's own verdict, read back — not the fact that the POST returned.
+      setCalling(body);
+      if (!body.enabled && body.requestDetail) setCallingError(body.requestDetail);
+    } catch (err: any) {
+      setCallingError(err?.message || 'Could not reach the API.');
+    } finally {
+      setCallingBusy(false);
+    }
+  };
+
+  const [subscribing, setSubscribing] = useState(false);
+  const [subscribeResult, setSubscribeResult] = useState<any | null>(null);
+  const [subscribeError, setSubscribeError] = useState<string | null>(null);
+
+  const subscribeWebhooks = async () => {
+    setSubscribing(true);
+    setSubscribeError(null);
+    setSubscribeResult(null);
+    try {
+      const res = await apiFetch(`${API_URL}/api/organizations/whatsapp-config/subscribe`, {
+        method: 'POST',
+        headers: authHeaders,
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        // A refused subscribe must not render as a successful one.
+        setSubscribeError(body?.message || `Could not subscribe (HTTP ${res.status}).`);
+        return;
+      }
+      setSubscribeResult(body);
+      // Re-read readiness, so the panel is not left showing a stale verdict.
+      await checkReadiness();
+    } catch (err: any) {
+      setSubscribeError(err?.message || 'Could not reach the API.');
+    } finally {
+      setSubscribing(false);
+    }
+  };
+
+  const checkReadiness = async () => {
+    setLoadingReadiness(true);
+    setReadinessError(null);
+    try {
+      const res = await apiFetch(`${API_URL}/api/organizations/whatsapp-config/readiness`, {
+        headers: authHeaders,
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setReadiness(null);
+        setReadinessError(body?.message || `Could not run the check (HTTP ${res.status}).`);
+        return;
+      }
+      setReadiness(body);
+    } catch (err: any) {
+      setReadiness(null);
+      setReadinessError(err?.message || 'Could not reach the API.');
+    } finally {
+      setLoadingReadiness(false);
+    }
+  };
+
+  const webhookUrl = `${API_URL}/api/whatsapp/webhook`;
+
+  /**
+   * The Phone Number ID is not the phone number, and Meta rarely shows the
+   * two together — so this field was a free-text box filled in from another
+   * tab, and getting it wrong is SILENT: the row saves, this screen reports
+   * the line connected, and the number that actually rings belongs to
+   * somebody else's test account. That is how this deployment came to hold
+   * Meta's sandbox "+1 555-671-9884 / Test Number".
+   *
+   * So ask Meta, with the credential already stored server-side. The operator
+   * never handles the token to find out which line is theirs.
+   */
+  const loadLines = async (opts: { discover?: boolean } = {}) => {
+    const wide = !!opts.discover;
+    if (wide) {
+      setSearchingAll(true);
+      setDiscoveredError(null);
+    } else {
+      setLoadingLines(true);
+      setLinesError(null);
+    }
+    try {
+      const res = await apiFetch(
+        `${API_URL}/api/organizations/whatsapp-config/numbers${wide ? '?discover=1' : ''}`,
+        { headers: authHeaders }
+      );
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        // A failed load must not render as an account with no numbers on it.
+        if (wide) {
+          setDiscoveredError(body?.message || `Could not ask Meta (HTTP ${res.status}).`);
+        } else {
+          setLines(null);
+          setLinesError(body?.message || `Could not ask Meta (HTTP ${res.status}).`);
+        }
+        return;
+      }
+      // The stored account can refuse while the wider search still answers,
+      // so `numbers` may be empty for want of a reading rather than for want
+      // of numbers. `primaryError` is what tells the two apart.
+      setPrimaryError(body?.primaryError ?? null);
+      setLines(Array.isArray(body.numbers) ? body.numbers : []);
+      if (wide) setDiscovered(body?.discovered ?? null);
+    } catch (err: any) {
+      if (wide) {
+        setDiscoveredError(err?.message || 'Could not reach the API.');
+      } else {
+        setLines(null);
+        setLinesError(err?.message || 'Could not reach the API.');
+      }
+    } finally {
+      if (wide) setSearchingAll(false);
+      else setLoadingLines(false);
+    }
+  };
+
+  const save = async (e: React.FormEvent) => {
+    e.preventDefault();
+    // On an existing line the credentials are OPTIONAL — omitted means
+    // unchanged — so switching which number the line points at does not
+    // require fetching the Meta token out of Business Manager again. The
+    // placeholder has always said "enter new to replace"; the form used to
+    // refuse anyway.
+    const isNewLine = !wa.phoneNumberId;
+    if (!phoneNumberId.trim()) {
+      showToast('Phone Number ID is required', 'error');
+      return;
+    }
+    if (isNewLine && (!accessToken.trim() || !webhookVerifyToken.trim())) {
+      showToast('A new line needs an Access Token and a Webhook Verify Token', 'error');
+      return;
+    }
+    setSaving(true);
+    try {
+      const res = await apiFetch(`${API_URL}/api/organizations/whatsapp-config`, {
+        method: 'POST', headers: authHeaders,
+        body: JSON.stringify({
+          phoneNumberId: phoneNumberId.trim(),
+          whatsappBusinessId: whatsappBusinessId.trim(),
+          // Left out entirely when blank, so the stored value stands.
+          ...(accessToken.trim() ? { accessToken: accessToken.trim() } : {}),
+          ...(webhookVerifyToken.trim() ? { webhookVerifyToken: webhookVerifyToken.trim() } : {}),
+          displayPhoneNumber: displayPhoneNumber.trim() || phoneNumberId.trim(),
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err?.message || 'Save failed');
+      }
+      showToast('WhatsApp config saved!');
+    } catch (err: any) { showToast(err?.message || 'Failed to save', 'error'); }
+    finally { setSaving(false); }
+  };
+
+  return (
+    <form onSubmit={save} className="space-y-5">
+      <Section title="WhatsApp Cloud API" description="Connect your Meta Business WhatsApp number">
+        {/* FIRST, above everything. A line whose token cannot be read does
+            not work, and every other panel on this page would otherwise
+            describe it as configured. */}
+        <UnreadableCredentials fields={wa.unreadableCredentials} what="WhatsApp line" />
+        {/* Calling: a citizen phones the agency from inside WhatsApp. The
+            only route to a voice agent on a Nigerian number with no carrier,
+            no international leg and nothing for the citizen to pay but data. */}
+        <div className="p-4 rounded-xl bg-slate-500/[0.06] border border-slate-200 dark:border-slate-500/20">
+          <div className="flex items-center gap-2 flex-wrap">
+            <p className="text-xs font-semibold flex-1">
+              Calling — let citizens phone this line from inside WhatsApp
+            </p>
+            <button
+              type="button"
+              onClick={loadCalling}
+              disabled={callingBusy || !wa.phoneNumberId}
+              className="px-3 py-1.5 text-xs rounded-lg bg-slate-100 dark:bg-slate-500/20 text-slate-700 dark:text-slate-200 hover:bg-slate-500/30 transition-all font-semibold disabled:opacity-50"
+            >
+              Check
+            </button>
+            <button
+              type="button"
+              onClick={() => toggleCalling(!(calling?.enabled))}
+              disabled={callingBusy || !wa.phoneNumberId}
+              className="px-3 py-1.5 text-xs rounded-lg bg-slate-100 dark:bg-slate-500/20 text-slate-700 dark:text-slate-200 hover:bg-slate-500/30 transition-all font-semibold disabled:opacity-50"
+            >
+              {callingBusy ? 'Asking Meta…' : calling?.enabled ? 'Turn calling off' : 'Turn calling on'}
+            </button>
+          </div>
+          {calling && (
+            <p className={`mt-2 text-xs ${calling.enabled ? 'text-emerald-700 dark:text-emerald-300' : 'text-amber-700 dark:text-amber-300'}`}>
+              Meta reports calling as {calling.callingStatus ?? 'unknown'}
+              {calling.displayPhoneNumber ? ` on ${calling.displayPhoneNumber}` : ''}.
+              {calling.nextStep ? ` ${calling.nextStep}` : ''}
+            </p>
+          )}
+          {callingError && (
+            <p className="mt-2 text-xs text-red-600 dark:text-red-400">{callingError}</p>
+          )}
+          {/* Meta's "does not exist, cannot be loaded due to missing
+              permissions, or does not support this operation" names three
+              unrelated faults in one sentence, and the id is only the first.
+              Quoting it alone sends an operator hunting a phone number id
+              that was right all along. */}
+          {/* Whether Meta will ALLOW calling on this number, before the
+              operator presses the toggle and gets a refusal that names
+              neither the rule nor the number's current tier. */}
+          {calling?.callingEligibility && !calling.enabled && (
+            <p
+              className={`mt-2 text-xs ${
+                /BELOW/.test(calling.callingEligibility)
+                  ? 'text-red-600 dark:text-red-400'
+                  : 'text-slate-600 dark:text-slate-300'
+              }`}
+            >
+              {calling.callingEligibility}
+            </p>
+          )}
+
+          {calling && !calling.enabled && (calling.refusalReading || calling.error) && (
+            <div className="mt-2 text-xs text-slate-600 dark:text-slate-300 space-y-1">
+              {calling.error && calling.error !== callingError && <p>{calling.error}</p>}
+              {calling.refusalReading && <p>{calling.refusalReading}</p>}
+              {calling.graphVersion && (
+                <p className="text-slate-500 dark:text-slate-400">
+                  Asked over Graph {calling.graphVersion}.
+                </p>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Can a citizen's message actually arrive? Asked of Meta, because
+            every other signal on this screen describes what WE hold. */}
+        <div className="p-4 rounded-xl bg-slate-500/[0.06] border border-slate-200 dark:border-slate-500/20">
+          <div className="flex items-center gap-2 flex-wrap">
+            <p className="text-xs font-semibold flex-1">Can a citizen's message reach this agency?</p>
+            <button
+              type="button"
+              onClick={checkReadiness}
+              disabled={loadingReadiness}
+              className="px-3 py-1.5 text-xs rounded-lg bg-slate-100 dark:bg-slate-500/20 text-slate-700 dark:text-slate-200 hover:bg-slate-500/30 transition-all font-semibold disabled:opacity-50"
+            >
+              {loadingReadiness ? 'Asking Meta…' : 'Run check'}
+            </button>
+            {/* Meta accepts a citizen's message and delivers it NOWHERE
+                unless the app is subscribed to the account AND to the
+                `messages` field. Both are one button rather than a trip
+                through two Meta screens. */}
+            <button
+              type="button"
+              onClick={subscribeWebhooks}
+              disabled={subscribing || !wa.phoneNumberId}
+              className="px-3 py-1.5 text-xs rounded-lg bg-slate-100 dark:bg-slate-500/20 text-slate-700 dark:text-slate-200 hover:bg-slate-500/30 transition-all font-semibold disabled:opacity-50"
+            >
+              {subscribing ? 'Subscribing…' : 'Subscribe to Meta webhooks'}
+            </button>
+          </div>
+
+          {subscribeResult && (
+            <div className="mt-3 space-y-1">
+              {subscribeResult.steps?.map((st: any, i: number) => (
+                <p
+                  key={i}
+                  className={`text-xs ${st.ok ? 'text-slate-500 dark:text-slate-400' : 'text-red-600 dark:text-red-400'}`}
+                >
+                  {st.ok ? '✓' : '✗'} {st.step} — {st.detail}
+                </p>
+              ))}
+              <p className="text-xs font-medium pt-1">{subscribeResult.nextStep}</p>
+            </div>
+          )}
+          {subscribeError && (
+            <p className="mt-2 text-xs text-red-600 dark:text-red-400">{subscribeError}</p>
+          )}
+
+          {readinessError && (
+            <p className="mt-2 text-xs text-red-600 dark:text-red-400">{readinessError}</p>
+          )}
+
+          {readiness && (
+            <div className="mt-3 space-y-2">
+              <p className="text-xs font-semibold">
+                {readiness.state === 'ready' && (
+                  <span className="text-emerald-700 dark:text-emerald-300">
+                    Ready — Meta confirms it will deliver here.
+                  </span>
+                )}
+                {readiness.state === 'degraded' && (
+                  <span className="text-amber-700 dark:text-amber-300">
+                    Degraded — a message can arrive, with caveats.
+                  </span>
+                )}
+                {readiness.state === 'blocked' && (
+                  <span className="text-red-700 dark:text-red-300">
+                    Blocked — a message cannot arrive.
+                  </span>
+                )}
+              </p>
+              {/* Blocked first and never mixed in with warnings: conflating
+                  the two buries the real blocker. */}
+              {readiness.blocked?.map((m: string, i: number) => (
+                <p key={`b${i}`} className="text-xs text-red-600 dark:text-red-400">• {m}</p>
+              ))}
+              {readiness.degraded?.map((m: string, i: number) => (
+                <p key={`d${i}`} className="text-xs text-amber-600 dark:text-amber-400">• {m}</p>
+              ))}
+              {readiness.ok?.map((m: string, i: number) => (
+                <p key={`o${i}`} className="text-xs text-slate-500 dark:text-slate-400">• {m}</p>
+              ))}
+              <p className="text-xs font-medium pt-1">{readiness.nextStep}</p>
+            </div>
+          )}
+
+          {/* WHAT HAPPENED WHEN META DID DELIVER.
+              Readiness proves Meta will send. It cannot say what became of a
+              message once it arrived — and six different faults all end as
+              the same silence on a citizen's phone. */}
+          <div className="mt-3 pt-3 border-t border-slate-200 dark:border-slate-500/20">
+            <button
+              type="button"
+              onClick={loadDeliveries}
+              className="px-3 py-1.5 text-xs rounded-lg bg-slate-100 dark:bg-slate-500/20 text-slate-700 dark:text-slate-200 hover:bg-slate-500/30 transition-all font-semibold"
+            >
+              What happened to recent messages
+            </button>
+
+            {deliveriesError && (
+              <p className="mt-2 text-xs text-red-600 dark:text-red-400">{deliveriesError}</p>
+            )}
+
+            {deliveries && deliveries.length === 0 && (
+              <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+                No inbound deliveries recorded since this server last restarted. If you have just
+                messaged the line and this stays empty, Meta is not delivering to this platform at
+                all — which is a subscription or callback-URL problem, not a problem with what
+                happens after.
+              </p>
+            )}
+
+            {deliveries && deliveries.length > 0 && (
+              <div className="mt-2 space-y-2">
+                {deliveries.slice(0, 10).map((d: any, i: number) => (
+                  <div
+                    key={i}
+                    className={`rounded-lg p-2 text-xs ${
+                      d.outcome === 'replied' || d.outcome === 'duplicate_ignored' || d.outcome === 'handed_to_human'
+                        ? 'bg-emerald-500/10 text-emerald-800 dark:text-emerald-300'
+                        : 'bg-red-500/10 text-red-800 dark:text-red-300'
+                    }`}
+                  >
+                    <p className="font-semibold">
+                      {d.outcome.replace(/_/g, ' ')}
+                      <span className="font-normal opacity-70">
+                        {' '}· {new Date(d.at).toLocaleTimeString()}
+                        {d.fromSuffix ? ` · from …${d.fromSuffix}` : ''}
+                      </span>
+                    </p>
+                    <p className="mt-0.5 opacity-90">{d.explanation}</p>
+                    {d.detail && <p className="mt-0.5 font-mono opacity-70">{d.detail}</p>}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="p-4 rounded-xl bg-blue-500/[0.06] border border-blue-200 dark:border-blue-500/20">
+          <p className="text-xs font-semibold text-blue-700 dark:text-blue-300 mb-1">📌 Webhook URL — paste this in Meta Developer Portal → WhatsApp → Configuration</p>
+          <div className="flex items-center gap-2 mt-2">
+            <code className="flex-1 text-xs text-blue-200 font-mono bg-blue-50 dark:bg-blue-500/10 px-3 py-2 rounded-lg truncate">{webhookUrl}</code>
+            <button type="button" onClick={async () => { const ok = await copyToClipboard(webhookUrl); if (ok) showToast('Copied to clipboard!'); else showToast('Failed to copy', 'error'); }}
+              className="px-3 py-2 rounded-lg bg-blue-100 dark:bg-blue-500/20 text-blue-700 dark:text-blue-300 hover:bg-blue-500/30 transition-all font-semibold flex items-center gap-1.5">
+              <Copy className="w-3.5 h-3.5" /> Copy
+            </button>
+          </div>
+        </div>
+        <div>
+          <label className={labelCls}>Phone Number ID</label>
+          <input type="text" value={phoneNumberId} onChange={e => setPhoneNumberId(e.target.value)} className={inputCls} placeholder="From Meta → WhatsApp → Phone Numbers" />
+          <div className="mt-2 flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => loadLines()}
+              disabled={loadingLines || !wa.phoneNumberId}
+              title={wa.phoneNumberId ? '' : 'Save a line first — Meta is asked with the stored credential.'}
+              className="px-3 py-1.5 text-xs rounded-lg bg-slate-100 dark:bg-slate-500/20 text-slate-700 dark:text-slate-200 hover:bg-slate-500/30 transition-all font-semibold disabled:opacity-50"
+            >
+              {loadingLines ? 'Asking Meta…' : "Show this account's lines"}
+            </button>
+            {/* The wider search. Separate button, because it is several
+                rate-limited Graph calls and the common case does not need
+                them — and because it answers a different question: not "what
+                is on this account" but "where is my number at all". */}
+            <button
+              type="button"
+              onClick={() => loadLines({ discover: true })}
+              disabled={searchingAll || !wa.phoneNumberId}
+              title={
+                wa.phoneNumberId
+                  ? "Searches every WhatsApp account this credential can see, not just the one saved on this line."
+                  : 'Save a line first — Meta is asked with the stored credential.'
+              }
+              className="px-3 py-1.5 text-xs rounded-lg bg-slate-100 dark:bg-slate-500/20 text-slate-700 dark:text-slate-200 hover:bg-slate-500/30 transition-all font-semibold disabled:opacity-50"
+            >
+              {searchingAll ? 'Searching every account…' : 'Find my number anywhere'}
+            </button>
+            {!wa.phoneNumberId && (
+              <span className="text-xs text-slate-500 dark:text-slate-400">
+                Save a line first — Meta is asked with the stored credential.
+              </span>
+            )}
+          </div>
+
+          {linesError && (
+            <p className="mt-2 text-xs text-red-600 dark:text-red-400">{linesError}</p>
+          )}
+
+          {/* The saved account refused, so `numbers` is empty for want of a
+              reading — not for want of numbers. Rendering the empty state
+              here would say this account holds none, which is a claim nothing
+              has established. */}
+          {primaryError && (
+            <p className="mt-2 text-xs text-amber-600 dark:text-amber-400">
+              The WhatsApp account saved on this line ({wa.whatsappBusinessId || 'no id stored'}) refused:{' '}
+              {primaryError}. Nothing was read from it, so it may still hold numbers. The search below
+              does not use that id.
+            </p>
+          )}
+
+          {lines && lines.length === 0 && !primaryError && (
+            <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+              Meta answered, and this business account holds no phone numbers.
+            </p>
+          )}
+
+          {lines && lines.length > 0 && (
+            <div className="mt-2 rounded-xl border border-slate-200 dark:border-slate-500/20 divide-y divide-slate-200 dark:divide-slate-500/20">
+              {lines.map((n: any) => (
+                <div key={n.phoneNumberId} className="p-3 flex items-center gap-3">
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-semibold truncate">
+                      {n.displayPhoneNumber || '(no number)'}{' '}
+                      <span className="font-normal text-slate-500 dark:text-slate-400">
+                        {n.verifiedName || ''}
+                      </span>
+                    </p>
+                    <p className="text-xs font-mono text-slate-500 dark:text-slate-400 truncate">
+                      {n.phoneNumberId}
+                    </p>
+                    {/* A sandbox number only exchanges messages with recipients
+                        added by hand in Meta, so it proves the stack works and
+                        is never a number to publish. Saying so here is cheaper
+                        than finding out after it is announced. */}
+                    {n.platformType && n.platformType !== 'CLOUD_API' && (
+                      <p className="text-xs text-amber-600 dark:text-amber-400">
+                        Not on Cloud API ({n.platformType}) — verified, but the platform cannot send or
+                        receive on it until it is registered.
+                      </p>
+                    )}
+                    {n.isMetaTestNumber && (
+                      <p className="text-xs text-amber-600 dark:text-amber-400">
+                        Meta test number — only reaches recipients you add in Meta. Not for publishing.
+                      </p>
+                    )}
+                  </div>
+                  {n.platformType && n.platformType !== 'CLOUD_API' ? (
+                    <button
+                      type="button"
+                      onClick={() => registerForCloudApi(n.phoneNumberId)}
+                      disabled={registeringId === n.phoneNumberId}
+                      title="Registers this number for Cloud API. Meta offers no way to do this in their own UI."
+                      className="px-3 py-1.5 text-xs rounded-lg bg-amber-100 dark:bg-amber-500/20 text-amber-800 dark:text-amber-200 hover:bg-amber-500/30 transition-all font-semibold whitespace-nowrap disabled:opacity-50"
+                    >
+                      {registeringId === n.phoneNumberId ? 'Registering…' : 'Register for Cloud API'}
+                    </button>
+                  ) : n.isConnectedHere ? (
+                    <span className="text-xs font-semibold px-2 py-1 rounded-lg bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 whitespace-nowrap">
+                      Connected here
+                    </span>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setPhoneNumberId(n.phoneNumberId || '');
+                        if (n.displayPhoneNumber) setDisplayPhoneNumber(n.displayPhoneNumber);
+                        showToast('Fields filled — press Save to switch to this line.');
+                      }}
+                      className="px-3 py-1.5 text-xs rounded-lg bg-slate-100 dark:bg-slate-500/20 text-slate-700 dark:text-slate-200 hover:bg-slate-500/30 transition-all font-semibold whitespace-nowrap"
+                    >
+                      Use this line
+                    </button>
+                  )}
+                </div>
+              ))}
+              <div className="p-3 space-y-2">
+                <label className={labelCls}>Two-step PIN (6 digits), for registering a number</label>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  maxLength={6}
+                  value={registerPin}
+                  onChange={e => setRegisterPin(e.target.value.replace(/[^0-9]/g, ''))}
+                  className={inputCls}
+                  placeholder="000000"
+                />
+                {/* Meta reuses this one field for two meanings, and getting it
+                    wrong spends one of ten attempts allowed per 72 hours. */}
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  If the number already has two-step verification this must be the existing PIN.
+                  Otherwise it becomes the number&apos;s PIN. Meta allows 10 attempts per number
+                  per 72 hours.
+                </p>
+                {registerError && (
+                  <p className="text-xs text-red-600 dark:text-red-400">{registerError}</p>
+                )}
+                {registerResult && (
+                  <div className="text-xs space-y-1">
+                    <p className={registerResult.registered ? 'text-emerald-700 dark:text-emerald-300' : 'text-amber-700 dark:text-amber-300'}>
+                      {registerResult.registered
+                        ? `${registerResult.displayPhoneNumber ?? registerResult.phoneNumberId} is on CLOUD_API.`
+                        : 'Not registered.'}
+                    </p>
+                    <p className="text-slate-500 dark:text-slate-400">{registerResult.requestDetail}</p>
+                    <p className="font-medium">{registerResult.nextStep}</p>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {discoveredError && (
+            <p className="mt-2 text-xs text-red-600 dark:text-red-400">{discoveredError}</p>
+          )}
+
+          {discovered && (
+            <div className="mt-3 rounded-xl border border-slate-200 dark:border-slate-500/20 p-3 space-y-3">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                  Every account this credential can see
+                </p>
+                {discovered.identity && (
+                  <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                    Credential belongs to {discovered.identity.name || '(unnamed)'}{' '}
+                    <span className="font-mono">{discovered.identity.id}</span>
+                  </p>
+                )}
+              </div>
+
+              {/* `numbers: null` means NOT READ. An account whose numbers
+                  could not be listed must not render as an account with none,
+                  which is the whole reason the API distinguishes them. */}
+              {Array.isArray(discovered.accounts) && discovered.accounts.length > 0 ? (
+                discovered.accounts.map((acct: any) => (
+                  <div key={`${acct.businessId}-${acct.whatsappBusinessId}`} className="rounded-lg bg-slate-50 dark:bg-slate-500/10 p-3">
+                    <p className="text-sm font-semibold">
+                      {acct.whatsappBusinessName || '(unnamed account)'}{' '}
+                      <span className="font-normal text-xs text-slate-500 dark:text-slate-400">
+                        {acct.relation} · {acct.businessName || acct.businessId}
+                      </span>
+                    </p>
+                    <p className="text-xs font-mono text-slate-500 dark:text-slate-400">
+                      WABA {acct.whatsappBusinessId}
+                    </p>
+                    {acct.numbers === null ? (
+                      <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
+                        Could not read this account&apos;s numbers — {acct.numbersError}. It may still
+                        hold some.
+                      </p>
+                    ) : acct.numbers.length === 0 ? (
+                      <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">No numbers on it.</p>
+                    ) : (
+                      <div className="mt-2 space-y-2">
+                        {acct.numbers.map((n: any) => (
+                          <div key={n.phoneNumberId} className="flex items-center gap-3">
+                            <div className="flex-1 min-w-0">
+                              <p className="text-sm truncate">
+                                {n.displayPhoneNumber || '(no number)'}{' '}
+                                <span className="text-slate-500 dark:text-slate-400">
+                                  {n.verifiedName || ''}
+                                </span>
+                              </p>
+                              <p className="text-xs font-mono text-slate-500 dark:text-slate-400 truncate">
+                                {n.phoneNumberId}
+                              </p>
+                              {n.platformType && n.platformType !== 'CLOUD_API' && (
+                                <p className="text-xs text-amber-600 dark:text-amber-400">
+                                  Not on Cloud API ({n.platformType}) — cannot send or receive until
+                                  registered.
+                                </p>
+                              )}
+                              {n.isMetaTestNumber && (
+                                <p className="text-xs text-amber-600 dark:text-amber-400">
+                                  Meta test number — only reaches recipients you add in Meta.
+                                </p>
+                              )}
+                            </div>
+                            {n.isConnectedHere ? (
+                              <span className="text-xs font-semibold px-2 py-1 rounded-lg bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 whitespace-nowrap">
+                                Connected here
+                              </span>
+                            ) : (
+                              // Fills BOTH ids: switching accounts needs the
+                              // WABA id too, and leaving the old one saved is
+                              // how a line ends up pointing at a number on an
+                              // account the stored id cannot see.
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setPhoneNumberId(n.phoneNumberId || '');
+                                  setWhatsappBusinessId(acct.whatsappBusinessId || '');
+                                  if (n.displayPhoneNumber) setDisplayPhoneNumber(n.displayPhoneNumber);
+                                  showToast('Phone Number ID and WABA ID filled — press Save to switch.');
+                                }}
+                                className="px-3 py-1.5 text-xs rounded-lg bg-slate-100 dark:bg-slate-500/20 text-slate-700 dark:text-slate-200 hover:bg-slate-500/30 transition-all font-semibold whitespace-nowrap"
+                              >
+                                Use this line
+                              </button>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))
+              ) : (
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  No WhatsApp accounts came back for this credential. The notes below say why.
+                </p>
+              )}
+
+              {/* Why the search may be incomplete. A truncated fan-out or a
+                  token without business_management returns part of the
+                  picture, and saying nothing presents it as all of it. */}
+              {Array.isArray(discovered.notes) && discovered.notes.length > 0 && (
+                <ul className="text-xs text-slate-500 dark:text-slate-400 list-disc pl-4 space-y-1">
+                  {discovered.notes.map((note: string, i: number) => (
+                    <li key={i}>{note}</li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+        </div>
+        <div>
+          <label className={labelCls}>WhatsApp Business Account ID (WABA ID)</label>
+          <input type="text" value={whatsappBusinessId} onChange={e => setWhatsappBusinessId(e.target.value)} className={inputCls} placeholder="From Meta Business Manager → Accounts → WhatsApp Accounts" />
+        </div>
+        <div>
+          <label className={labelCls}>Display Phone Number (e.g. +1 555 671-9884)</label>
+          <input type="text" value={displayPhoneNumber} onChange={e => setDisplayPhoneNumber(e.target.value)} className={inputCls} placeholder="+1 555 671-9884" />
+        </div>
+        <div>
+          <label className={labelCls}>Permanent Access Token <span className="text-slate-500 dark:text-slate-400 font-normal normal-case">(EAA…)</span></label>
+          <div className="relative">
+            <input
+              type={showToken ? 'text' : 'password'}
+              value={accessToken}
+              onChange={e => setAccessToken(e.target.value)}
+              className={`${inputCls} pr-12`}
+              placeholder={wa.accessToken ? `Current: ${wa.accessToken} — enter new to replace` : 'EAA...'}
+            />
+            <button type="button" onClick={() => setShowToken(!showToken)} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:text-slate-300">
+              {showToken ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+            </button>
+          </div>
+        </div>
+        <div>
+          <label className={labelCls}>Webhook Verify Token <span className="text-slate-500 dark:text-slate-400 font-normal normal-case">(you choose — must match Meta Dashboard)</span></label>
+          <div className="relative">
+            <input
+              type={showVerifyToken ? 'text' : 'password'}
+              value={webhookVerifyToken}
+              onChange={e => setWebhookVerifyToken(e.target.value)}
+              className={`${inputCls} pr-12`}
+              placeholder={wa.webhookVerifyToken ? `Current: ${wa.webhookVerifyToken} — enter new to replace` : 'e.g. my_verify_token_123'}
+            />
+            <button type="button" onClick={() => setShowVerifyToken(!showVerifyToken)} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:text-slate-300">
+              {showVerifyToken ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+            </button>
+          </div>
+        </div>
+      </Section>
+      <div className="flex justify-end">
+        <button type="submit" disabled={saving} className="flex items-center gap-2 px-6 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-sm disabled:opacity-50 transition-all shadow-lg shadow-brand-600/20">
+          {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+          {saving ? 'Saving...' : 'Save WhatsApp Config'}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+// ─────────────────────── Voice Tab ───────────────────────
+/**
+ * How the agency's phone line is connected.
+ *
+ * Four things here were wrong, and each of them was invisible from the
+ * dashboard — the form saved, or appeared to, and the damage showed up on a
+ * phone line instead.
+ *
+ * **Two of the five providers could never be saved.** The list read
+ * `AFRICA_TALKING` and `NIGERIAN_CARRIER`; the enum says `AFRICAS_TALKING` and
+ * `NIGERIA_CARRIER_FORWARD`. Both reached Prisma and came back as a bare 500,
+ * so choosing either showed "Failed to save" with no reason, every time. The
+ * API now answers 400 with the valid list, and this list is the valid list.
+ *
+ * **Secrets were pre-filled from their own masks.** `GET /me` returns
+ * `••••1234`, this form put that in the input, and saving wrote the mask as the
+ * credential — encrypted, stored, and rejected by Twilio as a bad auth token on
+ * the next call. Nothing is pre-filled now: what is configured is shown as
+ * text, the box starts empty, and an untouched box sends nothing.
+ *
+ * **A SIP trunk could not be configured at all**, so
+ * `/api/agent-provisioning/numbers/import-sip` could only ever answer "No SIP
+ * trunk is configured" — the one path that removes the Twilio dependency, with
+ * no way to fill in its fields.
+ *
+ * **`forwardingNumber` had no field.** Both voice handoff paths refuse with
+ * "Set one under Settings → Telephony and try again", which was a pointer to
+ * somewhere that did not exist.
+ */
+
+/** Providers, with the enum value the API expects and a label a human reads. */
+const VOICE_PROVIDERS: Array<{ value: string; label: string; note?: string }> = [
+  { value: 'TWILIO', label: 'Twilio' },
+  { value: 'SIP_TRUNK', label: 'SIP trunk (local carrier)', note: 'Answered by the hosted agent — no Twilio' },
+  { value: 'AFRICAS_TALKING', label: "Africa's Talking" },
+  { value: 'NIGERIA_CARRIER_FORWARD', label: 'Nigerian carrier forwarding' },
+  { value: 'MTN_ENTERPRISE_SIP', label: 'MTN Business SIP (inbound only)' },
+  { value: 'AIRTEL_BUSINESS_SIP', label: 'Airtel Business SIP (inbound only)' },
+  { value: 'PLIVO', label: 'Plivo' },
+  { value: 'TELNYX', label: 'Telnyx' },
+];
+
+/** Which inbound webhook a provider delivers to, or null when it sends us none. */
+function inboundWebhookPath(provider: string): string | null {
+  switch (provider) {
+    case 'TWILIO':
+    case 'MTN_ENTERPRISE_SIP':
+    case 'AIRTEL_BUSINESS_SIP':
+      // The carrier-SIP arrangements route into a Twilio SIP domain, so the
+      // call arrives on the Twilio webhook.
+      return 'twilio';
+    case 'AFRICAS_TALKING':
+      // The route is 'africa-talking' (singular) while the provider enum is
+      // AFRICAS_TALKING. Spelling it from the enum hands the operator a URL
+      // that 404s, and they would point their carrier at it.
+      return 'africa-talking';
+    case 'NIGERIA_CARRIER_FORWARD':
+      return 'nigeria-carrier';
+    case 'TELNYX':
+      return 'telnyx';
+    // A SIP trunk goes to ElevenLabs, which answers it. Showing a webhook URL
+    // for it would invite an operator to point the trunk back here and undo the
+    // cutover. Plivo has no inbound route in this API.
+    default:
+      return null;
+  }
+}
+
+/**
+ * A labelled control.
+ *
+ * The labels on this form were bare `<label>` elements with no `htmlFor`, so
+ * nothing tied them to their inputs: a screen reader announced an unlabelled
+ * text box, and clicking the label did not focus it. On a government platform
+ * that is a defect in its own right, and it is also why these fields were
+ * unreachable by name from a test.
+ */
+function Field({
+  id,
+  label,
+  hint,
+  children,
+}: {
+  id: string;
+  label: string;
+  hint?: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <div>
+      <label htmlFor={id} className={labelCls}>{label}</label>
+      {children}
+      {hint && <p className="text-xs text-slate-500 dark:text-slate-400 mt-1.5">{hint}</p>}
+    </div>
+  );
+}
+
+/** What is stored, shown as text — never as the contents of an input. */
+function Configured({ value }: { value?: string | null }) {
+  if (!value) return <span className="text-slate-500 dark:text-slate-400">not set</span>;
+  return <span className="font-mono text-slate-600 dark:text-slate-300">{value}</span>;
+}
+
+function VoiceTab({ org, authHeaders, showToast, onSaved }: any) {
+  // The API orders these — default line first — so this is the line outbound
+  // calls use, and it is the same line on every refresh. It was an unordered
+  // array, so a multi-line agency saw a different line after reloading.
+  const lines = org?.telephonyConfigs ?? [];
+  const tc = lines[0] || {};
+  const [deleting, setDeleting] = useState(false);
+  const [provider, setProvider] = useState(tc.provider || 'TWILIO');
+  const [phoneNumber, setPhoneNumber] = useState(tc.phoneNumber || '');
+  const [forwardingNumber, setForwardingNumber] = useState(tc.forwardingNumber || '');
+
+  // Credentials start EMPTY and are sent only when typed. See the note above:
+  // pre-filling these from the masked read wrote the mask as the secret.
+  const [accountSid, setAccountSid] = useState('');
+  const [authToken, setAuthToken] = useState('');
+  const [apiKey, setApiKey] = useState('');
+
+  const [sipAddress, setSipAddress] = useState(tc.sipAddress || '');
+  const [sipTransport, setSipTransport] = useState(tc.sipTransport || 'udp');
+  const [sipUsername, setSipUsername] = useState(tc.sipUsername || '');
+  const [sipPassword, setSipPassword] = useState('');
+
+  const [showSecret, setShowSecret] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const isSip = provider === 'SIP_TRUNK';
+  const usesAccount = provider === 'TWILIO' || provider === 'PLIVO';
+  const usesApiKey = provider === 'AFRICAS_TALKING' || provider === 'NIGERIA_CARRIER_FORWARD' || provider === 'TELNYX';
+  const webhookPath = inboundWebhookPath(provider);
+
+  const save = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSaving(true);
+    setError(null);
+    try {
+      // The id of the line THIS form is showing. An agency can hold several
+      // voice lines — a toll-free Twilio number, a Telnyx number, a
+      // carrier-forward line — and without the id the API updated whichever
+      // row came back first, so a save could rewrite a different line from the
+      // one on screen. Absent (no line configured yet) the API creates one.
+      const body: Record<string, unknown> = { provider, phoneNumber, forwardingNumber };
+      if (tc.id) body.id = tc.id;
+      if (usesAccount) {
+        if (accountSid) body.accountSid = accountSid;
+        if (authToken) body.authToken = authToken;
+      }
+      if (usesApiKey && apiKey) body.apiKey = apiKey;
+      if (isSip) {
+        body.sipAddress = sipAddress;
+        body.sipTransport = sipTransport;
+        body.sipUsername = sipUsername;
+        if (sipPassword) body.sipPassword = sipPassword;
+      }
+
+      const res = await apiFetch(`${API_URL}/api/organizations/telephony-config`, {
+        method: 'POST', headers: authHeaders,
+        body: JSON.stringify(body),
+      });
+      const payload = await res.json().catch(() => null);
+      if (!res.ok) {
+        // The API's message names the field and the valid values. Replacing it
+        // with "Failed to save" is what left an operator with two unsaveable
+        // providers and nothing to go on.
+        throw new Error(
+          Array.isArray(payload?.message) ? payload.message.join(' ') : payload?.message || 'Could not save the voice configuration.'
+        );
+      }
+      // Cleared so a saved credential is never sitting in the DOM, and so the
+      // next save does not re-send one the operator did not retype.
+      setAuthToken(''); setApiKey(''); setSipPassword(''); setAccountSid('');
+      showToast('Voice config saved!');
+    } catch (err: any) {
+      setError(err?.message || 'Could not save the voice configuration.');
+      showToast('Failed to save', 'error');
+    }
+    finally { setSaving(false); }
+  };
+
+  return (
+    <form onSubmit={save} className="space-y-5">
+      <Section title="Voice AI Telephony" description="How citizens' calls reach this agency">
+        <UnreadableCredentials fields={tc.unreadableCredentials} what="voice line" />
+        {/* Say so, rather than letting the form imply the agency has one line.
+            The other lines keep answering calls and are edited from whichever
+            tooling created them; this form only ever touches the one shown. */}
+        {lines.length > 1 && (
+          <p className="text-xs rounded-lg px-3 py-2 bg-amber-50 dark:bg-amber-500/10 text-amber-800 dark:text-amber-300 border border-amber-200 dark:border-amber-500/30">
+            This agency has {lines.length} voice lines. This form edits{' '}
+            <span className="font-mono">{tc.phoneNumber || 'the default line'}</span> only — the
+            others keep answering calls and are not changed by saving here.
+          </p>
+        )}
+        <Field
+          id="voice-provider"
+          label="Provider"
+          hint={VOICE_PROVIDERS.find(p => p.value === provider)?.note}
+        >
+          <select id="voice-provider" value={provider} onChange={e => setProvider(e.target.value)} className={selectCls}>
+            {VOICE_PROVIDERS.map(p => (
+              <option key={p.value} value={p.value}>{p.label}</option>
+            ))}
+          </select>
+        </Field>
+        <Field id="voice-number" label="Phone Number">
+          <input id="voice-number" type="tel" value={phoneNumber} onChange={e => setPhoneNumber(e.target.value)} className={inputCls} placeholder="+2348012345678" />
+        </Field>
+        <Field
+          id="voice-forwarding"
+          label="Forwarding Number"
+          hint={
+            <>
+              Where a call goes when the AI hands over to a person. With none set, a handover files a
+              high-priority ticket instead and the caller is told so — the AI never claims a transfer it
+              cannot make.
+            </>
+          }
+        >
+          <input id="voice-forwarding" type="tel" value={forwardingNumber} onChange={e => setForwardingNumber(e.target.value)} className={inputCls} placeholder="+2348090000000" />
+        </Field>
+
+        {usesAccount && (
+          <>
+            <Field
+              id="voice-account-sid"
+              label={provider === 'TWILIO' ? 'Account SID' : 'Auth ID'}
+              hint={<>Saved: <Configured value={tc.accountSid} /></>}
+            >
+              <input id="voice-account-sid" type="text" value={accountSid} onChange={e => setAccountSid(e.target.value)} className={inputCls} placeholder="Leave blank to keep the saved value" />
+            </Field>
+            <Field
+              id="voice-auth-token"
+              label="Auth Token"
+              hint={<>Saved: <Configured value={tc.authToken} /></>}
+            >
+              <div className="relative">
+                <input id="voice-auth-token" type={showSecret ? 'text' : 'password'} value={authToken} onChange={e => setAuthToken(e.target.value)} className={`${inputCls} pr-12`} placeholder="Leave blank to keep the saved value" />
+                <button type="button" onClick={() => setShowSecret(!showSecret)} aria-label={showSecret ? 'Hide secret' : 'Show secret'} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 dark:text-slate-400 hover:text-slate-700">
+                  {showSecret ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
+            </Field>
+          </>
+        )}
+
+        {usesApiKey && (
+          <Field
+            id="voice-api-key"
+            label="API Key"
+            hint={<>Saved: <Configured value={tc.apiKey} /></>}
+          >
+            <div className="relative">
+              <input id="voice-api-key" type={showSecret ? 'text' : 'password'} value={apiKey} onChange={e => setApiKey(e.target.value)} className={`${inputCls} pr-12`} placeholder="Leave blank to keep the saved value" />
+              <button type="button" onClick={() => setShowSecret(!showSecret)} aria-label={showSecret ? 'Hide secret' : 'Show secret'} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 dark:text-slate-400 hover:text-slate-700">
+                {showSecret ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+              </button>
+            </div>
+          </Field>
+        )}
+      </Section>
+
+      {isSip && (
+        <Section
+          title="SIP trunk"
+          description="The trunk the hosted agent answers. Your carrier supplies these."
+        >
+          <Field id="sip-address" label="SIP Host Address">
+            <input id="sip-address" type="text" value={sipAddress} onChange={e => setSipAddress(e.target.value)} className={inputCls} placeholder="sip.carrier.ng" />
+          </Field>
+          <Field id="sip-transport" label="Transport">
+            <select id="sip-transport" value={sipTransport} onChange={e => setSipTransport(e.target.value)} className={selectCls}>
+              {['udp', 'tcp', 'tls', 'auto'].map(t => (
+                <option key={t} value={t}>{t.toUpperCase()}</option>
+              ))}
+            </select>
+          </Field>
+          <Field id="sip-username" label="SIP Username">
+            <input id="sip-username" type="text" value={sipUsername} onChange={e => setSipUsername(e.target.value)} className={inputCls} placeholder="Leave blank for an IP-authenticated trunk" />
+          </Field>
+          <Field
+            id="sip-password"
+            label="SIP Password"
+            hint={
+              <>
+                Saved: <Configured value={tc.sipPassword} /> — digest authentication needs a username and a
+                password together, or neither if your carrier authenticates the trunk by IP address.
+              </>
+            }
+          >
+            <div className="relative">
+              <input id="sip-password" type={showSecret ? 'text' : 'password'} value={sipPassword} onChange={e => setSipPassword(e.target.value)} className={`${inputCls} pr-12`} placeholder="Leave blank to keep the saved value" />
+              <button type="button" onClick={() => setShowSecret(!showSecret)} aria-label={showSecret ? 'Hide secret' : 'Show secret'} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 dark:text-slate-400 hover:text-slate-700">
+                {showSecret ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+              </button>
+            </div>
+          </Field>
+          <div className="p-4 rounded-xl bg-blue-500/[0.06] border border-blue-200 dark:border-blue-500/20 text-xs text-blue-700 dark:text-blue-300">
+            Saving the trunk here does not move any calls. Hand it to the agent from{' '}
+            <Link href="/agent-provisioning" className="underline font-semibold">Agent provisioning</Link>, which
+            states what the cutover changes before it happens.
+          </div>
+        </Section>
+      )}
+
+      <Section title="Inbound webhook" description="Where the carrier delivers a call">
+        {webhookPath ? (
+          <div className="p-4 rounded-xl bg-amber-500/[0.06] border border-amber-200 dark:border-amber-500/20 text-xs text-amber-700 dark:text-amber-300 flex items-center justify-between gap-3">
+            <div>
+              <strong>Inbound Voice Webhook URL:</strong>
+              <code className="ml-2 font-mono break-all">{API_URL}/api/telephony/inbound/{webhookPath}</code>
+            </div>
+            <button
+              type="button"
+              onClick={async () => {
+                const ok = await copyToClipboard(`${API_URL}/api/telephony/inbound/${webhookPath}`);
+                if (ok) showToast('Telephony Webhook URL copied!');
+              }}
+              className="px-2.5 py-1 rounded bg-amber-100 dark:bg-amber-800/40 text-amber-800 dark:text-amber-200 hover:bg-amber-200 font-semibold text-[11px] flex items-center gap-1 shrink-0"
+            >
+              <Copy className="w-3 h-3" /> Copy
+            </button>
+          </div>
+        ) : (
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            {isSip
+              ? 'A SIP trunk is answered by the hosted agent, so no call is delivered to this platform. Point the trunk at ElevenLabs, not here.'
+              : 'This provider has no inbound route in this platform. Calls to it do not reach the AI.'}
+          </p>
+        )}
+      </Section>
+
+      {error && (
+        <div className="p-4 rounded-xl bg-red-500/[0.06] border border-red-200 dark:border-red-500/20 text-xs text-red-700 dark:text-red-300">
+          {error}
+        </div>
+      )}
+
+      <div className="flex justify-end items-center gap-3">
+        {/* Offered only for a line that EXISTS. Destructive, so it is behind a
+            confirm naming the number, and it says what happens to the call
+            history — which survives, because CallLog.telephonyConfigId is
+            SetNull. An operator who cannot tell is one who checks the hard
+            way. */}
+        {tc.id && (
+          <button
+            type="button"
+            disabled={saving || deleting}
+            onClick={async () => {
+              const ok = window.confirm(
+                `Remove ${tc.phoneNumber || 'this line'} from this agency?\n\n` +
+                'Calls already recorded on it are KEPT — they simply stop pointing at a line ' +
+                'that no longer exists. Citizens can no longer be routed to this number.'
+              );
+              if (!ok) return;
+              setDeleting(true);
+              setError(null);
+              try {
+                const res = await apiFetch(`${API_URL}/api/organizations/telephony-config/${tc.id}`, {
+                  method: 'DELETE', headers: authHeaders,
+                });
+                const payload = await res.json().catch(() => null);
+                if (!res.ok) {
+                  // A refused delete must not look like a successful one.
+                  setError(payload?.message || `The line could not be removed (HTTP ${res.status}).`);
+                  return;
+                }
+                showToast(payload?.note || 'Line removed.');
+                onSaved?.();
+              } catch (err: any) {
+                setError(err?.message || 'Could not reach the API.');
+              } finally {
+                setDeleting(false);
+              }
+            }}
+            className="px-4 py-2.5 rounded-xl bg-red-600 hover:bg-red-500 text-white font-semibold text-sm disabled:opacity-50 transition-all"
+          >
+            {deleting ? 'Removing…' : 'Remove this line'}
+          </button>
+        )}
+        <button type="submit" disabled={saving || deleting} className="flex items-center gap-2 px-6 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-sm disabled:opacity-50 transition-all shadow-lg shadow-brand-600/20">
+          {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+          {saving ? 'Saving...' : 'Save Voice Config'}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+// ─────────────────────── API Key Tab ───────────────────────
+/**
+ * The agency's integration key.
+ *
+ * `POST /api/organizations/api-keys/regenerate` has existed, audited, with no
+ * screen — so the only way to rotate the key an agency's own integrations
+ * authenticate with was a curl command, and a credential nobody can rotate
+ * without a terminal does not get rotated.
+ *
+ * Three things this screen has to get right, because the endpoint returns a
+ * LIVE credential exactly once:
+ *
+ *   IT IS SHOWN ONCE. Only a SHA-256 hash is stored, so nothing can show it
+ *   again — the panel says that before the operator navigates away, and copying
+ *   it is one click rather than a careful selection.
+ *
+ *   ROTATING IS NOT FREE. A new key does not disable the old one here (it adds
+ *   a key), but anything still using an old key should be moved over, so the
+ *   confirmation says what the operator needs to go and do.
+ *
+ *   A REFUSAL IS RENDERED. This is OWNER/ADMIN; a member reaching the tab sees
+ *   the server's 403 rather than a button that silently fails.
+ */
+function ApiKeyTab({ authHeaders, showToast }: any) {
+  const [issued, setIssued] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState(false);
+
+  const rotate = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await apiFetch(`${API_URL}/api/organizations/api-keys/regenerate`, {
+        method: 'POST',
+        headers: authHeaders,
+      });
+      const body = await res.json().catch(() => null);
+      if (!res.ok || !body?.apiKey) {
+        throw new Error(
+          (Array.isArray(body?.message) ? body.message.join(' ') : body?.message) ||
+          'Could not issue a new key.'
+        );
+      }
+      setIssued(body.apiKey);
+      setConfirming(false);
+      showToast('A new API key has been issued.');
+    } catch (err: any) {
+      setError(err?.message || 'Could not issue a new key.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="space-y-5">
+      <Section
+        title="Integration API key"
+        description="What this agency's own systems use to call the platform"
+      >
+        {issued ? (
+          <div className="space-y-3">
+            <div className="p-4 rounded-xl bg-emerald-500/[0.07] border border-emerald-200 dark:border-emerald-500/20">
+              <p className="text-xs font-semibold text-emerald-800 dark:text-emerald-200 mb-2">
+                Copy this now — it cannot be shown again.
+              </p>
+              <div className="flex items-center gap-2">
+                <code className="flex-1 font-mono text-xs break-all text-slate-900 dark:text-white bg-white dark:bg-slate-900 rounded-lg px-3 py-2 border border-emerald-200 dark:border-emerald-500/30">
+                  {issued}
+                </code>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    const ok = await copyToClipboard(issued);
+                    if (ok) showToast('API key copied.');
+                  }}
+                  className="px-3 py-2 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold flex items-center gap-1.5 shrink-0"
+                >
+                  <Copy className="w-3.5 h-3.5" /> Copy
+                </button>
+              </div>
+            </div>
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              Only a hash of it is stored, which is why this is the one time it is readable. Move any
+              integration still using an older key over to this one.
+            </p>
+            <button
+              type="button"
+              onClick={() => setIssued(null)}
+              className="text-xs font-semibold text-blue-700 dark:text-blue-400 hover:underline"
+            >
+              I have copied it
+            </button>
+          </div>
+        ) : confirming ? (
+          <div className="space-y-3">
+            <div className="p-4 rounded-xl bg-amber-500/[0.08] border border-amber-200 dark:border-amber-500/20 text-xs text-amber-800 dark:text-amber-200">
+              A new key is issued and shown once. Existing keys keep working until they are removed,
+              so nothing breaks the moment you click — but anything still using an old key should be
+              moved over.
+            </div>
+            <div className="flex gap-3">
+              <button
+                type="button"
+                onClick={rotate}
+                disabled={busy}
+                className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-amber-600 hover:bg-amber-500 text-white font-semibold text-sm disabled:opacity-50"
+              >
+                {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <KeyRound className="w-4 h-4" />}
+                {busy ? 'Issuing…' : 'Issue a new key'}
+              </button>
+              <button
+                type="button"
+                onClick={() => { setConfirming(false); setError(null); }}
+                className="px-5 py-2.5 rounded-xl bg-slate-100 dark:bg-slate-800/60 text-slate-700 dark:text-slate-200 font-semibold text-sm"
+              >
+                Not now
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              The key itself is never readable after it is issued — only a hash is kept. If it has
+              been shared or exposed, issue a new one.
+            </p>
+            <button
+              type="button"
+              onClick={() => { setConfirming(true); setError(null); }}
+              className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-sm"
+            >
+              <KeyRound className="w-4 h-4" /> Issue a new API key
+            </button>
+          </div>
+        )}
+
+        {error && (
+          <div className="p-3 rounded-xl bg-red-500/[0.06] border border-red-200 dark:border-red-500/20 text-xs text-red-700 dark:text-red-300">
+            {error}
+          </div>
+        )}
+      </Section>
+    </div>
+  );
+}
+
+// ─────────────────────── Hosted Agent Tab ───────────────────────
+/**
+ * The tenant's own ElevenLabs workspace.
+ *
+ * An ElevenLabs workspace has no tenancy of its own: the agents in it, the phone
+ * numbers, the WhatsApp lines and every conversation transcript belong to
+ * whoever holds the key. So each tenant needs its own, and until it has one the
+ * API refuses every hosted-agent operation rather than quietly putting this
+ * business's customers in a bucket with everyone else's.
+ *
+ * That refusal has been live with no way to clear it from the dashboard — the
+ * key could only be written by hand in SQL, and a credential nobody can rotate
+ * without a database console does not get rotated. This tab is that way.
+ *
+ * Three rules it follows, all of them the opposite of what the older tabs do:
+ *
+ *   NOTHING IS PRE-FILLED. The API returns fingerprints, never credentials, and
+ *   there is no read-back endpoint at all. An empty box next to "••••abcd" is
+ *   honest about that; a box pre-filled with a masked value invites someone to
+ *   save the mask as the new secret.
+ *
+ *   THE SERVER'S WARNINGS ARE SHOWN VERBATIM. They name the exact gap and the
+ *   exact URL to fix it. Re-wording them here means two descriptions of one
+ *   state, and the friendlier one is always the one that drifts out of date.
+ *
+ *   A REFUSAL IS RENDERED, NOT SWALLOWED. Reading the agent status throws for a
+ *   tenant with no key — and that exception text IS the instruction. Showing it
+ *   beats a panel that sits empty for a reason the operator cannot see.
+ */
+function HostedAgentTab({ showToast }: any) {
+  const [status, setStatus] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [apiKey, setApiKey] = useState('');
+  const [webhookSecret, setWebhookSecret] = useState('');
+  const [showSecrets, setShowSecrets] = useState(false);
+
+  const [agent, setAgent] = useState<any>(null);
+  const [agentError, setAgentError] = useState<string | null>(null);
+  const [agentLoading, setAgentLoading] = useState(true);
+  const [callHealth, setCallHealth] = useState<any>(null);
+  const [callHealthError, setCallHealthError] = useState<string | null>(null);
+
+  const role = (() => {
+    try { return JSON.parse(localStorage.getItem('ace_user') || '{}').role; } catch { return undefined; }
+  })();
+  const canEdit = role === 'OWNER' || role === 'ADMIN';
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try { setStatus(await api.agentProvisioning.getCredentials()); }
+    catch (err: any) { showToast(err.message || 'Could not read workspace status', 'error'); }
+    finally { setLoading(false); }
+  }, []);
+
+  const loadAgent = useCallback(async () => {
+    setAgentLoading(true);
+    setAgentError(null);
+    try { setAgent(await api.agentProvisioning.getStatus()); }
+    catch (err: any) {
+      // Expected whenever no key is set — the message is the instruction.
+      setAgent(null);
+      setAgentError(err.message || 'Could not read the agent status');
+    }
+    finally { setAgentLoading(false); }
+  }, []);
+
+  const loadCallHealth = useCallback(async () => {
+    setCallHealthError(null);
+    try { setCallHealth(await api.agentProvisioning.getCallHealth()); }
+    catch (err: any) {
+      // Unknown is not "no problems": say it could not be read.
+      setCallHealth(null);
+      setCallHealthError(err.message || 'Could not read how recent calls ended');
+    }
+  }, []);
+
+  useEffect(() => { load(); loadAgent(); loadCallHealth(); }, [load, loadAgent, loadCallHealth]);
+
+  const save = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!apiKey.trim() && !webhookSecret.trim()) {
+      showToast('Enter an API key, a webhook secret, or both', 'error');
+      return;
+    }
+    setSaving(true);
+    try {
+      const next = await api.agentProvisioning.setCredentials({
+        ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
+        ...(webhookSecret.trim() ? { webhookSecret: webhookSecret.trim() } : {}),
+      });
+      // The POST already returns the full status, so there is nothing to re-fetch
+      // and no window in which the screen shows the state from before the save.
+      setStatus(next);
+      setApiKey('');
+      setWebhookSecret('');
+      showToast('Workspace credentials saved');
+      loadAgent();
+    } catch (err: any) {
+      showToast(err.message || 'Failed to save', 'error');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (loading) {
+    return <div className="flex items-center justify-center py-20"><Loader2 className="w-8 h-8 text-blue-700 dark:text-blue-400 animate-spin" /></div>;
+  }
+
+  const dedicated = status?.mode === 'dedicated';
+
+  return (
+    <div className="space-y-5">
+      <Section
+        title="ElevenLabs Workspace"
+        description="Everything inside an ElevenLabs workspace — agents, phone numbers, WhatsApp lines and every call transcript — belongs to whoever holds the key. This organization needs its own."
+      >
+        <div className="flex flex-wrap items-center gap-3">
+          <span className={`text-[11px] px-2.5 py-1 rounded-lg font-bold border ${
+            dedicated
+              ? 'bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/20'
+              : 'bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-500/20'
+          }`}>
+            {dedicated ? 'OWN WORKSPACE' : 'NO KEY OF ITS OWN'}
+          </span>
+          {status?.fingerprint && (
+            <span className="text-xs text-slate-500 dark:text-slate-400">
+              API key <code className="font-mono text-slate-700 dark:text-slate-300">{status.fingerprint}</code>
+            </span>
+          )}
+          {dedicated && (
+            <span className="text-xs text-slate-500 dark:text-slate-400">
+              Webhook secret {status?.webhookSecretConfigured
+                ? <span className="text-emerald-700 dark:text-emerald-400 font-semibold">set</span>
+                : <span className="text-amber-700 dark:text-amber-400 font-semibold">not set</span>}
+            </span>
+          )}
+        </div>
+
+        {/* Verbatim. The server names the exact gap and the exact URL. */}
+        {(status?.warnings ?? []).map((w: string, i: number) => (
+          <div key={i} className="flex gap-2.5 p-4 rounded-xl bg-amber-500/[0.06] border border-amber-200 dark:border-amber-500/20">
+            <AlertTriangle className="w-4 h-4 text-amber-700 dark:text-amber-400 flex-shrink-0 mt-0.5" />
+            <p className="text-xs text-amber-700 dark:text-amber-300 leading-relaxed break-words">{w}</p>
+          </div>
+        ))}
+
+        {status?.webhookUrl && (
+          <div className="p-4 rounded-xl bg-blue-500/[0.06] border border-blue-200 dark:border-blue-500/20">
+            <p className="text-xs font-semibold text-blue-700 dark:text-blue-300 mb-1">
+              📌 Post-call webhook URL — paste this into your ElevenLabs workspace webhook settings
+            </p>
+            <p className="text-[11px] text-blue-700 dark:text-blue-400/80 mb-2">
+              This organization is in the path because the signature has to be checked before the body is read, so the delivery itself cannot say whose secret to use.
+            </p>
+            <div className="flex items-center gap-2">
+              <code className="flex-1 text-xs font-mono bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-200 px-3 py-2 rounded-lg truncate">{status.webhookUrl}</code>
+              <button
+                type="button"
+                onClick={async () => {
+                  const ok = await copyToClipboard(status.webhookUrl);
+                  showToast(ok ? 'Copied to clipboard!' : 'Failed to copy', ok ? 'success' : 'error');
+                }}
+                className="px-3 py-2 rounded-lg bg-blue-100 dark:bg-blue-500/20 text-blue-700 dark:text-blue-300 hover:bg-blue-500/30 transition-all font-semibold flex items-center gap-1.5 text-xs"
+              >
+                <Copy className="w-3.5 h-3.5" /> Copy
+              </button>
+            </div>
+          </div>
+        )}
+      </Section>
+
+      <Section
+        title="Workspace Credentials"
+        description="Both halves are needed: the API key to act in the workspace, and its own signing secret to verify the transcripts it sends back. Set either now and the other later — the status above says what is still missing."
+      >
+        {!canEdit ? (
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            Only an OWNER or ADMIN can change workspace credentials. You are signed in as {role || 'a member'}.
+          </p>
+        ) : (
+          <form onSubmit={save} className="space-y-4">
+            <div>
+              <label className={labelCls}>ElevenLabs API Key</label>
+              <div className="relative">
+                <input
+                  type={showSecrets ? 'text' : 'password'}
+                  value={apiKey}
+                  onChange={e => setApiKey(e.target.value)}
+                  className={`${inputCls} pr-12`}
+                  placeholder={status?.fingerprint ? `Replace the current key (${status.fingerprint})` : 'sk_...'}
+                  autoComplete="off"
+                />
+                <button type="button" onClick={() => setShowSecrets(!showSecrets)} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-300">
+                  {showSecrets ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mt-1.5">
+                From your own ElevenLabs workspace, under Profile → API Keys. Stored encrypted; it is never shown again after this.
+              </p>
+            </div>
+
+            <div>
+              <label className={labelCls}>Post-call Webhook Signing Secret</label>
+              <div className="relative">
+                <input
+                  type={showSecrets ? 'text' : 'password'}
+                  value={webhookSecret}
+                  onChange={e => setWebhookSecret(e.target.value)}
+                  className={`${inputCls} pr-12`}
+                  placeholder={status?.webhookSecretConfigured ? 'Replace the current secret' : 'wsec_...'}
+                  autoComplete="off"
+                />
+                <button type="button" onClick={() => setShowSecrets(!showSecrets)} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-300">
+                  {showSecrets ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mt-1.5">
+                From the same workspace's webhook settings. Without it, this organization's call transcripts arrive with a signature nothing can check — and an unverifiable delivery is rejected, so they are lost.
+              </p>
+            </div>
+
+            <div className="flex justify-end pt-1">
+              <button type="submit" disabled={saving} className="flex items-center gap-2 px-6 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-sm disabled:opacity-50 transition-all shadow-lg shadow-brand-600/20">
+                {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <KeyRound className="w-4 h-4" />}
+                {saving ? 'Saving...' : 'Save Credentials'}
+              </button>
+            </div>
+          </form>
+        )}
+      </Section>
+
+      <Section
+        title="How Calls Ended (last 24 hours)"
+        description="Why each call on this agent ended, as recorded by ElevenLabs. A rise in calls cut off by a timeout or an error means callers are being dropped."
+      >
+        <CallHealthPanel health={callHealth} error={callHealthError} />
+      </Section>
+
+      <Section
+        title="Agent Status"
+        description="What the agent your customers reach actually looks like, compared to this platform. Read-only — repairing drift silently would also destroy the evidence of how it happened."
+      >
+        {agentLoading ? (
+          <div className="py-6 text-center text-slate-500 dark:text-slate-400 text-sm flex items-center justify-center gap-2">
+            <Loader2 className="w-4 h-4 animate-spin text-blue-700 dark:text-blue-400" /> Checking the agent...
+          </div>
+        ) : agentError ? (
+          <div className="flex gap-2.5 p-4 rounded-xl bg-amber-500/[0.06] border border-amber-200 dark:border-amber-500/20">
+            <AlertTriangle className="w-4 h-4 text-amber-700 dark:text-amber-400 flex-shrink-0 mt-0.5" />
+            <p className="text-xs text-amber-700 dark:text-amber-300 leading-relaxed break-words">{agentError}</p>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            <div className="flex flex-wrap items-center gap-3 text-xs text-slate-600 dark:text-slate-400">
+              {agent?.agentId
+                ? <>Agent <code className="font-mono text-slate-700 dark:text-slate-300">{agent.agentId}</code></>
+                : <span>No agent has been provisioned yet.</span>}
+              {agent?.configured && (
+                <span>{agent.toolCount} of {agent.expectedToolCount} tools attached</span>
+              )}
+            </div>
+            {agent?.configured && <AssistantNameStatus agent={agent} />}
+            {(agent?.drift ?? []).length === 0 ? (
+              <p className="text-xs text-emerald-700 dark:text-emerald-400 flex items-center gap-1.5">
+                <CheckCircle2 className="w-3.5 h-3.5" /> The remote agent matches this platform.
+              </p>
+            ) : (
+              agent.drift.map((d: string, i: number) => (
+                <div key={i} className="flex gap-2.5 p-3 rounded-xl bg-amber-500/[0.06] border border-amber-200 dark:border-amber-500/20">
+                  <AlertTriangle className="w-4 h-4 text-amber-700 dark:text-amber-400 flex-shrink-0 mt-0.5" />
+                  <p className="text-xs text-amber-700 dark:text-amber-300 leading-relaxed break-words">{d}</p>
+                </div>
+              ))
+            )}
+            <p className="text-xs text-slate-500 dark:text-slate-400 pt-1">
+              Provisioning the agent, importing a phone number and attaching a WhatsApp line live on{' '}
+              <Link href="/agent-provisioning" className="text-blue-700 dark:text-blue-400 font-semibold hover:underline">
+                Agent Provisioning
+              </Link>
+              , not here — importing a number changes who answers your citizens, so it needs its own
+              confirmation rather than a button on a settings screen.
+            </p>
+          </div>
+        )}
+      </Section>
+    </div>
+  );
+}
+
+/**
+ * Which name the next caller will hear, read from the live agent itself, and
+ * what happened the last time this platform tried to change it. Callers kept
+ * hearing "Garba" with nothing on any screen to say whether the rotation was
+ * running, refused, or never triggered.
+ */
+function AssistantNameStatus({ agent }: { agent: any }) {
+  const last = agent.lastNameRotation;
+  const when = (iso: string) => {
+    try { return new Date(iso).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }); } catch { return iso; }
+  };
+  const trigger = (t: string) =>
+    t === 'sync' ? 'Sync configuration' : t === 'call-ended' ? 'the end of a call' : t === 'lookup' ? 'a caller lookup' : t;
+  return (
+    <div className="text-xs space-y-1">
+      <p className="text-slate-700 dark:text-slate-300">
+        Next caller will hear the assistant called{' '}
+        <strong>{agent.nextCallerName || 'unknown (could not be read from the agent)'}</strong>.
+      </p>
+      {last ? (
+        last.outcome === 'rotated' ? (
+          <p className="text-slate-500 dark:text-slate-400">
+            Last changed to {last.name} after {trigger(last.trigger)}, {when(last.at)}.
+          </p>
+        ) : (
+          <div className="flex gap-2.5 p-3 rounded-xl bg-red-500/[0.06] border border-red-200 dark:border-red-500/20">
+            <AlertTriangle className="w-4 h-4 text-red-700 dark:text-red-400 flex-shrink-0 mt-0.5" />
+            <p className="text-red-700 dark:text-red-300 leading-relaxed break-words">
+              The last name change ({trigger(last.trigger)}, {when(last.at)}) {last.outcome === 'refused' ? 'was refused by ElevenLabs' : 'failed'}: {last.detail || 'no detail given'}. Until this is fixed, every caller hears the same name.
+            </p>
+          </div>
+        )
+      ) : (
+        <p className="text-slate-500 dark:text-slate-400">No name change has been attempted since the server last started.</p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * How the agent's recent calls ended. "Could not read" is shown as that, never
+ * as an empty healthy panel: unknown is not the same as fine.
+ */
+function CallHealthPanel({ health, error }: { health: any; error: string | null }) {
+  if (error) {
+    return (
+      <div className="flex gap-2.5 p-4 rounded-xl bg-amber-500/[0.06] border border-amber-200 dark:border-amber-500/20">
+        <AlertTriangle className="w-4 h-4 text-amber-700 dark:text-amber-400 flex-shrink-0 mt-0.5" />
+        <p className="text-xs text-amber-700 dark:text-amber-300 leading-relaxed break-words">{error}</p>
+      </div>
+    );
+  }
+  if (!health) {
+    return (
+      <div className="py-4 text-center text-slate-500 dark:text-slate-400 text-sm flex items-center justify-center gap-2">
+        <Loader2 className="w-4 h-4 animate-spin text-blue-700 dark:text-blue-400" /> Checking recent calls...
+      </div>
+    );
+  }
+  if (health.total === 0) {
+    return <p className="text-xs text-slate-600 dark:text-slate-400">No calls ended in the last {health.windowHours} hours.</p>;
+  }
+  const pct = health.abnormalRate === null ? null : Math.round(health.abnormalRate * 100);
+  return (
+    <div className="space-y-3">
+      {health.alert ? (
+        <div role="alert" className="flex gap-2.5 p-3 rounded-xl bg-red-500/[0.06] border border-red-200 dark:border-red-500/20">
+          <AlertTriangle className="w-4 h-4 text-red-700 dark:text-red-400 flex-shrink-0 mt-0.5" />
+          <p className="text-xs text-red-700 dark:text-red-300 leading-relaxed">
+            {health.abnormal} of {health.total} calls ({pct}%) ended abnormally — cut off by a timeout or an error. Callers are being dropped. Check the reasons below and the Agent Status list.
+          </p>
+        </div>
+      ) : (
+        <p className="text-xs text-emerald-700 dark:text-emerald-400 flex items-center gap-1.5">
+          <CheckCircle2 className="w-3.5 h-3.5" /> {health.abnormal} of {health.total} calls ended abnormally ({pct}%).
+        </p>
+      )}
+      <ul className="space-y-1.5">
+        {health.reasons.map((r: any, i: number) => (
+          <li key={i} className="flex flex-wrap items-start justify-between gap-x-3 text-xs">
+            <span className={r.kind === 'abnormal' ? 'text-red-700 dark:text-red-300' : r.kind === 'unknown' ? 'text-amber-700 dark:text-amber-300' : 'text-slate-700 dark:text-slate-300'}>
+              {r.reason}
+              <span className="ml-1.5 text-slate-500 dark:text-slate-400">({r.kind === 'abnormal' ? 'abnormal' : r.kind === 'unknown' ? 'not recognised' : 'normal'})</span>
+            </span>
+            <span className="font-semibold text-slate-700 dark:text-slate-300 tabular-nums">{r.count}</span>
+            {r.kind !== 'normal' && (r.lastAt || r.calls?.length) ? (
+              <div className="basis-full text-[11px] text-slate-500 dark:text-slate-400 space-y-0.5 mt-0.5">
+                {r.lastAt && <p>Last: {new Date(r.lastAt).toLocaleString()}</p>}
+                {/* Open each in ElevenLabs → Agents → Call History to read why it ended this way. */}
+                {(r.calls ?? []).map((c: any) => (
+                  <p key={c.conversationId} className="font-mono">
+                    {c.at ? new Date(c.at).toLocaleString() : 'time unknown'} · {c.direction ?? 'direction unknown'}
+                    {c.durationSecs !== null && c.durationSecs !== undefined ? ` · ${c.durationSecs}s` : ''} · {c.conversationId}
+                  </p>
+                ))}
+              </div>
+            ) : null}
+          </li>
+        ))}
+      </ul>
+
+    </div>
+  );
+}
+
+// ─────────────────────── Activity Log Tab ───────────────────────
+
+/**
+ * Who changed what, in this agency.
+ *
+ * Until this existed the only reader of the audit table was the ministry's own
+ * console, so an agency could not find out who had promoted somebody, who had
+ * minted an API key, or — the part that matters most — what the ministry had
+ * done to the agency and why. A record that only the party with the most reach
+ * can read is not accountability.
+ *
+ * Two things the screen states rather than leaves to be inferred:
+ *
+ *   - WHETHER WE DID IT OR IT WAS DONE TO US. The server marks each entry
+ *     `agency` or `platform`. An operator scanning for "why were we suspended"
+ *     should not have to decode an action prefix to find it.
+ *   - THAT AN OUTSIDE ACTOR IS NOT NAMED. The ministry's officials are staff of
+ *     another tenancy, so the trail describes the role instead. Saying so is
+ *     better than letting somebody conclude the record is simply vague.
+ */
+function ActivityLogTab({ showToast }: any) {
+  const [entries, setEntries] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [forbidden, setForbidden] = useState(false);
+  const [origin, setOrigin] = useState<'all' | 'agency' | 'platform'>('all');
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setForbidden(false);
+    try {
+      const res = await api.organizations.getAudit({ limit: 200 });
+      setEntries(res.entries ?? []);
+    } catch (err: any) {
+      const msg = String(err?.message ?? err);
+      // A 403 is a legitimate answer for an AGENT or VIEWER, not a fault.
+      if (/permission|forbidden|403/i.test(msg)) setForbidden(true);
+      else showToast(msg || 'Could not read the activity log', 'error');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  if (forbidden) {
+    return (
+      <Section
+        title="Activity Log"
+        description="Who changed what in this agency, and what was done to it."
+      >
+        <p className="text-xs text-slate-500 dark:text-slate-400">
+          Only an OWNER or ADMIN can read the activity log. It names which colleague changed
+          somebody&rsquo;s role or deactivated an account, which is administrative information
+          rather than something needed to handle citizens.
+        </p>
+      </Section>
+    );
+  }
+
+  const shown = entries.filter(e => origin === 'all' || e.origin === origin);
+  const platformCount = entries.filter(e => e.origin === 'platform').length;
+
+  return (
+    <div className="space-y-5">
+      <Section
+        title="Activity Log"
+        description="Append-only. Nothing here can be edited or removed, including by this agency."
+      >
+        <div className="flex flex-wrap items-center gap-2">
+          {([
+            ['all', `Everything (${entries.length})`],
+            ['agency', `By this agency (${entries.length - platformCount})`],
+            ['platform', `By the ministry (${platformCount})`],
+          ] as const).map(([id, label]) => (
+            <button
+              key={id}
+              onClick={() => setOrigin(id)}
+              className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all ${
+                origin === id
+                  ? 'bg-brand-600 text-white border-brand-600'
+                  : 'border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+          <button
+            onClick={load}
+            disabled={loading}
+            className="ml-auto flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50"
+          >
+            {loading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Zap className="w-3.5 h-3.5" />}
+            Refresh
+          </button>
+        </div>
+
+        {platformCount > 0 && (
+          <div className="flex gap-2.5 p-4 rounded-xl bg-blue-500/[0.06] border border-blue-200 dark:border-blue-500/20">
+            <Landmark className="w-4 h-4 text-blue-700 dark:text-blue-400 flex-shrink-0 mt-0.5" />
+            <p className="text-xs text-blue-700 dark:text-blue-300 leading-relaxed">
+              {platformCount === 1 ? 'One entry was' : `${platformCount} entries were`} recorded by the
+              operating ministry rather than by this agency. Their officials are staff of another
+              organisation, so the log names the role and not the person — which official it was is a
+              question for the ministry.
+            </p>
+          </div>
+        )}
+
+        {loading && entries.length === 0 ? (
+          <div className="py-10 text-center text-xs text-slate-500 dark:text-slate-400 flex items-center justify-center gap-2">
+            <Loader2 className="w-4 h-4 animate-spin text-blue-700 dark:text-blue-400" /> Reading the log...
+          </div>
+        ) : shown.length === 0 ? (
+          <p className="py-10 text-center text-xs text-slate-500 dark:text-slate-400">
+            {entries.length === 0
+              ? 'Nothing has been recorded yet. Changes to team roles, account access and API keys appear here as they happen.'
+              : 'Nothing recorded in this category.'}
+          </p>
+        ) : (
+          <ul className="divide-y divide-slate-100 dark:divide-slate-800 rounded-xl border border-slate-200 dark:border-slate-800 overflow-hidden">
+            {shown.map(e => (
+              <li key={e.id} className="px-4 py-3 space-y-1">
+                <div className="flex flex-wrap items-baseline justify-between gap-2">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className={`text-[10px] px-2 py-0.5 rounded-lg font-bold border flex-shrink-0 ${
+                      e.origin === 'platform'
+                        ? 'bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 border-blue-200 dark:border-blue-500/20'
+                        : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-slate-700'
+                    }`}>
+                      {e.origin === 'platform' ? 'MINISTRY' : 'THIS AGENCY'}
+                    </span>
+                    <code className="text-xs font-mono font-semibold text-slate-900 dark:text-white truncate">
+                      {e.action}
+                    </code>
+                  </div>
+                  <span className="text-[10px] text-slate-500 dark:text-slate-400 flex-shrink-0">
+                    {new Date(e.createdAt).toLocaleString('en-NG')}
+                  </span>
+                </div>
+
+                <p className="text-[11px] text-slate-600 dark:text-slate-400">
+                  by <span className={e.actorIsOwnStaff ? 'font-semibold text-slate-800 dark:text-slate-200' : 'italic'}>{e.actor}</span>
+                  {' · '}{e.targetType}
+                </p>
+
+                {/* The shape of the change, both sides where there are two.
+                    A role change is unreadable without the value it replaced. */}
+                <ChangeSummary previous={e.previousValue} next={e.newValue} />
+              </li>
+            ))}
+          </ul>
+        )}
+      </Section>
+    </div>
+  );
+}
+
+/**
+ * Renders a change as the fields that moved.
+ *
+ * Deliberately not a JSON dump: these values are written by code, not by a
+ * person, so a reader wants "role: AGENT → ADMIN", not a brace-delimited blob
+ * they have to parse by eye.
+ */
+function ChangeSummary({ previous, next }: { previous: any; next: any }) {
+  const prev = previous && typeof previous === 'object' ? previous : null;
+  const now = next && typeof next === 'object' ? next : null;
+  if (!prev && !now) return null;
+
+  const keys = Array.from(new Set([...Object.keys(prev ?? {}), ...Object.keys(now ?? {})]));
+  if (keys.length === 0) return null;
+
+  const show = (v: any) => (v === null || v === undefined ? '—' : typeof v === 'object' ? JSON.stringify(v) : String(v));
+
+  return (
+    <dl className="flex flex-wrap gap-x-4 gap-y-1 pt-0.5">
+      {keys.map(k => {
+        const before = prev?.[k];
+        const after = now?.[k];
+        const changed = prev && now && show(before) !== show(after);
+        return (
+          <div key={k} className="text-[11px]">
+            <dt className="inline text-slate-500 dark:text-slate-400">{k}: </dt>
+            <dd className="inline text-slate-700 dark:text-slate-300 font-mono">
+              {changed ? <>{show(before)} <span className="text-slate-500 dark:text-slate-400">&rarr;</span> {show(after)}</> : show(after ?? before)}
+            </dd>
+          </div>
+        );
+      })}
+    </dl>
+  );
+}
+
+// ─────────────────────── Team & RBAC Tab ───────────────────────
+function TeamTab({ org, authHeaders, showToast, onSaved }: any) {
+  const [showForm, setShowForm] = useState(false);
+  const [email, setEmail] = useState('');
+  const [fullName, setFullName] = useState('');
+  const [role, setRole] = useState('AGENT');
+  const [saving, setSaving] = useState(false);
+  const [members, setMembers] = useState<any[]>(org?.users || []);
+  const [matrix, setMatrix] = useState<any[]>([]);
+  const [loadingMembers, setLoadingMembers] = useState(false);
+
+  const fetchTeamAndMatrix = useCallback(async () => {
+    setLoadingMembers(true);
+    try {
+      const [mRes, pRes] = await Promise.all([
+        api.organizations.getTeamMembers(),
+        api.organizations.getPermissionsMatrix(),
+      ]);
+      if (mRes) setMembers(mRes);
+      if (pRes) setMatrix(pRes);
+    } catch (err: any) {
+      // An empty team list reads as "this agency has one member", which is a
+      // different and much less alarming statement than "we could not ask".
+      showToast(err?.message || 'Could not load the team list.', 'error');
+    }
+    finally { setLoadingMembers(false); }
+  }, []);
+
+  useEffect(() => {
+    fetchTeamAndMatrix();
+  }, [fetchTeamAndMatrix]);
+
+  const addMember = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSaving(true);
+    try {
+      await api.organizations.addTeamMember({ email, fullName, role });
+      showToast('Team member invited successfully!');
+      setShowForm(false); setEmail(''); setFullName('');
+      fetchTeamAndMatrix();
+    } catch (err: any) { showToast(err.message || 'Failed to invite', 'error'); }
+    finally { setSaving(false); }
+  };
+
+  const handleRoleChange = async (userId: string, newRole: string) => {
+    try {
+      await api.organizations.updateMemberRole(userId, newRole);
+      showToast(`User role updated to ${newRole}`);
+      fetchTeamAndMatrix();
+    } catch (err: any) {
+      showToast(err.message || 'Failed to update role', 'error');
+    }
+  };
+
+  // MDA liaison scope (PRD §15): a liaison sees only cases referred to their MDA.
+  const handleMdaScope = async (userId: string, current: string | null, name: string) => {
+    const next = window.prompt(
+      `Make ${name} the liaison for one MDA? They will then see only cases referred to it.\n` +
+        'Enter the MDA name exactly as you refer cases to it, or leave empty to remove the scope.',
+      current ?? '',
+    );
+    if (next === null) return;
+    try {
+      await api.organizations.setMemberMda(userId, next.trim() || null);
+      showToast(next.trim() ? `${name} is now the liaison for ${next.trim()}` : `${name} is no longer scoped to an MDA`);
+      fetchTeamAndMatrix();
+    } catch (err: any) {
+      showToast(err.message || 'Failed to update the MDA scope', 'error');
+    }
+  };
+
+  const handleStatusToggle = async (userId: string, currentStatus: boolean) => {
+    try {
+      await api.organizations.updateMemberStatus(userId, !currentStatus);
+      showToast(`User ${!currentStatus ? 'reactivated' : 'suspended'}`);
+      fetchTeamAndMatrix();
+    } catch (err: any) {
+      showToast(err.message || 'Failed to update status', 'error');
+    }
+  };
+
+  const handleRemoveMember = async (userId: string, memberName: string) => {
+    if (!window.confirm(`Are you sure you want to remove ${memberName} from this organization?`)) return;
+    try {
+      await api.organizations.removeTeamMember(userId);
+      showToast('Team member removed');
+      fetchTeamAndMatrix();
+    } catch (err: any) {
+      showToast(err.message || 'Failed to remove member', 'error');
+    }
+  };
+
+  const roleColors: Record<string, string> = {
+    OWNER: 'bg-purple-50 dark:bg-purple-500/10 text-purple-700 dark:text-purple-400 border-purple-200 dark:border-purple-500/20',
+    ADMIN: 'bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 border-blue-200 dark:border-blue-500/20',
+    AGENT: 'bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/20',
+    VIEWER: 'bg-slate-100 dark:bg-slate-500/10 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-500/20',
+  };
+
+  return (
+    <div className="space-y-6">
+      <Section title="Team Members & Role Access Control (RBAC)" description="Manage member access levels, roles, and granular platform permissions">
+        {loadingMembers ? (
+          <div className="py-8 text-center text-slate-500 dark:text-slate-400 text-sm flex items-center justify-center gap-2">
+            <Loader2 className="w-4 h-4 animate-spin text-blue-700 dark:text-blue-400" /> Loading team members...
+          </div>
+        ) : members.length === 0 ? (
+          <div className="py-8 text-center text-slate-500 dark:text-slate-400 text-sm">No team members yet. Invite your first agent below.</div>
+        ) : (
+          <div className="space-y-3">
+            {members.map((m: any) => (
+              <div key={m.id} className="flex flex-col md:flex-row md:items-center justify-between p-4 rounded-xl bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 shadow-sm hover:bg-slate-50 dark:hover:bg-slate-800/60 transition-all gap-4">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-full bg-gradient-to-br from-blue-500 to-indigo-600 text-slate-900 dark:text-white font-bold text-sm flex items-center justify-center flex-shrink-0">
+                    {(m.fullName || m.email || 'U')[0].toUpperCase()}
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <p className="text-sm font-semibold text-slate-800 dark:text-slate-200">{m.fullName || 'Team Member'}</p>
+                      <span className={`text-[10px] px-2 py-0.5 rounded font-bold ${m.isActive !== false ? 'bg-emerald-100 dark:bg-emerald-500/20 text-emerald-700 dark:text-emerald-400' : 'bg-red-100 dark:bg-red-500/20 text-red-700 dark:text-red-400'}`}>
+                        {m.isActive !== false ? 'ACTIVE' : 'SUSPENDED'}
+                      </span>
+                    </div>
+                    <p className="text-xs text-slate-500 dark:text-slate-400">{m.email}</p>
+                    {m.mdaName && <p className="text-[11px] text-slate-600 dark:text-slate-300">Liaison for {m.mdaName}</p>}
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-3">
+                  {m.role !== 'OWNER' && m.role !== 'ADMIN' && (
+                    <button
+                      onClick={() => handleMdaScope(m.id, m.mdaName ?? null, m.fullName || m.email)}
+                      className="text-xs px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 font-semibold text-slate-700 dark:text-slate-200"
+                    >
+                      {m.mdaName ? 'Change MDA' : 'MDA liaison…'}
+                    </button>
+                  )}
+                  {/* Role Selector */}
+                  <select
+                    value={m.role}
+                    onChange={e => handleRoleChange(m.id, e.target.value)}
+                    className="px-3 py-1.5 rounded-lg bg-white dark:bg-slate-900 border border-white/[0.1] text-xs font-semibold text-slate-800 dark:text-slate-200 focus:outline-none cursor-pointer"
+                  >
+                    <option value="OWNER">OWNER</option>
+                    <option value="ADMIN">ADMIN</option>
+                    <option value="AGENT">AGENT</option>
+                    <option value="VIEWER">VIEWER</option>
+                  </select>
+
+                  {/* Status Toggle */}
+                  <button
+                    onClick={() => handleStatusToggle(m.id, m.isActive !== false)}
+                    className={`text-xs px-2.5 py-1.5 rounded-lg border font-semibold transition-all ${
+                      m.isActive !== false
+                        ? 'border-yellow-500/30 text-yellow-600 dark:text-yellow-400 hover:bg-yellow-50 dark:bg-yellow-500/10'
+                        : 'border-emerald-200 dark:border-emerald-500/30 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-50 dark:bg-emerald-500/10'
+                    }`}
+                  >
+                    {m.isActive !== false ? 'Suspend' : 'Reactivate'}
+                  </button>
+
+                  {/* Delete Button */}
+                  <button
+                    onClick={() => handleRemoveMember(m.id, m.fullName || m.email)}
+                    className="text-xs px-2.5 py-1.5 rounded-lg border border-red-200 dark:border-red-500/30 text-red-700 dark:text-red-400 hover:bg-red-50 dark:bg-red-500/10 font-semibold transition-all"
+                  >
+                    Remove
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </Section>
+
+      {/* Invite Member Form */}
+      {showForm ? (
+        <Section title="Invite Team Member">
+          <form onSubmit={addMember} className="space-y-4">
+            <div>
+              <label className={labelCls}>Full Name</label>
+              <input required type="text" value={fullName} onChange={e => setFullName(e.target.value)} className={inputCls} placeholder="e.g. Chidi Okeke" />
+            </div>
+            <div>
+              <label className={labelCls}>Email Address</label>
+              <input required type="email" value={email} onChange={e => setEmail(e.target.value)} className={inputCls} placeholder="agent@yourcompany.com" />
+            </div>
+            <div>
+              <label className={labelCls}>Role</label>
+              <select value={role} onChange={e => setRole(e.target.value)} className={selectCls}>
+                {['ADMIN', 'AGENT', 'VIEWER'].map(r => <option key={r} value={r}>{r}</option>)}
+              </select>
+            </div>
+            <div className="flex gap-3">
+              <button type="submit" disabled={saving} className="flex-1 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-sm disabled:opacity-50 transition-all flex items-center justify-center gap-2">
+                {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
+                {saving ? 'Inviting...' : 'Send Invite'}
+              </button>
+              <button type="button" onClick={() => setShowForm(false)} className="px-4 py-2.5 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-400 hover:text-slate-800 dark:text-slate-200 text-sm transition-all">
+                Cancel
+              </button>
+            </div>
+          </form>
+        </Section>
+      ) : (
+        <button
+          onClick={() => setShowForm(true)}
+          className="w-full py-3 rounded-xl border border-dashed border-white/[0.10] text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:text-slate-300 hover:border-slate-200 dark:border-slate-700 text-sm font-medium flex items-center justify-center gap-2 transition-all"
+        >
+          <Plus className="w-4 h-4" /> Invite New Team Member
+        </button>
+      )}
+
+      {/* Role & Access Permission Matrix Grid Table */}
+      <Section title="Role Access Permission Matrix" description="System access levels assigned per user role">
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs text-left">
+            <thead className="bg-slate-50 dark:bg-slate-800/60 text-slate-600 dark:text-slate-400 uppercase tracking-wider font-semibold border-b border-slate-200 dark:border-slate-800">
+              <tr>
+                <th className="px-4 py-3">Platform Module</th>
+                <th className="px-4 py-3 text-purple-700 dark:text-purple-400">OWNER</th>
+                <th className="px-4 py-3 text-blue-700 dark:text-blue-400">ADMIN</th>
+                <th className="px-4 py-3 text-emerald-700 dark:text-emerald-400">AGENT</th>
+                <th className="px-4 py-3 text-slate-600 dark:text-slate-400">VIEWER</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-white/[0.04] text-slate-700 dark:text-slate-300">
+              {matrix.map((row: any, i: number) => (
+                <tr key={i} className="hover:bg-white dark:bg-slate-900/80 transition-colors">
+                  <td className="px-4 py-3 font-medium text-slate-900 dark:text-white">{row.module}</td>
+                  <td className="px-4 py-3 font-semibold text-purple-700 dark:text-purple-300">{row.OWNER}</td>
+                  <td className="px-4 py-3 font-semibold text-blue-700 dark:text-blue-300">{row.ADMIN}</td>
+                  <td className="px-4 py-3 font-semibold text-emerald-700 dark:text-emerald-300">{row.AGENT}</td>
+                  <td className="px-4 py-3 font-semibold text-slate-600 dark:text-slate-400">{row.VIEWER}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Section>
+    </div>
+  );
+}
+

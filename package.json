@@ -1,0 +1,55 @@
+{
+  "name": "ace-platform",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Customer Care Agent \u2014 AI-Powered Customer Experience for Nigerian Businesses and Government MDAs",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "setup": "./scripts/dev-setup.sh",
+    "build": "npx turbo run build",
+    "dev": "npx turbo run dev",
+    "start": "npx turbo run start",
+    "lint": "npx turbo run lint",
+    "test": "npx turbo run test && npm run test:packages",
+    "db:generate": "npm run --prefix packages/database generate",
+    "db:push": "npm run --prefix packages/database push",
+    "db:seed:gatekipa": "npm run --prefix packages/database seed:gatekipa",
+    "check:deployment": "node scripts/check-deployment.js",
+    "agent:sync": "node scripts/sync-deployed-agent.js",
+    "demo:readiness": "node scripts/demo-readiness.js",
+    "verify": "./scripts/verify-all.sh",
+    "db:studio": "npm run --prefix packages/database studio",
+    "test:packages": "npx jest --config jest.packages.config.js",
+    "typecheck": "npx tsc -p apps/api/tsconfig.json --noEmit && npx tsc -p apps/web/tsconfig.json --noEmit",
+    "certify": "node scripts/certify-mvp.js",
+    "secrets:encrypt": "node scripts/encrypt-secrets.js",
+    "storage:buckets": "node scripts/ensure-storage-buckets.js",
+    "contacts:dedupe": "node scripts/merge-duplicate-contacts.js",
+    "retention:apply": "node scripts/apply-retention.js",
+    "selfie:reissue": "node scripts/reissue-selfie-links.js",
+    "translations:export": "node scripts/export-translations.js",
+    "translations:import": "node scripts/import-translations.js",
+    "parity": "node scripts/agent-parity.js",
+    "platform:grant": "node scripts/grant-platform-admin.js",
+    "models:drop-dead": "node scripts/drop-dead-models.js",
+    "user:password": "node scripts/set-user-password.js",
+    "agencies:seed": "node scripts/seed-agencies.js",
+    "catalogue:seed": "node scripts/seed-service-catalogue.js",
+    "db:sync-enums": "node scripts/sync-enum-values.js",
+    "mdas:seed": "node scripts/seed-gombe-mdas.js",
+    "faqs:seed": "node scripts/seed-state-faqs.js",
+    "leadership:apply": "node scripts/apply-verified-leadership.js"
+  },
+  "dependencies": {
+    "turbo": "^2.4.0",
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=9.0.0"
+  },
+  "packageManager": "npm@10.8.2"
+}

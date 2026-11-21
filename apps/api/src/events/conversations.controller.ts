@@ -1,0 +1,291 @@
+import {
+  BadRequestException,
+  Body,
+  Controller,
+  Get,
+  NotFoundException,
+  Param,
+  Patch,
+  Post,
+  Query,
+  Req,
+  UseGuards,
+} from '@nestjs/common';
+import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { AuthUser, MessageSender } from '@ace/shared-types';
+import { prisma } from '@ace/database';
+import { WITHHELD_TEXT, callWithholding, isTranscriptTurnWithheld } from '../common/case-visibility';
+import { describeConversationFlow } from '@ace/orchestrator';
+import { WhatsappService } from '../whatsapp/whatsapp.service';
+import { AgentConsoleGateway } from './agent-console.gateway';
+import { RolesGuard } from '../common/guards/roles.guard';
+import { Roles } from '../common/decorators/roles.decorator';
+import { AceLogger } from '../config/logger';
+import { WebhookDispatcherService } from '../webhooks/webhook-dispatcher.service';
+
+const log = new AceLogger('ConversationsController');
+
+const MESSAGE_PAGE_SIZE = 200;
+
+/**
+ * Live conversations, across every channel.
+ *
+ * ── This is now the ONLY handoff implementation ─────────────────────────────
+ *
+ * `POST /api/whatsapp/conversations/:id/handoff` did the same write and has
+ * been removed. They were not equivalent: this one calls
+ * `gateway.notifyHandoffChanged`, and the WhatsApp one did not — so when an
+ * officer took a thread over from the console (which called the WhatsApp
+ * route), no other console heard about it, and two officers could each believe
+ * they owned the citizen. The agent-console even carried a comment saying the
+ * WhatsApp route was needed because it "updates assignedUserId + handoff flag",
+ * which this route has always done.
+ *
+ * Handoff is not channel-specific — a VOICE or WEBCHAT conversation can be
+ * handed to a person too — so the channel-agnostic route is the one that
+ * survives.
+ *
+ * ── Authorization ──────────────────────────────────────────────────────────
+ *
+ * Reading is open to every member. WRITING is not: sending a message speaks to
+ * a citizen as the agency, and seizing a thread stops the AI replying to them,
+ * so a VIEWER doing either is an outage for that citizen with nobody handling
+ * it. AGENT is included because this is exactly the front desk's job.
+ *
+ * `RolesGuard` must be listed after `JwtAuthGuard` — it is not global, and
+ * `@Roles` without it is metadata nothing reads.
+ */
+@Controller('api/conversations')
+@UseGuards(JwtAuthGuard, RolesGuard)
+export class ConversationsController {
+  constructor(
+    private readonly whatsappService: WhatsappService,
+    private readonly gateway: AgentConsoleGateway,
+    private readonly webhookDispatcher: WebhookDispatcherService
+  ) {}
+
+  /**
+   * GET /api/conversations
+   * Returns conversations for the caller's organization, most recently active first.
+   */
+  @Get()
+  async getConversations(@Req() req: { user: AuthUser }) {
+    const withheld = await callWithholding(req.user);
+    const rows = await prisma.conversation.findMany({
+      where: { organizationId: req.user.organizationId },
+      include: {
+        contact: {
+          select: { id: true, fullName: true, phoneNumber: true, email: true },
+        },
+        messages: {
+          orderBy: { sentAt: 'desc' },
+          take: 1,
+          select: { content: true, sender: true, sentAt: true, externalId: true },
+        },
+      },
+      // lastMessageAt is what the UI sorts and displays; updatedAt also moves for
+      // unrelated edits such as a handoff toggle, which reshuffled the inbox for no
+      // visible reason.
+      orderBy: { lastMessageAt: 'desc' },
+      take: 100,
+    });
+    // A call's transcript is mirrored here as a VOICE thread; a confidential
+    // report's call reads as withheld, as it does on the call list.
+    return rows.map((c) => ({
+      ...c,
+      messages: c.messages.map(({ externalId, ...m }) =>
+        isTranscriptTurnWithheld(withheld, c.channel, externalId) ? { ...m, content: WITHHELD_TEXT } : m
+      ),
+    }));
+  }
+
+  /**
+   * GET /api/conversations/:id/messages
+   */
+  @Get(':id/messages')
+  async getMessages(
+    @Req() req: { user: AuthUser },
+    @Param('id') id: string,
+    @Query('before') before?: string
+  ) {
+    const conv = await this.requireConversation(id, req.user.organizationId);
+
+    // The LAST page, not the first (invariant 5). This queried asc + take, so a
+    // thread longer than the page size showed only its BEGINNING — an operator
+    // opening a 250-message conversation saw messages 1..200, and everything the
+    // customer said recently was unreachable from the dashboard. The page size
+    // being 200 is what kept this invisible: short threads fit, so the ordering
+    // never mattered until a thread grew past it.
+    //
+    // Query desc to take the newest N, then reverse so the client still renders
+    // oldest→newest. The `before` cursor composes correctly with desc too:
+    // "the newest N older than this" is backward pagination, which is what a
+    // scroll-up-for-history UI wants. With asc it meant "the OLDEST N older
+    // than this" — forward pagination from the start of time.
+    const page = await prisma.message.findMany({
+      where: {
+        conversationId: conv.id,
+        ...(before ? { sentAt: { lt: new Date(before) } } : {}),
+      },
+      orderBy: { sentAt: 'desc' },
+      take: MESSAGE_PAGE_SIZE,
+    });
+    const withheld = conv.channel === 'VOICE' ? await callWithholding(req.user) : null;
+    return page
+      .reverse()
+      .map((m) =>
+        withheld && isTranscriptTurnWithheld(withheld, conv.channel, m.externalId)
+          ? { ...m, content: WITHHELD_TEXT, mediaUrl: null, metadata: null }
+          : m
+      );
+  }
+
+  /**
+   * GET /api/conversations/:id/flow
+   *
+   * What the customer is part-way through, for the operator taking over.
+   *
+   * Asking for a person always beats a flow — that is what stops a form being
+   * a trap — but the state it interrupts lived only inside the orchestrator.
+   * A citizen six answers into a registration form who asked for help was
+   * handed to somebody who could see the message thread and nothing else, so
+   * they were asked their name, age, address and LGA a second time.
+   *
+   * Returns null rather than 404 when there is no flow: "this customer is not
+   * filling anything in" is a normal answer to this question, and the caller
+   * renders nothing.
+   */
+  @Get(':id/flow')
+  async getFlow(@Req() req: { user: AuthUser }, @Param('id') id: string) {
+    const conv = await this.requireConversation(id, req.user.organizationId);
+    return describeConversationFlow(conv.flowState);
+  }
+
+  /**
+   * POST /api/conversations/:id/messages
+   * A human agent replies in a conversation.
+   *
+   * This previously wrote a Message row and returned it — and stopped there. The
+   * customer never received anything: nothing was ever handed to the WhatsApp Cloud
+   * API. Agents saw their reply in the transcript and reasonably assumed it had been
+   * delivered. Delivery is now attempted on the conversation's own channel, and a
+   * failure is reported rather than persisted as a phantom "sent" message.
+   */
+  @Roles('OWNER', 'ADMIN', 'AGENT')
+  @Post(':id/messages')
+  async sendMessage(
+    @Req() req: { user: AuthUser },
+    @Param('id') id: string,
+    @Body() body: { content: string }
+  ) {
+    const content = body?.content?.trim();
+    if (!content) throw new BadRequestException('Message content cannot be empty');
+
+    const conv = await this.requireConversation(id, req.user.organizationId);
+
+    if (conv.channel === 'WHATSAPP') {
+      // Delegates to WhatsappService, which sends over the Cloud API first and only
+      // persists the message once Meta has accepted it.
+      const message = await this.whatsappService.sendAgentMessage(
+        conv.id,
+        content,
+        req.user.userId,
+        req.user.organizationId
+      );
+      this.gateway.notifyNewMessage(req.user.organizationId, { conversationId: conv.id, message });
+      return message;
+    }
+
+    // WEBCHAT threads are historical — that channel was retired — and the
+    // remaining channels here have no push path, so persisting the message *is*
+    // delivery for them.
+    const message = await prisma.message.create({
+      data: {
+        conversationId: conv.id,
+        content,
+        sender: MessageSender.HUMAN_AGENT,
+        metadata: { sentByAgentId: req.user.userId },
+      },
+    });
+
+    await prisma.conversation.update({
+      where: { id: conv.id },
+      data: {
+        lastMessageAt: new Date(),
+        isHumanHandoffActive: true,
+        assignedUserId: req.user.userId,
+      },
+    });
+
+    // Replying IS a takeover. Only the transition is the event — this write
+    // sets the flag on every message, and a webhook per message is noise.
+    if (!conv.isHumanHandoffActive) {
+      this.webhookDispatcher
+        .handoverRequested(req.user.organizationId, conv.id, 'OFFICER')
+        .catch(() => {});
+    }
+
+    this.gateway.notifyNewMessage(req.user.organizationId, { conversationId: conv.id, message });
+
+    if (conv.channel !== 'WEBCHAT') {
+      log.warn('agent_reply_channel_not_deliverable', {
+        conversationId: conv.id,
+        channel: conv.channel,
+        organizationId: req.user.organizationId,
+      });
+    }
+
+    return message;
+  }
+
+  /**
+   * PATCH /api/conversations/:id/handoff
+   * Toggles human handoff for the conversation.
+   */
+  @Roles('OWNER', 'ADMIN', 'AGENT')
+  @Patch(':id/handoff')
+  async toggleHandoff(
+    @Req() req: { user: AuthUser },
+    @Param('id') id: string,
+    @Body() body: { handoff: boolean }
+  ) {
+    if (typeof body?.handoff !== 'boolean') {
+      throw new BadRequestException('handoff must be a boolean');
+    }
+
+    const conv = await this.requireConversation(id, req.user.organizationId);
+
+    const updated = await prisma.conversation.update({
+      where: { id: conv.id },
+      data: {
+        isHumanHandoffActive: body.handoff,
+        assignedUserId: body.handoff ? req.user.userId : null,
+        handoffReason: body.handoff ? undefined : null,
+      },
+    });
+
+    this.gateway.notifyHandoffChanged(req.user.organizationId, updated);
+
+    // Only a handover being REQUESTED is an event. Releasing one back to the
+    // assistant has no name in the catalogue, and inventing a payload that said
+    // "requested" for a release would be worse than sending nothing.
+    if (body.handoff && !conv.isHumanHandoffActive) {
+      this.webhookDispatcher
+        .handoverRequested(req.user.organizationId, conv.id, 'OFFICER')
+        .catch(() => {});
+    }
+
+    return updated;
+  }
+
+  /**
+   * Every handler goes through this: an id alone is not authority to read or write a
+   * conversation. Missing rows raise 404 rather than the bare `throw new Error(...)`
+   * these handlers used to do, which surfaced as an opaque 500.
+   */
+  private async requireConversation(id: string, organizationId: string) {
+    const conv = await prisma.conversation.findFirst({ where: { id, organizationId } });
+    if (!conv) throw new NotFoundException('Conversation not found');
+    return conv;
+  }
+}

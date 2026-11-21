@@ -1,0 +1,518 @@
+/**
+ * ElevenLabs Agents contracts, taken from the SDK's own type definitions
+ * (@elevenlabs/elevenlabs-js@2.64.0), which are generated from their OpenAPI
+ * spec. The published docs site is not reachable from every environment; these
+ * types are, and they cannot drift from the API the way prose can.
+ *
+ * This module exists so A2 (agent create/update) builds against verified
+ * shapes rather than plausible-looking ones. Everything below was read out of
+ * the SDK, not inferred.
+ *
+ * ── Four findings, two of which correct code already shipped ────────────────
+ *
+ * 1. `prompt.tools` IS DEPRECATED — the SDK says outright: "A list of tools
+ *    that the agent can use over the course of the conversation, use tool_ids
+ *    instead". Tools are first-class resources now: create each one, keep its
+ *    id, and reference the ids from the agent. scripts/generate-agent-config.js
+ *    emits the deprecated inline shape and needs migrating.
+ *
+ * 2. THE AGENT DOES NOT KNOW WHAT DAY IT IS unless `prompt.timezone` is set.
+ *    Verbatim from the SDK: "without this, the agent has no knowledge of the
+ *    current date/time ... which can lead to incorrect or hallucinated time
+ *    references." Our book-appointment tool asks the model to turn "next
+ *    Tuesday" into an ISO timestamp. Unset, that is a hallucinated date
+ *    written into a real calendar — a booking on the wrong day that looks
+ *    entirely normal in the transcript. Organizations already carry a
+ *    `timezone`; it must be passed through.
+ *
+ * 3. THE SDK IS camelCase. It converts to the wire's snake_case itself, so
+ *    `dynamicVariable` here becomes `dynamic_variable` on the wire. Code that
+ *    hand-writes snake_case and passes it to the SDK silently drops those
+ *    fields — including the phone-number binding that is the whole safety
+ *    property. Use the SDK's casing everywhere and let it do the conversion.
+ *
+ * 4. `responseTimeoutSecs` must be between 5 and 300 inclusive.
+ */
+import type { ElevenLabs } from '@elevenlabs/elevenlabs-js';
+
+/**
+ * How a tool parameter gets its value. Exactly one of these may be set — the
+ * API rejects more than one, and the difference between the first two is the
+ * difference between the platform supplying the caller's phone number and the
+ * model guessing at it.
+ */
+export type ParameterSource =
+  | { description: string } // the LLM fills it in from the conversation
+  | { dynamicVariable: string } // the platform injects it
+  | { constantValue: string | number | boolean }
+  | { isSystemProvided: true }
+  | { isOmitted: true };
+
+/** A parameter in a webhook tool's request body. */
+export type ToolParameter = ElevenLabs.LiteralJsonSchemaProperty;
+
+/**
+ * Bind a parameter to a dynamic variable, so the platform supplies it.
+ *
+ * Use this for anything that identifies a customer. A model-supplied phone
+ * number means cancel-booking can cancel a stranger's appointment, and nothing
+ * in the transcript would look wrong.
+ */
+export const boundTo = (dynamicVariable: string): ToolParameter => ({
+  type: 'string',
+  dynamicVariable,
+});
+
+/** A parameter the model fills in from what the customer actually said. */
+export const askedOf = (
+  type: ElevenLabs.LiteralJsonSchemaPropertyType,
+  description: string
+): ToolParameter => ({ type, description });
+
+/**
+ * A header value on a webhook tool. It may be a literal string, or a reference
+ * to a workspace secret.
+ *
+ * Prefer the secret reference for anything credential-shaped. A literal is
+ * stored in the tool definition and shown in the ElevenLabs dashboard to
+ * everyone with workspace access; a secret reference is resolved at call time
+ * and can be rotated without touching a single tool.
+ */
+export type HeaderValue =
+  | string
+  | ElevenLabs.ConvAiSecretLocator
+  | ElevenLabs.ConvAiDynamicVariable
+  | ElevenLabs.ConvAiEnvVarLocator;
+
+/** Reference a workspace secret (`conversationalAi.secrets`) by id. */
+export const fromSecret = (secretId: string): ElevenLabs.ConvAiSecretLocator => ({ secretId });
+
+export interface WebhookToolSpec {
+  name: string;
+  description: string;
+  url: string;
+  headers: Record<string, HeaderValue>;
+  parameters: Record<string, ToolParameter>;
+  required?: string[];
+  /** 5–300 inclusive. */
+  timeoutSecs?: number;
+}
+
+/**
+ * Build the request for `conversationalAi.tools.create`.
+ *
+ * Returns one tool. The agent is then created with the resulting ids in
+ * `prompt.toolIds` — see finding 1.
+ */
+export function webhookTool(spec: WebhookToolSpec): ElevenLabs.ToolRequestModel {
+  const timeout = spec.timeoutSecs ?? 25;
+  if (timeout < 5 || timeout > 300) {
+    throw new Error(`responseTimeoutSecs must be between 5 and 300, got ${timeout}`);
+  }
+
+  return {
+    toolConfig: {
+      type: 'webhook',
+      name: spec.name,
+      description: spec.description,
+      responseTimeoutSecs: timeout,
+      apiSchema: {
+        url: spec.url,
+        method: 'POST',
+        requestHeaders: spec.headers,
+        requestBodySchema: {
+          type: 'object',
+          properties: spec.parameters,
+          required: spec.required ?? [],
+        },
+      },
+    },
+  };
+}
+
+export interface AgentSpec {
+  name: string;
+  firstMessage: string;
+  systemPrompt: string;
+  /** Tool ids from `tools.create` — NOT inline definitions. See finding 1. */
+  toolIds: string[];
+  /**
+   * IANA timezone, e.g. "Africa/Lagos". Required in practice: without it the
+   * agent cannot resolve "next Tuesday" and will invent a date. See finding 2.
+   */
+  timezone: string;
+  language?: string;
+  voiceId?: string;
+  llm?: ElevenLabs.PromptAgentApiModelInput['llm'];
+  maxDurationSeconds?: number;
+  /**
+   * Pronunciation dictionary locators to attach to the TTS engine.
+   * Each entry ties a specific dictionary version to this agent so custom
+   * phoneme rules for an agency's own name survive every sync.
+   */
+  pronunciationDictionaryLocators?: Array<{ pronunciationDictionaryId: string; versionId: string }>;
+  /**
+   * Send an EMPTY `prompt.tools` alongside the tool ids.
+   *
+   * `prompt.tools` is deprecated and this platform never writes definitions
+   * into it — but an agent provisioned before that still carries them, and the
+   * remote update MERGES, so the array survived every sync. The remedy used to
+   * be a dashboard errand.
+   *
+   * An empty array is not "both kinds of tools": it is an instruction to
+   * remove the inline ones, which is why `agentDefinition` allows this
+   * combination and no other. Whether the workspace honours it is not assumed
+   * — the caller re-reads the agent and reports what is actually there.
+   */
+  clearInlineTools?: boolean;
+  /**
+   * Defaults for every `{{variable}}` the prompt or first message uses.
+   *
+   * REQUIRED IN PRACTICE for inbound calls. Outbound calls and the browser SDK
+   * pass dynamic variables per conversation; an inbound SIP or Twilio call
+   * passes NONE. An agent whose prompt names `{{organization_name}}` with no
+   * placeholder answered every toll-free call, transcribed the caller, and
+   * then said nothing at all: no greeting, no LLM call, zero TTS characters.
+   */
+  dynamicVariablePlaceholders?: Record<string, string>;
+  /**
+   * Where ElevenLabs asks, as each call connects, who is calling.
+   *
+   * Set per AGENT (`platformSettings.workspaceOverrides`), not on the
+   * workspace, because each agency's agent must reach its own tenant's
+   * records. ElevenLabs runs it for inbound Twilio and SIP-trunk calls, and for
+   * outbound calls that send no initiation data of their own.
+   *
+   * Turning it on also allows the reply to override the first message and the
+   * language, which is how a returning caller is greeted by name — and which
+   * the outbound path already sends, so it is enabled for both.
+   *
+   * ElevenLabs' documentation is blunt that a failed or timed-out webhook can
+   * stop the conversation starting. The endpoint is built never to fail; see
+   * `AgentToolsService.conversationStart`.
+   */
+  initiationWebhook?: {
+    /**
+     * Whether ElevenLabs asks the webhook as each call connects. false keeps
+     * the URL registered but switched OFF: on the live Gombe line every call
+     * was refused with "all circuits are busy" while it was on, twice, so it
+     * is opt-in until a call proves it.
+     */
+    enabled?: boolean;
+    url: string;
+    /** A literal or a workspace secret — the only two kinds this header takes. */
+    authorization: string | ElevenLabs.ConvAiSecretLocator;
+  };
+}
+
+/** The text-to-speech model: English, because the phone agent speaks only English. */
+export const VOICE_MODEL_ID = 'eleven_flash_v2';
+
+/**
+ * ⚠ BOTH VOICE IDS BELOW ARE PLATEAU STATE'S VOICE CLONES, AND MUST BE
+ * REPLACED BEFORE THIS LINE TAKES A SINGLE GOMBE CALL.
+ *
+ * A voice id points at a recording in an ElevenLabs workspace. Renaming the
+ * persona from Nanpan to Garba changed what the assistant CALLS itself; it did
+ * not and cannot change whose voice comes out of the phone. Specifically:
+ *
+ *   - The assistant voice is "Stephen", a Nigerian-English clone the PLATEAU
+ *     State team commissioned. It will read Garba's lines in a Plateau
+ *     officer's voice. That is a licensing question as much as a branding one:
+ *     the person who recorded it consented to a Plateau deployment.
+ *   - The Governor voice is a clone of CALEB MUTFWANG, Governor of Plateau
+ *     State, used for the `<governor>` opening — "welcome to the Gombe State
+ *     Government Citizen Contact Centre" would be spoken in the voice of
+ *     another State's Governor, under Inuwa Yahaya's name. That is not a
+ *     branding defect; it is a misrepresentation of a named public official,
+ *     and it is the one thing in this rebrand that no amount of text editing
+ *     fixes.
+ *
+ * Replace both with clones recorded and consented to for Gombe State, then
+ * delete this notice. `npm run agent:sync` pushes whatever is here to the live
+ * agent, so these ids are what callers actually hear.
+ */
+
+/** Garba — every word the agent says outside the Governor's opening. */
+export const GARBA_VOICE_ID = 'KpLREcAbIIKFKpEkPEIR'; // TODO(gombe): Plateau clone — re-record.
+
+/** His Excellency the Governor — the `<governor>` part of the opening only. */
+export const GOVERNOR_VOICE_ID = 'pAqGcXrGBThHKNv6yJnM'; // TODO(gombe): Mutfwang's voice — re-record.
+
+/**
+ * The settings both voices are spoken with. Stability and similarity are the
+ * values they sounded like their originals on. Speed 1.0: running the older
+ * English model at 0.9 caused dropped words in TTS audio. ElevenLabs accepts
+ * 0.7–1.2. ONE definition: a post-sync PATCH used to re-apply its own,
+ * different numbers right after the sync wrote these.
+ */
+export const VOICE_SETTINGS = { stability: 0.5, similarityBoost: 0.8, speed: 1.0 } as const;
+
+/**
+ * Seconds after the CALLER last spoke before ElevenLabs hangs up.
+ *
+ * Not "seconds of silence": the SDK defines it as the "maximum wait time since
+ * the user last spoke before terminating the call", and the agent's own speech
+ * does not reset it. At 10, any agent turn longer than ten seconds was cut off
+ * mid-sentence — the Phase 10 closing alone runs about forty seconds at speed
+ * 0.9, and create-ticket's reply is Phase 8 and Phase 10 together — so calls
+ * dropped in the middle of the agent talking. It must exceed the longest
+ * scripted turn plus a tool call with room to spare. A caller who really has
+ * gone quiet is handled by turnTimeout (the agent asks if they are still there)
+ * and the prompt's instruction to end_call after two unanswered checks.
+ *
+ * 180, not 120: `spoken-duration.spec.ts` measures every scripted turn at the
+ * configured speed, and the urgent SECURITY reply — 112, three toll-free
+ * lines and a control room read digit by digit, which the agent is told to
+ * explain further — needs about 140 seconds with a tool call and the caller's
+ * answer. At 120 a caller reporting an attack could be hung up on mid-number.
+ * ElevenLabs documents no maximum for this field; if a sync is refused over it,
+ * the sync error and the live-settings drift check both say so.
+ */
+export const SILENCE_END_CALL_TIMEOUT_SECONDS = 180;
+
+/** Build the request for `conversationalAi.agents.create`. */
+export function agentDefinition(spec: AgentSpec) {
+  if (!spec.timezone) {
+    // Refusing here rather than defaulting: a wrong timezone silently books
+    // customers on the wrong day, and a default would hide that choice.
+    throw new Error(
+      'timezone is required — without it the agent has no knowledge of the current date and will invent one'
+    );
+  }
+
+  return {
+    name: spec.name,
+    ...(spec.initiationWebhook
+      ? {
+          platformSettings: {
+            overrides: {
+              // Explicitly false when off, never merely absent: an agent update
+              // MERGES, so leaving the key out would keep a live agent's webhook
+              // on. See `AgentSpec.initiationWebhook.enabled`.
+              enableConversationInitiationClientDataFromWebhook: spec.initiationWebhook.enabled !== false,
+              // language: false — the call is English only, so nothing may override it.
+              conversationConfigOverride: { agent: { firstMessage: true, language: false } },
+            },
+            workspaceOverrides: {
+              conversationInitiationClientDataWebhook: {
+                url: spec.initiationWebhook.url,
+                requestHeaders: { Authorization: spec.initiationWebhook.authorization },
+              },
+            },
+          },
+        }
+      : {}),
+    conversationConfig: {
+      agent: {
+        firstMessage: spec.firstMessage,
+        language: spec.language ?? 'en',
+        disableFirstMessageInterruptions: true,
+        // snake_case INSIDE, on purpose — the one exception to "the SDK
+        // converts". Its AgentConfig serializer types `dynamic_variables` as
+        // `unknown` and passes the object through untouched, so the camelCase
+        // key this used to send reached ElevenLabs verbatim as
+        // `dynamicVariablePlaceholders`. Their API reads
+        // `conversation_config.agent.dynamic_variables.dynamic_variable_placeholders`
+        // (their dynamic-variables documentation), so the defaults were never
+        // set. elevenlabs-agent.spec.ts asserts the field on the wire.
+        ...(spec.dynamicVariablePlaceholders
+          ? { dynamicVariables: { dynamic_variable_placeholders: spec.dynamicVariablePlaceholders } }
+          : {}),
+        prompt: {
+          prompt: spec.systemPrompt,
+          llm: spec.llm ?? 'gpt-4o',
+          toolIds: spec.toolIds,
+          timezone: spec.timezone,
+          builtInTools: {
+            endCall: {
+              type: 'system' as const,
+              name: 'end_call',
+              description:
+                'Drop/end the phone call ONLY AFTER you have asked the citizen whether you should drop/end the call (or whether there is anything else they need before ending the call) and they have confirmed yes/goodbye, OR when the citizen does not respond and the conversation is finished. Never call end_call mid-conversation before asking the citizen.',
+              params: {
+                systemToolType: 'end_call' as const,
+              },
+            },
+          },
+          // See `clearInlineTools`. Emitted ONLY as an empty array, never with
+          // definitions in it.
+          ...(spec.clearInlineTools ? { tools: [] as never[] } : {}),
+        },
+      },
+      asr: {
+        quality: 'high',
+        // ulaw_8000 = G.711 μ-law, the universal phone/PSTN format.
+        // pcm_16000 is for browser WebRTC — it fails silently over Twilio.
+        userInputAudioFormat: 'ulaw_8000',
+        // Words the recogniser is primed for on an 8kHz phone line: the
+        // State's own names, which a general model mishears.
+        //
+        // Plateau's list ended in its own ethnonyms (Berom, Ngas, Tarok,
+        // Mwaghavul, Goemai, Afizere, Irigwe), Jos wards (Rantya, Bukuru,
+        // Rayfield, Hwolshe, Zarmaganda, Bolari, Terminus, Pantami, Kuru,
+        // Gindiri) and Plateau given names (Gyang, Mamman, Dachung, Pam, Dung).
+        // None of them is heard on a Gombe line, and priming the recogniser
+        // for them makes it mishear Gombe names AS them.
+        //
+        // What is here: the 11 LGAs, the State's language communities, the
+        // localities of Gombe metropolis, the headquarters towns callers
+        // actually name, and the places they ask about. Add given names and
+        // ward names as the live call transcripts show which ones the
+        // recogniser gets wrong.
+        keywords: [
+          // The 11 Local Government Areas.
+          'Akko',
+          'Balanga',
+          'Billiri',
+          'Dukku',
+          'Funakaye',
+          'Gombe',
+          'Kaltungo',
+          'Kwami',
+          'Nafada',
+          'Shongom',
+          'Yamaltu/Deba',
+          // Language communities of the State.
+          'Hausa',
+          'Fulfulde',
+          'Tangale',
+          'Waja',
+          'Tera',
+          'Bolewa',
+          'Kanuri',
+          'Cham',
+          'Dadiya',
+          'Pero',
+          'Tula',
+          // Localities and wards in and around Gombe metropolis.
+          'Pantami',
+          'Bolari',
+          'Jekadafari',
+          'Herwagana',
+          'Nasarawo',
+          'Shamaki',
+          'Arawa',
+          'Dawaki',
+          'Bogo',
+          'Kumbiya-Kumbiya',
+          'Doma',
+          'Tudun Wada',
+          // LGA headquarters towns that are not the LGA's own name.
+          'Kumo',
+          'Bajoga',
+          'Malam Sidi',
+          'Talasse',
+          'Boh',
+          'Deba',
+          // Institutions and places a caller names.
+          'GOHEALTH',
+          'GSU',
+          'FUK',
+          'Kashere',
+          'Dadin Kowa',
+          'Bulok',
+          'Tula Plateau',
+          'Bima Hill',
+        ],
+      },
+      turn: {
+        turnTimeout: 3.5,
+        silenceEndCallTimeout: SILENCE_END_CALL_TIMEOUT_SECONDS,
+        mode: 'turn',
+        turnEagerness: 'patient',
+        speculativeTurn: false,
+        turnModel: 'turn_v3',
+        // NOISY LINES. A caller at a market, a roadside or a generator loses
+        // speech to the voice-activity detector: it hears noise, not words,
+        // the turn times out, and the agent asks "are you still there?" over
+        // somebody who just asked their question. With this on, ElevenLabs
+        // re-transcribes the audio it was holding when the turn times out, so
+        // the question is answered instead of lost.
+        retranscribeOnTurnTimeout: true,
+        // Wait for a caller spelling a name or reading a phone number digit by
+        // digit instead of taking each pause as the end of their turn — the
+        // pauses are longer when they are shouting over noise.
+        spellingPatience: 'auto',
+        // (ElevenLabs' background-voice filter is not settable here: the SDK's
+        // VadConfig has no fields and strips anything sent in it. The NOISY
+        // LINE guardrail in agentPromptFor covers what the model can do.)
+      },
+      tts: {
+        ...(spec.voiceId ? { voiceId: spec.voiceId } : {}),
+        // ENGLISH ONLY, so the English model. eleven_v3_conversational was
+        // adopted to speak Hausa; with expressiveMode, lowered stability and an
+        // off-1.0 speed on top, neither cloned voice sounded like its original.
+        // The phone agent no longer speaks anything but English (the agency's
+        // decision), so the multilingual model buys nothing. eleven_flash_v2 is
+        // ElevenLabs' current low-latency English model (replacing deprecated
+        // eleven_turbo_v2) and avoids dropped-word artifacts.
+        modelId: VOICE_MODEL_ID,
+        // The Governor's opening only: `<governor>…</governor>` in the first
+        // message. Every other word is Garba's voice (spec.voiceId). No other
+        // voices are offered, so the model cannot switch to one.
+        supportedVoices: [
+          {
+            label: 'governor',
+            voiceId: GOVERNOR_VOICE_ID,
+            description:
+              'His Excellency the Governor — used ONLY inside <governor>...</governor> in the opening welcome. Never use this voice anywhere else.',
+            language: 'en',
+            ...VOICE_SETTINGS,
+          },
+        ],
+        // ulaw_8000 = G.711 μ-law 8kHz — the universal format for telephony / PSTN networks.
+        agentOutputAudioFormat: 'ulaw_8000',
+        // 0 = full buffer smoothing; eleven_flash_v2 is already low-latency,
+        // and >0 chunking causes choppy/broken audio over ulaw_8000 SIP.
+        optimizeStreamingLatency: 0,
+        // Phoneme rules in the pronunciation dictionary (Inuwa Yahaya, Garba, …).
+        enablePhonemeTags: true,
+        ...VOICE_SETTINGS,
+        pronunciationDictionaryLocators: spec.pronunciationDictionaryLocators ?? [],
+      },
+      // EMPTY, explicitly — not omitted. The live agent was created with a
+      // Hausa preset (`ha`), and an agent update MERGES: leaving the key out
+      // kept `ha` on the agent, and ElevenLabs then refused the whole sync
+      // (HTTP 400, "Preset languages must be one of en, zh, …, but got ha")
+      // because the English model accepts no Hausa preset. English only.
+      languagePresets: {},
+      conversation: {
+        maxDurationSeconds: spec.maxDurationSeconds ?? 900,
+        // 'audio' MUST be here. Without it the agent produced no greeting and
+        // no reply on any inbound SIP call (agent_message_count 0, zero TTS),
+        // while the identical agent spoke to a direct websocket client. The
+        // first call after adding it ran three minutes with tools answering.
+        clientEvents: ['audio', 'interruption', 'agent_response', 'user_transcript'],
+      },
+    },
+  };
+}
+
+/**
+ * Import a Twilio number so ElevenLabs answers it natively — no TwiML, and no
+ * media-stream handling on our side.
+ *
+ * `sid` and `token` are the tenant's Twilio credentials, which we already hold
+ * in TelephonyConfig.
+ */
+export function twilioPhoneNumberImport(args: {
+  phoneNumber: string;
+  label: string;
+  accountSid: string;
+  authToken: string;
+  agentId?: string;
+  supportsInbound?: boolean;
+  supportsOutbound?: boolean;
+}): ElevenLabs.CreateTwilioPhoneNumberRequest & { provider: 'twilio' } {
+  return {
+    provider: 'twilio',
+    phoneNumber: args.phoneNumber,
+    label: args.label,
+    sid: args.accountSid,
+    token: args.authToken,
+    ...(args.agentId ? { agentId: args.agentId } : {}),
+    supportsInbound: args.supportsInbound ?? true,
+    supportsOutbound: args.supportsOutbound ?? true,
+  };
+}

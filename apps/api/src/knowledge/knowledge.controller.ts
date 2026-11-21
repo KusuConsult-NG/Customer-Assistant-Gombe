@@ -1,0 +1,132 @@
+import { Controller, Get, Post, Patch, Delete, Body, Param, Query, Req, UseGuards } from '@nestjs/common';
+import { KnowledgeService } from './knowledge.service';
+import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { RolesGuard } from '../common/guards/roles.guard';
+import { Roles } from '../common/decorators/roles.decorator';
+import { AuthUser } from '@ace/shared-types';
+import { CrawlWebsiteDto, UploadDocumentDto, KnowledgeMetadataDto, WithdrawKnowledgeDto, UpdateGapDto } from './knowledge.dto';
+import { KnowledgeGovernanceService } from './knowledge-governance.service';
+import { actorFrom } from '../common/actor';
+
+// RolesGuard follows JwtAuthGuard: guards execute in the order given, and RolesGuard
+// needs request.user. Registering it globally (as before) ran it first, so every
+// @Roles() route here returned 403 no matter who called it.
+@Controller('api/knowledge')
+@UseGuards(JwtAuthGuard, RolesGuard)
+export class KnowledgeController {
+  constructor(
+    private readonly governance: KnowledgeGovernanceService,
+    private knowledgeService: KnowledgeService,
+  ) {}
+
+  @Get('documents')
+  async getDocuments(@Req() req: { user: AuthUser }) {
+    return this.knowledgeService.getDocuments(req.user.organizationId);
+  }
+
+  @Roles('OWNER', 'ADMIN')
+  @Post('documents')
+  async uploadDocument(@Req() req: { user: AuthUser }, @Body() body: UploadDocumentDto) {
+    // Decode base64 back to Buffer for Supabase Storage upload.
+    const fileBuffer = Buffer.from(body.fileBufferBase64, 'base64');
+
+    // Trust the decoded length, not the client-supplied fileSize: the size limit is
+    // meaningless if the caller can simply declare a small number alongside a
+    // 200 MB payload.
+    return this.knowledgeService.uploadAndIndexDocument(req.user.organizationId, {
+      title: body.title,
+      fileName: body.fileName,
+      fileSize: fileBuffer.byteLength,
+      mimeType: body.mimeType,
+      fileBuffer,
+      createdByUserId: req.user.userId,
+    });
+  }
+
+  /**
+   * GET /api/knowledge/documents/:id
+   * Returns full document metadata plus all indexed chunks in order.
+   * Previously returned 404 — there was no route registered for this path (HID-017).
+   */
+  @Get('documents/:id')
+  async getDocument(@Req() req: { user: AuthUser }, @Param('id') id: string) {
+    return this.knowledgeService.getDocumentById(req.user.organizationId, id);
+  }
+
+  /**
+   * Short-lived signed download URL for an uploaded document.
+   *
+   * KnowledgeService.getDocumentDownloadUrl already existed but nothing routed to it,
+   * so an uploaded file could be stored and never retrieved again through the API.
+   */
+  @Get('documents/:id/download')
+  async downloadDocument(@Req() req: { user: AuthUser }, @Param('id') id: string) {
+    const url = await this.knowledgeService.getDocumentDownloadUrl(req.user.organizationId, id);
+    return { url, expiresInSeconds: 3600 };
+  }
+
+  @Get('search')
+  async searchPlayground(@Req() req: { user: AuthUser }, @Query('q') query: string) {
+    return this.knowledgeService.searchPlayground(req.user.organizationId, query || '');
+  }
+
+  @Roles('OWNER', 'ADMIN')
+  @Post('crawl-website')
+  async crawlWebsite(@Req() req: { user: AuthUser }, @Body() body: CrawlWebsiteDto) {
+    return this.knowledgeService.crawlAndIndexWebsite(req.user.organizationId, body.url, {
+      maxPages: body.maxPages,
+      createdByUserId: req.user.userId,
+    });
+  }
+
+  /**
+   * POST /api/knowledge/reindex
+   * Re-embeds all existing document chunks into Qdrant.
+   * Use after replacing an expired OPENAI_API_KEY or provisioning a new Qdrant instance.
+   * Does NOT re-chunk documents — reads existing chunks from PostgreSQL and vectorises them.
+   */
+  @Roles('OWNER', 'ADMIN')
+  @Post('reindex')
+  async reindexAll(@Req() req: { user: AuthUser }) {
+    return this.knowledgeService.reindexAllDocuments(req.user.organizationId);
+  }
+
+  // ── Governance (PRD §12) ──────────────────────────────────────────────────
+
+  @Roles('OWNER', 'ADMIN')
+  @Patch('documents/:id/metadata')
+  async updateMetadata(@Req() req: { user: AuthUser }, @Param('id') id: string, @Body() body: KnowledgeMetadataDto) {
+    return this.governance.updateMetadata(req.user.organizationId, id, body);
+  }
+
+  @Roles('OWNER', 'ADMIN')
+  @Post('documents/:id/approve')
+  async approve(@Req() req: { user: AuthUser; ip?: string }, @Param('id') id: string) {
+    return this.governance.approve(req.user.organizationId, id, actorFrom(req));
+  }
+
+  @Roles('OWNER', 'ADMIN')
+  @Post('documents/:id/withdraw')
+  async withdraw(@Req() req: { user: AuthUser; ip?: string }, @Param('id') id: string, @Body() body: WithdrawKnowledgeDto) {
+    return this.governance.withdraw(req.user.organizationId, id, actorFrom(req), body.reason);
+  }
+
+  /** Questions nobody could answer, most-asked first. */
+  @Get('gaps')
+  async gaps(@Req() req: { user: AuthUser }, @Query('status') status?: string) {
+    return this.governance.listGaps(req.user.organizationId, status);
+  }
+
+  @Roles('OWNER', 'ADMIN', 'AGENT')
+  @Patch('gaps/:id')
+  async updateGap(@Req() req: { user: AuthUser }, @Param('id') id: string, @Body() body: UpdateGapDto) {
+    return this.governance.updateGap(req.user.organizationId, id, body);
+  }
+
+  @Roles('OWNER', 'ADMIN')
+  @Delete('documents/:id')
+  async deleteDocument(@Req() req: { user: AuthUser }, @Param('id') id: string) {
+    return this.knowledgeService.deleteDocument(req.user.organizationId, id, actorFrom(req));
+  }
+}
+

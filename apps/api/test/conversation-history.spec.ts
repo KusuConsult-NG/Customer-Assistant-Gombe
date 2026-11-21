@@ -1,0 +1,319 @@
+/**
+ * Invariant 5: conversation lists return the LAST N messages, never the first N.
+ *
+ * CLAUDE.md lists this as reversing a shipped bug, and it had quietly
+ * un-reversed in two places — both `orderBy: asc` + `take`, which is "the first
+ * N" wearing pagination's clothes:
+ *
+ *   1. GET /api/conversations/:id/messages served messages 1..200 of a long
+ *      thread. The page size of 200 is what kept it invisible: short threads
+ *      fit, so the ordering never mattered until a thread grew past it — and
+ *      then an operator opening the conversation saw its beginning, with
+ *      everything the customer said recently unreachable from the dashboard.
+ *
+ *   2. The WhatsApp inbound path fetched conversation "history (last 10
+ *      messages)" — said the comment — as the FIRST ten. Once a thread grew
+ *      past ten messages the AI's context window froze at the conversation's
+ *      opening, permanently: every later message was answered with the
+ *      customer's greeting as context and none of what they had just said.
+ *
+ * Both are pinned against the real database, because both defects lived in the
+ * query — a mocked Prisma would have asserted the mock.
+ */
+
+import { Test, TestingModule } from '@nestjs/testing';
+import { INestApplication } from '@nestjs/common';
+import request from 'supertest';
+import { randomBytes } from 'crypto';
+import { prisma } from '@ace/database';
+import { AppModule } from '../src/app.module';
+import { createTenant } from './support/tenant';
+import { WhatsappService } from '../src/whatsapp/whatsapp.service';
+
+describe('Conversation history returns the last N messages', () => {
+  let app: INestApplication;
+  let orgId: string;
+  let token: string;
+
+  jest.setTimeout(60000);
+
+  /** Seed `count` one-minute-spaced messages, numbered so order is checkable. */
+  const seedThread = async (count: number, phoneNumber: string) => {
+    const contact = await prisma.contact.create({
+      data: { organizationId: orgId, phoneNumber, fullName: 'Marathon Talker' },
+    });
+    const conversation = await prisma.conversation.create({
+      data: { organizationId: orgId, contactId: contact.id, channel: 'WHATSAPP' },
+    });
+    const base = Date.now() - (count + 10) * 60_000;
+    await prisma.message.createMany({
+      data: Array.from({ length: count }, (_, i) => ({
+        conversationId: conversation.id,
+        sender: i % 2 ? ('AI' as const) : ('CUSTOMER' as const),
+        content: `msg ${String(i + 1).padStart(3, '0')}`,
+        sentAt: new Date(base + (i + 1) * 60_000),
+      })),
+    });
+    return conversation;
+  };
+
+  const numbersOf = (messages: any[]) => messages.map((m) => parseInt(m.content.slice(4), 10));
+
+  beforeAll(async () => {
+    process.env.JWT_SECRET ??= 'test_jwt_secret_that_is_at_least_32_chars_long';
+    process.env.JWT_REFRESH_SECRET ??= 'test_jwt_refresh_secret_at_least_32_chars';
+
+    const moduleFixture: TestingModule = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+    app = moduleFixture.createNestApplication();
+    await app.init();
+
+    // Seeded directly rather than registered. POST /api/auth/register is
+    // throttled 5/min per IP and the whole suite is one IP, so a spec that
+    // registers for setup convenience spends a budget the registration
+    // CONTRACT tests in api-integration.spec.ts need — and losing it there
+    // surfaces as a 429 that reads like a broken endpoint. Three sibling specs
+    // already avoid it for this reason; this was the last one that did not.
+    ({ token, orgId } = await createTenant(app, 'history'));
+  });
+
+  afterAll(async () => {
+    await prisma.organization.delete({ where: { id: orgId } }).catch(() => {});
+    await app?.close();
+  });
+
+  describe('GET /api/conversations/:id/messages', () => {
+    it('shows the END of a thread longer than the page, not its beginning', async () => {
+      const conversation = await seedThread(250, '+2348030007101');
+
+      const res = await request(app.getHttpServer())
+        .get(`/api/conversations/${conversation.id}/messages`)
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+
+      const nums = numbersOf(res.body);
+      // The newest message is what the operator opened the thread to see.
+      expect(Math.max(...nums)).toBe(250);
+      // And the page is still rendered oldest→newest — desc is the query's
+      // business, not the client's.
+      expect(nums).toEqual([...nums].sort((a, b) => a - b));
+    });
+
+    it('pages BACKWARD from a cursor — scroll-up-for-history, not forward from the start of time', async () => {
+      const conversation = await seedThread(250, '+2348030007102');
+
+      const page1 = await request(app.getHttpServer())
+        .get(`/api/conversations/${conversation.id}/messages`)
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+
+      const page2 = await request(app.getHttpServer())
+        .get(`/api/conversations/${conversation.id}/messages`)
+        .query({ before: page1.body[0].sentAt })
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+
+      const n1 = numbersOf(page1.body);
+      const n2 = numbersOf(page2.body);
+      // Page 2 is everything OLDER than page 1, with no gap and no overlap.
+      expect(Math.max(...n2)).toBe(Math.min(...n1) - 1);
+      expect(Math.min(...n2)).toBe(1);
+    });
+  });
+
+  describe('the history handed to the WhatsApp orchestrator', () => {
+    it("is the newest ten messages, not the thread's opening", async () => {
+      const phoneNumberId = `pnid_${randomBytes(4).toString('hex')}`;
+      const customerNumber = '2348030007103';
+      await prisma.whatsAppConfig.create({
+        data: {
+          organizationId: orgId,
+          phoneNumberId,
+          whatsappBusinessId: 'waba_test',
+          // Legacy plaintext, which withWhatsAppCredentials still reads.
+          accessToken: 'legacy-plaintext-token',
+          displayPhoneNumber: '+2348000000001',
+          webhookVerifyToken: 'verify',
+        },
+      });
+      const conversation = await seedThread(15, `+${customerNumber}`);
+
+      // Capture the context instead of answering; an empty replyText also means
+      // nothing is handed to the Meta send client, so no network is involved.
+      const service = app.get(WhatsappService);
+      const captured: any[] = [];
+      (service as any).orchestrator = {
+        processIncomingMessage: async (context: any) => {
+          captured.push(context);
+          return { replyText: '', confidenceScore: 1, shouldHandoff: false };
+        },
+      };
+
+      await service.processIncomingWebhook(
+        {
+          entry: [
+            {
+              changes: [
+                {
+                  value: {
+                    metadata: { phone_number_id: phoneNumberId },
+                    messages: [
+                      {
+                        from: customerNumber,
+                        id: `wamid.${randomBytes(6).toString('hex')}`,
+                        type: 'text',
+                        text: { body: 'so what about my booking then?' },
+                        timestamp: String(Math.floor(Date.now() / 1000)),
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          ],
+        },
+        'history-test'
+      );
+
+      expect(captured).toHaveLength(1);
+      const history = captured[0].history;
+      expect(history).toHaveLength(10);
+
+      // The inbound message is persisted before the history fetch, so the
+      // newest ten are msg 007..015 plus the message itself.
+      const texts = history.map((h: any) => h.content);
+      expect(texts[texts.length - 1]).toBe('so what about my booking then?');
+      expect(texts).toContain('msg 015');
+      // The frozen-window bug: these were the ONLY things the AI ever saw.
+      expect(texts).not.toContain('msg 001');
+      expect(texts).not.toContain('msg 006');
+
+      // Chronological, oldest→newest — what a conversation context means.
+      const times = history.map((h: any) => new Date(h.timestamp).getTime());
+      expect(times).toEqual([...times].sort((a, b) => a - b));
+
+      // The conversation persists, so a re-run of this spec against the same
+      // database must not collide on the config's phoneNumberId.
+      await prisma.whatsAppConfig.deleteMany({ where: { phoneNumberId } });
+      void conversation;
+    });
+  });
+
+  describe('two agencies claiming one phoneNumberId', () => {
+    /**
+     * `phoneNumberId` is indexed and deliberately NOT unique, because one
+     * agency holds several lines. Nothing stops two DIFFERENT agencies holding
+     * the same one, and `findFirst` then answered the citizen as whichever row
+     * the database returned — that agency's persona, its knowledge base, and
+     * its CRM receiving the citizen's name and number. Worse, "whichever row"
+     * could change after any UPDATE, so a citizen's own thread changed hands
+     * part-way through a conversation.
+     *
+     * This path briefly REFUSED instead, and that was the wrong call. A
+     * refusal on a contested line means a citizen who messages the State's
+     * number receives nothing at all: no reply, no ticket, no record that they
+     * tried, and no way to tell a silent platform from a wrong number. It took
+     * a live line down. Being answered by the wrong agency is wrong, visible
+     * and recoverable; silence is none of those.
+     *
+     * So the contest is logged at error level with both organization ids, and
+     * the citizen is answered by a STABLY chosen one. These tests pin the two
+     * things that matter: somebody answers, and it is the same somebody every
+     * time.
+     */
+    it('answers the citizen, from a stably chosen agency, rather than going silent', async () => {
+      // Its own line id, so the test is self-contained: both agencies are
+      // given THIS number and nothing else in the suite shares it.
+      const phoneNumberId = `pn-contested-${randomBytes(4).toString('hex')}`;
+      await prisma.whatsAppConfig.create({
+        data: {
+          organizationId: orgId,
+          phoneNumberId,
+          whatsappBusinessId: 'waba_owner',
+          accessToken: 'legacy-plaintext-token',
+          displayPhoneNumber: '+2348000000003',
+          webhookVerifyToken: 'verify',
+          createdAt: new Date(Date.now() - 86400000),
+        },
+      });
+
+      const rival = await prisma.organization.create({
+        data: {
+          name: 'Rival Agency',
+          slug: `rival-${randomBytes(4).toString('hex')}`,
+          industry: 'GOVERNMENT',
+        },
+      });
+      await prisma.whatsAppConfig.create({
+        data: {
+          organizationId: rival.id,
+          phoneNumberId,
+          whatsappBusinessId: 'waba_rival',
+          accessToken: 'legacy-plaintext-token',
+          displayPhoneNumber: '+2348000000002',
+          webhookVerifyToken: 'verify',
+        },
+      });
+
+      const service = app.get(WhatsappService);
+      const captured: any[] = [];
+      (service as any).orchestrator = {
+        processIncomingMessage: async (context: any) => {
+          captured.push(context);
+          return { replyText: '', confidenceScore: 1, shouldHandoff: false };
+        },
+      };
+
+      const deliver = () =>
+        service.processIncomingWebhook(
+          {
+            entry: [
+              {
+                changes: [
+                  {
+                    value: {
+                      metadata: { phone_number_id: phoneNumberId },
+                      messages: [
+                        {
+                          from: '2348031112222',
+                          id: `wamid.${randomBytes(6).toString('hex')}`,
+                          type: 'text',
+                          text: { body: 'who owns this line?' },
+                          timestamp: String(Math.floor(Date.now() / 1000)),
+                        },
+                      ],
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+          'ambiguous-line-test'
+        );
+
+      try {
+        await deliver();
+
+        // THE CITIZEN IS ANSWERED. This is the assertion that fails if the
+        // refusal comes back: the orchestrator ran, so somebody replied.
+        expect(captured).toHaveLength(1);
+
+        // And by the agency whose row was created first — the owner here, not
+        // the rival added afterwards.
+        expect(captured[0].organizationId).toBe(orgId);
+
+        // Stability is the real property. `findFirst` with no ordering could
+        // hand the same number to a different agency between two messages, so
+        // one citizen's conversation split across two CRMs. A second delivery
+        // must reach the same place.
+        await deliver();
+        expect(captured).toHaveLength(2);
+        expect(captured[1].organizationId).toBe(captured[0].organizationId);
+      } finally {
+        await prisma.whatsAppConfig.deleteMany({ where: { phoneNumberId } });
+        await prisma.organization.delete({ where: { id: rival.id } }).catch(() => undefined);
+      }
+    });
+  });
+});

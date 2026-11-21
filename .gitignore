@@ -1,0 +1,68 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build outputs
+dist/
+build/
+.next/
+out/
+.turbo/
+tsconfig.tsbuildinfo
+
+# Environment variables — NEVER commit these
+.env
+.env.*
+# ...but the template must be committed — it is the only place the local
+# setup gotchas are written down, and `.env.*` above would swallow it.
+!.env.example
+*.env
+apps/*/.env
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Prisma
+packages/database/prisma/generated/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Uploads (local dev only — production uses Supabase Storage)
+apps/api/uploads/
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# E2E validation output (regenerated per run)
+e2e-validation/results.json
+
+# Redis snapshot written by a locally-run redis-server
+dump.rdb
+
+# Playwright artifacts
+apps/web/playwright-report/
+apps/web/test-results/
+# Playwright run from the repo root (wrong cwd) drops its artifacts here.
+/test-results/
+/playwright-report/
+apps/web/playwright.sandbox.config.ts
+data/qdrant/qdrant
+storage/
+.qdrant-initialized
+infra/sip-bridge/bridge.env
+
+# Local verification environment (Postgres/Redis credentials for test runs)
+.env
