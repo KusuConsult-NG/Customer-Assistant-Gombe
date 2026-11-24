@@ -32,6 +32,7 @@ import {
 } from '@ace/database';
 import {
   electionIncidentFields,
+  isClusterConflict,
   corroborateExisting,
   corroborationReply,
   shouldSkipReadBack,
@@ -1619,34 +1620,43 @@ export class AgentToolsService implements OnModuleInit, OnModuleDestroy {
         }
       }
 
-      const ticket = await this.crm.createTicket(organizationId, {
-        contactId: contact.id,
-        subject,
-        description: details,
-        priority: kind || isIntegrityComplaint ? priority : (cls.priority as TicketPriority),
-        caseFields: {
-          caseStage: stage,
-          category: cls.category,
-          isSensitive: cls.sensitive,
-          isAnonymous: anonymous,
-          lga,
-          ward,
-          community,
-          responsibleMda: routedToMda,
-          // The read-back the caller confirmed — the record of what they agreed
-          // they reported, kept beside their own words in `description`.
-          summary: input.summary?.trim() || null,
-          // An election incident's deadline is in MINUTES (5 for critical).
-          // The service charter's days would have an ongoing attack "on time"
-          // until after the result was declared.
-          dueAt: election ? election.dueAt : new Date(Date.now() + cls.serviceDays * 86_400_000),
-          channel: 'VOICE',
-          openedBy: 'system:voice-agent',
-          eventBody:
-            (yes(input.summaryConfirmed)
-              ? `Opened from a phone call after the caller confirmed the summary; classified as ${cls.category}, marked for ${routedToMda}.`
-              : `Opened from a phone call as an emergency still in progress, without a read-back; classified as ${cls.category}, marked for ${routedToMda}.`) +
-            (input.conversationId?.trim() ? callReferenceText(input.conversationId.trim()) : ''),
+      // ── The loser of the create race corroborates ─────────────────────────
+      //
+      // `@@unique([organizationId, clusterKey])` lets exactly one simultaneous
+      // report create the incident. The rest raise P2002 on that constraint,
+      // and each of those is not an error: it is a report that should have been
+      // a corroboration, and would have been if it had arrived a millisecond
+      // later. Without this, a surge of 60 reports at one unit produced 22
+      // incidents.
+      const fileReport = () =>
+        this.crm.createTicket(organizationId, {
+          contactId: contact.id,
+          subject,
+          description: details,
+          priority: kind || isIntegrityComplaint ? priority : (cls.priority as TicketPriority),
+          caseFields: {
+            caseStage: stage,
+            category: cls.category,
+            isSensitive: cls.sensitive,
+            isAnonymous: anonymous,
+            lga,
+            ward,
+            community,
+            responsibleMda: routedToMda,
+            // The read-back the caller confirmed — the record of what they agreed
+            // they reported, kept beside their own words in `description`.
+            summary: input.summary?.trim() || null,
+            // An election incident's deadline is in MINUTES (5 for critical).
+            // The service charter's days would have an ongoing attack "on time"
+            // until after the result was declared.
+            dueAt: election ? election.dueAt : new Date(Date.now() + cls.serviceDays * 86_400_000),
+            channel: 'VOICE',
+            openedBy: 'system:voice-agent',
+            eventBody:
+              (yes(input.summaryConfirmed)
+                ? `Opened from a phone call after the caller confirmed the summary; classified as ${cls.category}, marked for ${routedToMda}.`
+                : `Opened from a phone call as an emergency still in progress, without a read-back; classified as ${cls.category}, marked for ${routedToMda}.`) +
+              (input.conversationId?.trim() ? callReferenceText(input.conversationId.trim()) : ''),
           ...(election
             ? {
                 election: {
@@ -1665,8 +1675,35 @@ export class AgentToolsService implements OnModuleInit, OnModuleDestroy {
                 },
               }
             : {}),
-        },
-      });
+          },
+        });
+
+      let ticket: Awaited<ReturnType<typeof fileReport>>;
+      try {
+        ticket = await fileReport();
+      } catch (err: any) {
+        if (!election?.clusterKey || !isClusterConflict(err)) throw err;
+        const won = await corroborateExisting(organizationId, election.clusterKey, {
+          contactId: contact.id,
+          account: details,
+        });
+        if (!won) throw err;
+        return {
+          ok: true,
+          speak: corroborationReply(won, spokenReference(won.ticketNumber)),
+          data: {
+            filed: true,
+            corroborated: true,
+            racedToCorroboration: true,
+            ticketId: won.ticketId,
+            ticketNumber: won.ticketNumber,
+            corroborations: won.corroborations,
+            verification: won.verification,
+            incidentType: election.incidentType,
+            severity: election.severity,
+          },
+        };
+      }
 
       if (isIntegrityComplaint || kind) {
         await prisma.note.create({

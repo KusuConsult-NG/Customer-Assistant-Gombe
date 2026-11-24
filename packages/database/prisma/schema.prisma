@@ -613,8 +613,21 @@ model Ticket {
 
   @@index([organizationId, createdAt])
   @@index([organizationId, pollingUnitCode])
-  @@index([organizationId, clusterKey])
   @@index([organizationId, verification])
+  /// ONE incident per cluster, enforced by the database.
+  ///
+  /// A surge test fired 60 simultaneous reports at one polling unit and got 22
+  /// incidents: every request read "no existing incident at this unit" before
+  /// any of them had written one, so every request created one. That is the
+  /// exact failure clustering exists to prevent, it is invisible at any
+  /// sequential test, and a situation room briefing it would have reported 22
+  /// incidents where there was one.
+  ///
+  /// A read-then-write cannot be made safe in application code, so the
+  /// constraint lives here and the loser of the race catches P2002 and
+  /// corroborates instead. `clusterKey` is null for every service case, and
+  /// Postgres does not conflict NULLs, so service cases are untouched.
+  @@unique([organizationId, clusterKey])
   @@index([contactId])
   @@index([assignedUserId])
   @@map("tickets")

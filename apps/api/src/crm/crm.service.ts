@@ -369,7 +369,27 @@ export class CrmService {
       );
     } catch (err: any) {
       if (err?.code === 'P2003') throw new NotFoundException('Contact not found');
-      if (err?.code === 'P2002') {
+
+      // ONLY a ticketNumber collision becomes this message.
+      //
+      // This used to map EVERY P2002 to it, which was true while `ticketNumber`
+      // was the table's only unique constraint. Adding
+      // `@@unique([organizationId, clusterKey])` — the thing that stops twenty
+      // simultaneous reporters at one polling unit becoming twenty incidents —
+      // made it false in the worst way: a cluster conflict was reported to the
+      // caller as a ticket-numbering failure, wrapped in a ConflictException
+      // that carries no `code`, so the caller could no longer recognise it and
+      // retry as a corroboration. A surge test lost nine reports in twenty to
+      // this, each one answered with "I'm sorry — I could not complete that".
+      //
+      // Other P2002s are rethrown untouched so the caller can act on them. The
+      // allocator has already exhausted its retries by the time a ticketNumber
+      // P2002 reaches here, so that one really is unrecoverable.
+      const target = err?.meta?.target;
+      const onTicketNumber = Array.isArray(target)
+        ? target.includes('ticketNumber')
+        : String(target ?? '').includes('ticketNumber');
+      if (err?.code === 'P2002' && onTicketNumber) {
         throw new ConflictException('Could not allocate a unique ticket number. Please retry.');
       }
       throw err;

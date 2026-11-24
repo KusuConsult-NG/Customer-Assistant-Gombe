@@ -131,17 +131,25 @@ export async function corroborateExisting(
       existing.contactId === reporter.contactId ||
       existing.events.some((e) => (e.body ?? '').includes(`contact:${reporter.contactId}`));
 
-    const corroborations = alreadyCounted ? existing.corroborations : existing.corroborations + 1;
-    const verification = verificationFromCorroboration(
-      existing.verification as IncidentVerification,
-      corroborations,
-    );
+    let corroborations = existing.corroborations;
+    let verification = existing.verification as IncidentVerification;
 
     if (!alreadyCounted) {
-      await prisma.$transaction([
+      // `{ increment: 1 }`, not `corroborations + 1` computed here.
+      //
+      // The surge test fired 60 reports at one unit and logged 38
+      // corroborations, of which only 5 were counted: every request read the
+      // same number, added one, and wrote the same result, so 33 increments
+      // were silently lost. A count that undercounts is worse than no count,
+      // because it is the signal that raises a claim to CORROBORATED.
+      //
+      // Postgres does the addition, so simultaneous increments all land, and
+      // the row that comes back carries the true total.
+      const [updated] = await prisma.$transaction([
         prisma.ticket.update({
           where: { id: existing.id },
-          data: { corroborations, verification: verification as any },
+          data: { corroborations: { increment: 1 } },
+          select: { corroborations: true, verification: true },
         }),
         prisma.caseEvent.create({
           data: {
@@ -155,6 +163,21 @@ export async function corroborateExisting(
           },
         }),
       ]);
+
+      corroborations = updated.corroborations;
+      verification = verificationFromCorroboration(
+        updated.verification as IncidentVerification,
+        corroborations,
+      );
+
+      // Written separately, from the count Postgres actually arrived at. Racing
+      // writers converge here because the transition is monotonic — once a
+      // claim is CORROBORATED, nothing in this function moves it back.
+      if (verification !== updated.verification) {
+        await prisma.ticket
+          .update({ where: { id: existing.id }, data: { verification: verification as any } })
+          .catch(() => {});
+      }
     }
 
     log.info('incident_corroborated', {
@@ -235,4 +258,24 @@ export function discreetReply(spokenReference: string): string {
     `I repeat, ${spokenReference}. I will not read the details back. If you are not safe, please move ` +
     `somewhere safe and call 1 1 2.`
   );
+}
+
+
+/**
+ * Whether a failed create lost the race for a cluster.
+ *
+ * `@@unique([organizationId, clusterKey])` is what stops twenty simultaneous
+ * reporters at one polling unit becoming twenty incidents. Exactly one insert
+ * wins; the rest raise P2002 on that constraint, and each of those is not an
+ * error — it is a report that should have been a corroboration all along, and
+ * would have been if it had arrived a millisecond later.
+ *
+ * Checked narrowly: a P2002 on any other field (`ticketNumber`) is a different
+ * problem with its own retry, and swallowing it here would hide it.
+ */
+export function isClusterConflict(err: any): boolean {
+  if (err?.code !== 'P2002') return false;
+  const target = err?.meta?.target;
+  const fields: string[] = Array.isArray(target) ? target : typeof target === 'string' ? [target] : [];
+  return fields.some((f) => String(f).toLowerCase().includes('clusterkey'));
 }

@@ -258,3 +258,73 @@ describe('an ordinary service complaint is untouched', () => {
     expect(days).toBeGreaterThan(1);
   }, 60_000);
 });
+
+describe('a surge at one polling unit', () => {
+  it('becomes ONE incident, with every report accounted for', async () => {
+    // Found by `npm run surge -- --scenario cluster`, which no sequential test
+    // could have found. Sixty simultaneous reports at one unit produced TWENTY
+    // TWO incidents and lost nine reports in twenty, through three separate
+    // bugs:
+    //
+    //   1. read-then-write — every request read "no incident here" before any
+    //      had written one, so every request created one;
+    //   2. `corroborations: n + 1` computed in JavaScript — simultaneous
+    //      writers all read the same n and wrote the same n+1, losing 33 of 60
+    //      increments;
+    //   3. `crm.createTicket` mapped EVERY P2002 to "Could not allocate a
+    //      unique ticket number" in a ConflictException with no `code`, so the
+    //      new cluster constraint was reported as a numbering failure and the
+    //      caller could not recognise it to retry as a corroboration.
+    //
+    // Twelve at once is enough to reproduce all three and still run quickly.
+    const unit = '15-07-04-077';
+    const AT_ONCE = 12;
+
+    const responses = await Promise.all(
+      Array.from({ length: AT_ONCE }, (_, i) =>
+        post('create-ticket', report({
+          phoneNumber: `+2347${String(10000000 + i)}`,
+          pollingUnitCode: unit,
+          description: `Reporter ${i} saw the ballot box carried off.`,
+        })),
+      ),
+    );
+
+    // Not one report refused. `ok: false` inside an HTTP 201 is still a lost
+    // report, and that is how all nine hid on the first surge run.
+    for (const res of responses) {
+      expect(res.status).toBe(201);
+      expect(res.body.ok).toBe(true);
+    }
+
+    // All of them point at the same incident.
+    const references = new Set(responses.map((r) => r.body.data.ticketNumber));
+    expect(references.size).toBe(1);
+
+    const tickets = await prisma.ticket.findMany({
+      where: { organizationId: orgId, pollingUnitCode: unit },
+      select: { id: true, corroborations: true, verification: true },
+    });
+    expect(tickets).toHaveLength(1);
+
+    // Every report is accounted for: the creator plus one event each.
+    expect(tickets[0].corroborations).toBe(AT_ONCE);
+    const events = await prisma.caseEvent.count({
+      where: { organizationId: orgId, ticketId: tickets[0].id, type: 'CORROBORATION' },
+    });
+    expect(events).toBe(AT_ONCE - 1);
+    expect(tickets[0].verification).toBe('CORROBORATED');
+  }, 120_000);
+
+  it('reports a cluster conflict as a cluster conflict, not a numbering failure', async () => {
+    // The error that hid the bug. A P2002 on anything but `ticketNumber` must
+    // reach the caller with its code intact, so it can be acted on.
+    const { isClusterConflict } = require('../src/agent-tools/election-incident');
+    expect(isClusterConflict({ code: 'P2002', meta: { target: ['organizationId', 'clusterKey'] } })).toBe(true);
+    // Not swallowed: the numbering retry is a different problem with its own
+    // handling, and treating it as a cluster conflict would hide it.
+    expect(isClusterConflict({ code: 'P2002', meta: { target: ['ticketNumber'] } })).toBe(false);
+    expect(isClusterConflict({ code: 'P2003' })).toBe(false);
+    expect(isClusterConflict(new Error('something else'))).toBe(false);
+  });
+});

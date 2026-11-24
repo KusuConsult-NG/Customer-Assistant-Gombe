@@ -22,6 +22,39 @@ interface AgentRequest {
 // A live call makes several tool calls per minute, and a busy tenant runs many
 // calls at once. High enough not to interrupt real conversations, low enough
 // that a leaked key cannot be used to enumerate a tenant's customer base.
+//
+// That reasoning is about READS. See `REPORT_FILING_LIMIT` below for why the
+// endpoints that FILE a report are not held to it.
+/**
+ * The rate limit for endpoints that FILE a citizen's report.
+ *
+ * ── Why it is not the controller's 240/min ──────────────────────────────────
+ *
+ * A surge test at election-day shape sent 400 reports and every one came back
+ * 429. The controller's limit is 240 a minute — four a second — which is
+ * generous for a contact centre and nowhere near an election: a State with
+ * thousands of polling units and a thousand accredited observers bursts past
+ * that the moment the polls open, and again when materials fail to arrive, and
+ * again at collation.
+ *
+ * The asymmetry that makes this safe is what the endpoints DO. The controller's
+ * limit exists so a leaked key cannot enumerate a tenant's customer base, and
+ * that is a risk of the READ tools — lookup-customer, find-booking. Filing a
+ * report is a WRITE that creates a new record and discloses nothing; a leaked
+ * key abusing it produces junk tickets, which is a nuisance an officer closes,
+ * not an exfiltration route. So the two deserve different numbers, and tying
+ * the write to the read's limit buys no security and loses reports.
+ *
+ * And the costs are not symmetric either. A 429 on a read is a retry. A 429 on
+ * a report is a citizen's report that does not exist — they were told to call
+ * in, they called, and nothing was recorded.
+ *
+ * Still limited, not unlimited: a limit is the thing that keeps one broken
+ * client from exhausting the database for every other reporter. Raise it for an
+ * election with `AGENT_REPORT_RATE_LIMIT`.
+ */
+const REPORT_FILING_LIMIT = Number(process.env.AGENT_REPORT_RATE_LIMIT ?? 6_000);
+
 @Throttle({ default: { limit: 240, ttl: 60_000 } })
 @UseGuards(AgentKeyGuard)
 @Controller('api/agent-tools')
@@ -135,6 +168,7 @@ export class AgentToolsController {
   }
 
   @Post('create-ticket')
+  @Throttle({ default: { limit: REPORT_FILING_LIMIT, ttl: 60_000 } })
   createTicket(
     @Req() req: AgentRequest,
     @Body()
@@ -169,6 +203,7 @@ export class AgentToolsController {
   }
 
   @Post('request-callback')
+  @Throttle({ default: { limit: REPORT_FILING_LIMIT, ttl: 60_000 } })
   requestCallback(
     @Req() req: AgentRequest,
     @Body()
