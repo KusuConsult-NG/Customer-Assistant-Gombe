@@ -26,6 +26,10 @@ import { prisma } from '@ace/database';
 import {
   classifyIncident,
   clusterKeyFor,
+  normaliseUnitCode,
+  resolveLga,
+  resolvePollingUnit,
+  type PollingUnitResolution,
   dueAtFor,
   incidentType as lookupIncidentType,
   severityFor,
@@ -278,4 +282,46 @@ export function isClusterConflict(err: any): boolean {
   const target = err?.meta?.target;
   const fields: string[] = Array.isArray(target) ? target : typeof target === 'string' ? [target] : [];
   return fields.some((f) => String(f).toLowerCase().includes('clusterkey'));
+}
+
+
+/**
+ * Resolve what a reporter said into a polling unit from the loaded register.
+ *
+ * Reads the register narrowed to the LGA, because a unit NAME is not unique
+ * across a State — "CENTRAL PRIMARY SCHOOL" exists in most LGAs, and picking
+ * the first would file an incident in the wrong Local Government Area. A code
+ * is unique and skips all of that.
+ *
+ * Never blocks a report. Every miss comes back with the reporter's own words
+ * intact so the caller can file anyway and attach the unit later: the register
+ * is a snapshot, units move between elections, and a reporter standing at one
+ * watching something happen must not be turned away because our reference data
+ * is behind.
+ */
+export async function resolveUnitFromRegister(
+  said: { code?: string | null; name?: string | null; lga?: string | null; registrationArea?: string | null },
+): Promise<PollingUnitResolution> {
+  const code = normaliseUnitCode(said.code);
+
+  // A code needs no narrowing and no name matching.
+  if (code) {
+    const unit = await prisma.pollingUnit.findUnique({ where: { code } });
+    if (unit) return { ok: true, unit };
+    // A code that is not in the register is worth saying: it may be a new unit,
+    // or the register may be stale, and either way nobody should guess.
+    return { ok: false, reason: 'no_match', said: said.code ?? undefined };
+  }
+
+  const name = (said.name ?? '').trim();
+  if (!name) return { ok: false, reason: 'nothing_said' };
+
+  const lga = said.lga ? resolveLga(said.lga) : null;
+  const pool = await prisma.pollingUnit.findMany({
+    where: lga ? { lga } : {},
+    // Bounded: an unnarrowed query over a State's whole register, per report,
+    // is the sort of thing that works until election day.
+    take: lga ? 2_000 : 500,
+  });
+  return resolvePollingUnit(pool, name, { lga, registrationArea: said.registrationArea ?? null });
 }

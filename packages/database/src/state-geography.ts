@@ -62,6 +62,12 @@ const LGA_ALIASES: Record<string, string> = {
   'yamaltu deba': 'Yamaltu/Deba',
   'yamaltu-deba': 'Yamaltu/Deba',
   'yelmatu deba': 'Yamaltu/Deba',
+  // INEC's own register spells it YALMALTU/ DEBA. Both are in use, and without
+  // this the loader rightly refuses every unit in the LGA — which is what the
+  // LGA check is for, and how the spelling difference was noticed at all.
+  'yalmaltu deba': 'Yamaltu/Deba',
+  'yalmaltu/deba': 'Yamaltu/Deba',
+  'yalmaltu': 'Yamaltu/Deba',
   // Headquarters towns that are not the LGA's own name, as callers say them.
   kumo: 'Akko',
   bajoga: 'Funakaye',

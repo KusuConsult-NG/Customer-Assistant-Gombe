@@ -29,9 +29,11 @@ import {
   classifyIncident,
   incidentType as lookupIncidentType,
   normaliseUnitCode,
+  unitMissReply,
 } from '@ace/database';
 import {
   electionIncidentFields,
+  resolveUnitFromRegister,
   isClusterConflict,
   corroborateExisting,
   corroborationReply,
@@ -1442,7 +1444,38 @@ export class AgentToolsService implements OnModuleInit, OnModuleDestroy {
         yes(input.electionIncident) ||
         classifyIncident(electionText) !== null;
 
-      const unitCode = normaliseUnitCode(input.pollingUnitCode) ?? null;
+      // Resolve what the reporter said against INEC's register. A resolved
+      // unit gives the incident a real code to cluster, map and correlate on;
+      // an unresolved one still files, with their own words kept.
+      const unit = isElection
+        ? await resolveUnitFromRegister({
+            code: input.pollingUnitCode ?? null,
+            name: input.pollingUnit ?? null,
+            lga: input.lga ?? null,
+            registrationArea: input.registrationArea ?? null,
+          })
+        : null;
+
+      // An ambiguous NAME is the one case worth a question before filing: the
+      // reporter is looking at the unit and can tell us which it is in three
+      // words, and a wrong unit sends a response team to the wrong village.
+      // Not asked when the incident is ongoing — then the unit can wait.
+      if (unit && !unit.ok && unit.reason === 'ambiguous' && !ongoing) {
+        return {
+          ok: false,
+          speak: unitMissReply(unit),
+          data: {
+            filed: false,
+            pollingUnitAmbiguous: true,
+            candidates: (unit.candidates ?? []).map((u) => ({ code: u.code, name: u.name, registrationArea: u.registrationArea })),
+            instruction:
+              'Nothing was registered yet. Ask which of these polling units they mean, then call ' +
+              'create-ticket again with pollingUnitCode set to the code they confirm.',
+          },
+        };
+      }
+
+      const unitCode = unit?.ok ? unit.unit.code : normaliseUnitCode(input.pollingUnitCode) ?? null;
       const election = isElection
         ? electionIncidentFields({
             text: electionText,
@@ -1662,12 +1695,12 @@ export class AgentToolsService implements OnModuleInit, OnModuleDestroy {
                 election: {
                   incidentType: election.incidentType,
                   severity: election.severity,
-                  registrationArea: input.registrationArea?.trim() || null,
                   pollingUnitCode: unitCode,
                   // The unit as the REPORTER named it, kept even when it could
                   // not be resolved: the register is incomplete, and a report
                   // must never be blocked by our reference data.
-                  pollingUnitName: input.pollingUnit?.trim() || null,
+                  pollingUnitName: unit?.ok ? unit.unit.name : input.pollingUnit?.trim() || null,
+                  registrationArea: unit?.ok ? unit.unit.registrationArea : input.registrationArea?.trim() || null,
                   latitude: typeof input.latitude === 'number' ? input.latitude : null,
                   longitude: typeof input.longitude === 'number' ? input.longitude : null,
                   clusterKey: election.clusterKey,

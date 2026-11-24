@@ -93,7 +93,7 @@ describe('many reporters, one event', () => {
       where: { ticketNumber: reference },
       select: {
         corroborations: true, verification: true, incidentType: true, severity: true,
-        pollingUnitCode: true, registrationArea: true, clusterKey: true, dueAt: true, createdAt: true,
+        pollingUnitCode: true, pollingUnitName: true, registrationArea: true, clusterKey: true, dueAt: true, createdAt: true,
         events: { where: { type: 'CORROBORATION' }, select: { body: true } },
       },
     });
@@ -103,7 +103,12 @@ describe('many reporters, one event', () => {
     expect(stored?.incidentType).toBe('ballot_snatching');
     expect(stored?.severity).toBe('CRITICAL');
     expect(stored?.pollingUnitCode).toBe(UNIT);
-    expect(stored?.registrationArea).toBe('Kumo East');
+    // INEC's register wins over what the agent passed. The fixture sends
+    // registrationArea: 'Kumo East'; the real unit 15-01-03-004 is in
+    // Kalshingi, and the resolved value is what a situation room counts and a
+    // tribunal is told. That the register overrides a guess IS the feature.
+    expect(stored?.registrationArea).toBe('Kalshingi');
+    expect(stored?.pollingUnitName).toMatch(/KULUM/);
 
     // The second reporter's own account is kept whole, not merged away: an
     // incident with two corroborations and one narrative has thrown away a
@@ -277,6 +282,9 @@ describe('a surge at one polling unit', () => {
     //      caller could not recognise it to retry as a corroboration.
     //
     // Twelve at once is enough to reproduce all three and still run quickly.
+    // Deliberately a code the register does not hold: an unresolvable unit
+    // must still cluster on the code the reporter gave, or a surge at a newly
+    // created or relocated unit would split into one incident per reporter.
     const unit = '15-07-04-077';
     const AT_ONCE = 12;
 
