@@ -238,6 +238,7 @@ model Organization {
   leads              Lead[]
   deals              Deal[]
   tickets            Ticket[]
+  evidence           Evidence[]
   conversations      Conversation[]
   callLogs           CallLog[]
   knowledgeDocuments KnowledgeDocument[]
@@ -560,13 +561,60 @@ model Ticket {
   citizenNotifiedAt DateTime?
   channel           String?
 
+  // ── Election incident reporting ───────────────────────────────────────────
+  //
+  // An election incident happens at a POLLING UNIT, inside a Registration Area
+  // (what everyone calls a ward), inside an LGA. `lga`/`ward`/`community` above
+  // are free text a caller said; these are resolved against INEC's register, so
+  // they can be counted, mapped, deduplicated and handed to a lawyer.
+  /// INEC Registration Area, resolved. `ward` keeps the caller's own words.
+  registrationArea String?
+  /// INEC polling unit code, e.g. "15-04-07-012". The join key for everything.
+  pollingUnitCode  String?
+  pollingUnitName  String?
+  /// Where the reporter says they are. Not proof, but it is checkable against
+  /// the polling unit's own position.
+  latitude         Float?
+  longitude        Float?
+
+  /// The election incident taxonomy (`packages/database/src/election-incidents.ts`).
+  /// Null for an ordinary service case; `category` stays the service taxonomy.
+  incidentType     String?
+  severity         IncidentSeverity?
+
+  /// Whether the CLAIM is true. Deliberately separate from `caseStage`, which
+  /// is about whether the WORK is done: a situation room publishes these, and
+  /// "resolved" must never be mistaken for "verified".
+  verification     VerificationState @default(UNVERIFIED)
+  verifiedByUserId String?
+  verifiedAt       DateTime?
+  verificationNote String?           @db.Text
+
+  /// Polling unit + incident type + time bucket. Twenty observers at one unit
+  /// are one incident with twenty corroborations, not twenty incidents.
+  clusterKey       String?
+  /// Independent reports clustered here, including this one.
+  corroborations   Int               @default(1)
+
+  /// Recorded before it could be classified, because classification failed or
+  /// was rate-limited. The report is never lost for want of a category.
+  needsClassification Boolean        @default(false)
+
+  /// Retention must not delete this: it is evidence inside a petition window.
+  legalHold        Boolean           @default(false)
+  legalHoldReason  String?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   events    CaseEvent[]
   referrals MdaReferral[]
+  evidence  Evidence[]
 
   @@index([organizationId, createdAt])
+  @@index([organizationId, pollingUnitCode])
+  @@index([organizationId, clusterKey])
+  @@index([organizationId, verification])
   @@index([contactId])
   @@index([assignedUserId])
   @@map("tickets")
@@ -703,6 +751,11 @@ model Message {
   content        String        @db.Text
   mediaUrl       String?
   mediaType      String?
+  /// A shared location's own coordinates. These used to be flattened into the
+  /// message text ("[Customer shared a location: lat X, lng Y]") and the
+  /// numbers thrown away, so nothing could map or check them.
+  latitude       Float?
+  longitude      Float?
   metadata       Json?
   sentAt         DateTime      @default(now())
 
@@ -1635,4 +1688,113 @@ model KnowledgeGap {
   @@unique([organizationId, questionKey])
   @@index([organizationId, status, count])
   @@map("knowledge_gaps")
+}
+
+
+// ─── Election incident reporting ─────────────────────────────────────────────
+
+/// Whether a reported claim is true. Separate from `CaseStage`, which is about
+/// whether the work on it is done.
+enum VerificationState {
+  /// One report, nothing checked. The default, and what most reports stay as.
+  UNVERIFIED
+  /// Independent reports from different reporters at the same polling unit.
+  CORROBORATED
+  /// A human reviewed the evidence and stands behind it.
+  VERIFIED
+  /// Reports conflict, or a reviewer could not settle it.
+  DISPUTED
+  /// Checked and untrue. Kept, not deleted: what was claimed and refuted is
+  /// itself part of the record.
+  FALSE_REPORT
+}
+
+enum IncidentSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  /// Ongoing violence, or anything with casualties. Escalates in minutes.
+  CRITICAL
+}
+
+/// A file a reporter sent, kept as it arrived.
+///
+/// Inbound media used to be downloaded, passed to the model for a description,
+/// and the BYTES DISCARDED — what persisted was the description plus an
+/// expiring `graph.facebook.com` URL needing a provider token. A photograph of
+/// ballot snatching became a sentence of model prose, and the photograph was
+/// gone. For an election petition that is worthless.
+///
+/// So the bytes are stored, hashed at ingest, and never modified. `derivedText`
+/// is what a model made of the file; it is a description, never a finding, and
+/// it does not replace the file.
+model Evidence {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  ticketId       String?
+  ticket         Ticket?      @relation(fields: [ticketId], references: [id], onDelete: SetNull)
+  contactId      String?
+  conversationId String?
+  messageId      String?
+  callSid        String?
+
+  channel  String
+  /// image | audio | video | document
+  kind     String
+
+  /// OUR storage path, never a provider URL.
+  storagePath String
+  mimeType    String
+  byteSize    Int
+  /// SHA-256 of the bytes exactly as received, before any processing. This is
+  /// what makes the file admissible: it proves the copy was not altered.
+  sha256      String
+  /// The provider's own id, kept to trace where the file came from.
+  sourceRef   String?
+
+  /// What a model made of the file. A description, not a conclusion.
+  derivedText String?   @db.Text
+  /// From the file's own metadata, when it has any. Not the time we received it.
+  capturedAt  DateTime?
+  receivedAt  DateTime  @default(now())
+  latitude    Float?
+  longitude   Float?
+
+  /// Retention must not delete this.
+  legalHold       Boolean @default(false)
+  legalHoldReason String?
+
+  @@index([organizationId, sha256])
+  @@index([organizationId, receivedAt])
+  @@index([ticketId])
+  @@map("evidence")
+}
+
+/// INEC's polling unit register for the State.
+///
+/// State-wide reference data, not per-tenant: a polling unit is a fact about
+/// the State, exactly as an LGA is (see `state-geography.ts`). Loaded by
+/// `npm run units:load`; EMPTY until the register is loaded, and the resolver
+/// says so rather than guessing a unit.
+model PollingUnit {
+  id   String @id @default(uuid())
+  /// INEC code, e.g. "15-04-07-012".
+  code String @unique
+  name String
+  /// Must be one of the State's LGAs.
+  lga              String
+  /// INEC Registration Area (ward).
+  registrationArea String
+  /// Registered voters, when the register gives it.
+  registeredVoters Int?
+  latitude         Float?
+  longitude        Float?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([lga, registrationArea])
+  @@index([registrationArea])
+  @@map("polling_units")
 }

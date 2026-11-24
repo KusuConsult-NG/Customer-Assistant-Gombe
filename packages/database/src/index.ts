@@ -129,3 +129,5 @@ export * from './audit';
 export * from './budget';
 export * from './cases';
 export * from './knowledge-gaps';
+export * from './election-incidents';
+export * from './polling-units';

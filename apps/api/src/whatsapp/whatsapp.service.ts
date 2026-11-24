@@ -11,6 +11,7 @@ import { WorkflowTriggerService } from '../workflows/workflow-trigger.service';
 import { OnboardingService } from '../onboarding/onboarding.service';
 import { WhatsAppCallAnswerService } from './whatsapp-call-answer.service';
 import { understandMedia, mediaTextForEngine, mediaRefusalReply, MEDIA_LIMITS, type MediaKind, type MediaOutcome } from './media-understanding';
+import { ingestEvidence } from '../common/evidence';
 import { recordSent, recordSendFailure, applyDeliveryReceipt } from './delivery-status';
 
 const log = new AceLogger('WhatsappService');
@@ -233,10 +234,13 @@ export class WhatsappService {
       let textContent: string;
       let mediaUrl: string | undefined;
       let mediaType: string | undefined;
+      /// A shared location's own coordinates, stored on the message.
+      let sharedLatitude: number | undefined;
+      let sharedLongitude: number | undefined;
       // Kept so the file can be fetched and UNDERSTOOD below (PRD §06), not
       // just recorded as "[Customer sent a voice message]".
       const mediaId: string | undefined =
-        message.audio?.id ?? message.image?.id ?? message.document?.id ?? undefined;
+        message.audio?.id ?? message.image?.id ?? message.document?.id ?? message.video?.id ?? undefined;
       const mediaCaption: string | undefined = message.image?.caption ?? message.document?.caption ?? undefined;
       const mediaFileName: string | undefined = message.document?.filename ?? undefined;
 
@@ -269,10 +273,15 @@ export class WhatsappService {
         textContent = '[Customer sent a sticker]';
         mediaType = 'sticker';
       } else if (message.type === 'location') {
-        const lat = message.location?.latitude;
-        const lng = message.location?.longitude;
+        // The coordinates are KEPT, not just narrated. They used to be
+        // formatted into this sentence and the numbers thrown away, so nothing
+        // could map a report or check whether a reporter was where they said
+        // they were — which, for an election incident, is the whole point of
+        // asking them to share a location.
+        sharedLatitude = typeof message.location?.latitude === 'number' ? message.location.latitude : undefined;
+        sharedLongitude = typeof message.location?.longitude === 'number' ? message.location.longitude : undefined;
         const name = message.location?.name ? ` (${message.location.name})` : '';
-        textContent = `[Customer shared a location${name}: lat ${lat}, lng ${lng}]`;
+        textContent = `[Customer shared a location${name}: lat ${sharedLatitude}, lng ${sharedLongitude}]`;
       } else if (message.type === 'contacts') {
         textContent = '[Customer shared a contact card]';
       } else {
@@ -459,6 +468,8 @@ export class WhatsappService {
             content: textContent,
             mediaUrl: mediaUrl ?? null,
             mediaType: mediaType ?? null,
+            latitude: sharedLatitude ?? null,
+            longitude: sharedLongitude ?? null,
             externalId: messageId,
             metadata: { messageId, messageType: message.type },
           },
@@ -519,9 +530,10 @@ export class WhatsappService {
       // the transcript too, not a placeholder. A file that cannot be used is
       // answered honestly ("couldn't make out that voice note") rather than
       // passed on as a placeholder for the model to guess at.
-      if (mediaId && (mediaType === 'audio' || mediaType === 'image' || mediaType === 'document')) {
+      if (mediaId && (mediaType === 'audio' || mediaType === 'image' || mediaType === 'document' || mediaType === 'video')) {
         const understood = await this.understandInboundMedia(
           config, mediaId, mediaType, mediaCaption, mediaFileName, messageId, correlationId,
+          { organizationId, contactId: contact.id, conversationId: conversation.id },
         );
         if (understood.ok) {
           textContent = mediaTextForEngine(understood, mediaCaption);
@@ -739,7 +751,17 @@ export class WhatsappService {
   }
 
   /**
-   * Download one inbound file and turn it into text the engine can answer.
+   * Download one inbound file, KEEP IT, and turn it into text the engine can
+   * answer.
+   *
+   * The keeping is the part that changed. The bytes used to be downloaded,
+   * handed to the model, and discarded — the only durable trace was the model's
+   * description plus an expiring `graph.facebook.com` URL. A citizen's
+   * photograph is their evidence, so it is now stored, hashed and recorded by
+   * `ingestEvidence` BEFORE anything tries to interpret it, and the storing
+   * happens even when the file turns out to be unreadable: a video we cannot
+   * describe is still a video somebody filmed.
+   *
    * Never throws. On success the stored message is updated to carry the
    * transcript / description / extract, so the dashboard shows what the
    * citizen actually said rather than "[Customer sent a voice message]".
@@ -747,22 +769,48 @@ export class WhatsappService {
   private async understandInboundMedia(
     config: { phoneNumberId: string | null; accessToken: string | null; webhookVerifyToken: string | null },
     mediaId: string,
-    kind: MediaKind,
+    kind: MediaKind | 'video',
     caption: string | undefined,
     fileName: string | undefined,
     messageId: string,
     correlationId: string,
+    origin?: { organizationId: string; contactId?: string | null; conversationId?: string | null },
   ): Promise<MediaOutcome> {
     let outcome: MediaOutcome;
     try {
       const client = resolveWhatsAppClient(config);
+      // A video is kept but not interpreted, so it has no MEDIA_LIMITS entry.
+      const maxBytes = kind === 'video' ? 16 * 1024 * 1024 : MEDIA_LIMITS[kind].maxBytes;
       // +1 byte so an oversized file is reported as too large, not as unreadable.
-      const media = await client.downloadMedia(mediaId, MEDIA_LIMITS[kind].maxBytes + 1);
-      outcome = media
-        ? await understandMedia(kind, media.bytes, media.mimeType, { caption, fileName })
-        : { ok: false, kind, reason: 'unreadable', detail: 'download failed or exceeded the size limit' };
+      const media = await client.downloadMedia(mediaId, maxBytes + 1);
+
+      if (media && origin) {
+        // Stored FIRST, and on its own failure path: whether the model can
+        // read the file has nothing to do with whether we should keep it.
+        await ingestEvidence({
+          organizationId: origin.organizationId,
+          bytes: media.bytes,
+          mimeType: media.mimeType ?? 'application/octet-stream',
+          kind: kind === 'document' ? 'document' : kind === 'audio' ? 'audio' : kind === 'video' ? 'video' : 'image',
+          channel: 'WHATSAPP',
+          sourceRef: mediaId,
+          fileName: fileName ?? null,
+          contactId: origin.contactId ?? null,
+          conversationId: origin.conversationId ?? null,
+          messageId,
+        });
+      }
+
+      if (kind === 'video') {
+        // Kept, not interpreted. Said plainly rather than guessed at.
+        outcome = { ok: false, kind: 'document', reason: 'unsupported_type', detail: 'video kept as evidence; not transcribed' };
+      } else {
+        outcome = media
+          ? await understandMedia(kind, media.bytes, media.mimeType, { caption, fileName })
+          : { ok: false, kind, reason: 'unreadable', detail: 'download failed or exceeded the size limit' };
+      }
     } catch (err: any) {
-      outcome = { ok: false, kind, reason: 'unreadable', detail: String(err?.message ?? err) };
+      outcome = { ok: false, kind: kind === 'video' ? 'document' : kind, reason: 'unreadable', detail: String(err?.message ?? err) } as MediaOutcome;
     }
 
     log.info('whatsapp_media_understood', {
