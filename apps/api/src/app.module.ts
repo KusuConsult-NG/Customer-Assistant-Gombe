@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { SituationRoomModule } from './situation-room/situation-room.module';
 import { APP_GUARD } from '@nestjs/core';
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
 import { DiagnosticsModule } from './diagnostics/diagnostics.module';
@@ -53,6 +54,7 @@ import { OnboardingModule } from './onboarding/onboarding.module';
     OrganizationsModule,
     PlatformModule,
     CatalogueModule,
+    SituationRoomModule,
     BudgetModule,
     CasesModule,
     CrmModule,

@@ -239,6 +239,7 @@ model Organization {
   deals              Deal[]
   tickets            Ticket[]
   evidence           Evidence[]
+  accreditedReporters AccreditedReporter[]
   conversations      Conversation[]
   callLogs           CallLog[]
   knowledgeDocuments KnowledgeDocument[]
@@ -604,6 +605,15 @@ model Ticket {
   legalHold        Boolean           @default(false)
   legalHoldReason  String?
 
+  /// Who reported it. An accredited observer at their assigned unit and an
+  /// anonymous tip are both worth having and are NOT the same evidence.
+  reporterKind         ReporterKind @default(UNKNOWN)
+  accreditedReporterId String?
+  accreditedReporter   AccreditedReporter? @relation(fields: [accreditedReporterId], references: [id], onDelete: SetNull)
+  /// How many of `corroborations` came from accredited reporters. Two
+  /// accredited observers is a finding; two anonymous tips is a lead.
+  accreditedCorroborations Int       @default(0)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -614,6 +624,7 @@ model Ticket {
   @@index([organizationId, createdAt])
   @@index([organizationId, pollingUnitCode])
   @@index([organizationId, verification])
+  @@index([organizationId, reporterKind])
   /// ONE incident per cluster, enforced by the database.
   ///
   /// A surge test fired 60 simultaneous reports at one polling unit and got 22
@@ -1810,4 +1821,81 @@ model PollingUnit {
   @@index([lga, registrationArea])
   @@index([registrationArea])
   @@map("polling_units")
+}
+
+
+/// Where a report came from.
+enum ReporterKind {
+  /// An accredited observer, matched to the roster by phone or code.
+  ACCREDITED
+  /// A member of the public. Worth having; not the same evidence.
+  PUBLIC
+  /// Not established — the default, and what a report stays as unless matched.
+  UNKNOWN
+}
+
+enum AccreditedRole {
+  OBSERVER
+  COORDINATOR
+  LAWYER
+  MEDIA
+}
+
+/// A reporter the coalition has accredited, and where they were deployed.
+///
+/// ── Why the roster exists ───────────────────────────────────────────────────
+///
+/// Without it every caller is just a `Contact`, and three things become
+/// impossible. A situation room cannot tell a trained observer standing at
+/// their assigned unit from an anonymous caller repeating a rumour — and both
+/// deserve to be recorded, but not identically. It cannot tell whether silence
+/// from a unit means nothing happened or that nobody was deployed there.
+/// And it has no defence against coordinated flooding, which looks exactly
+/// like a lot of independent reports.
+///
+/// Matching is by PHONE on the way in, because that is what a phone call and a
+/// WhatsApp message carry, with a short code as the fallback a reporter can
+/// read out when they are calling from someone else's handset.
+///
+/// This is NOT authentication. A phone number is not a credential: handsets are
+/// shared, lent and stolen. It raises confidence and it records a deployment;
+/// it does not prove identity, and nothing here should be written as though it
+/// does.
+model AccreditedReporter {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  /// Short code a reporter can read out: "my code is GM-0471".
+  code      String
+  fullName  String
+  /// E.164, matched against the calling number.
+  phoneNumber String
+  role        AccreditedRole @default(OBSERVER)
+
+  /// Where they were deployed. An LGA at minimum; a unit where the plan is
+  /// that specific. A report from somewhere else is not refused — observers
+  /// get moved — but the difference is recorded.
+  deployedLga              String?
+  deployedRegistrationArea String?
+  deployedPollingUnitCode  String?
+
+  active        Boolean   @default(true)
+  accreditedAt  DateTime  @default(now())
+  /// Set when accreditation is withdrawn. Their past reports are NOT deleted:
+  /// what was reported and by whom is the record.
+  withdrawnAt   DateTime?
+  withdrawnReason String?
+  note          String?   @db.Text
+
+  tickets Ticket[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([organizationId, code])
+  @@unique([organizationId, phoneNumber])
+  @@index([organizationId, active])
+  @@index([organizationId, deployedLga])
+  @@map("accredited_reporters")
 }

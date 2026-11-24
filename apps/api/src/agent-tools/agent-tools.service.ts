@@ -31,6 +31,7 @@ import {
   normaliseUnitCode,
   unitMissReply,
 } from '@ace/database';
+import { matchReporter, deploymentNote } from './accredited-reporter';
 import {
   electionIncidentFields,
   resolveUnitFromRegister,
@@ -1406,6 +1407,8 @@ export class AgentToolsService implements OnModuleInit, OnModuleDestroy {
       longitude?: number;
       /** The reporter asked not to have the report read back aloud. */
       noReadBack?: boolean | string;
+      /** An accreditation code the reporter read out, when calling from another handset. */
+      reporterCode?: string;
     }
   ): Promise<ToolResult> {
     try {
@@ -1476,6 +1479,18 @@ export class AgentToolsService implements OnModuleInit, OnModuleDestroy {
       }
 
       const unitCode = unit?.ok ? unit.unit.code : normaliseUnitCode(input.pollingUnitCode) ?? null;
+
+      // Who is reporting. Raises confidence and records a deployment; it is not
+      // authentication and it never refuses a report. See `matchReporter`.
+      const reporter = isElection
+        ? await matchReporter(organizationId, {
+            phoneNumber: input.phoneNumber,
+            reporterCode: input.reporterCode ?? null,
+            lga: input.lga ?? null,
+            pollingUnitCode: unitCode,
+          })
+        : null;
+
       const election = isElection
         ? electionIncidentFields({
             text: electionText,
@@ -1633,7 +1648,8 @@ export class AgentToolsService implements OnModuleInit, OnModuleDestroy {
       if (election?.clusterKey) {
         const existing = await corroborateExisting(organizationId, election.clusterKey, {
           contactId: contact.id,
-          account: details,
+          account: [details, deploymentNote(reporter!) ?? ''].filter(Boolean).join('\n'),
+          accredited: reporter?.kind === 'ACCREDITED',
         });
         if (existing) {
           return {
@@ -1705,6 +1721,8 @@ export class AgentToolsService implements OnModuleInit, OnModuleDestroy {
                   longitude: typeof input.longitude === 'number' ? input.longitude : null,
                   clusterKey: election.clusterKey,
                   needsClassification: election.needsClassification,
+                  reporterKind: reporter?.kind ?? 'UNKNOWN',
+                  accreditedReporterId: reporter?.reporterId ?? null,
                 },
               }
             : {}),
@@ -1718,7 +1736,8 @@ export class AgentToolsService implements OnModuleInit, OnModuleDestroy {
         if (!election?.clusterKey || !isClusterConflict(err)) throw err;
         const won = await corroborateExisting(organizationId, election.clusterKey, {
           contactId: contact.id,
-          account: details,
+          account: [details, deploymentNote(reporter!) ?? ''].filter(Boolean).join('\n'),
+          accredited: reporter?.kind === 'ACCREDITED',
         });
         if (!won) throw err;
         return {

@@ -268,6 +268,8 @@ export class CrmService {
           longitude?: number | null;
           clusterKey?: string | null;
           needsClassification?: boolean;
+          reporterKind?: 'ACCREDITED' | 'PUBLIC' | 'UNKNOWN';
+          accreditedReporterId?: string | null;
         };
       };
     }
@@ -314,6 +316,9 @@ export class CrmService {
                   longitude: c.election.longitude ?? null,
                   clusterKey: c.election.clusterKey ?? null,
                   needsClassification: c.election.needsClassification ?? false,
+                  reporterKind: (c.election.reporterKind ?? 'UNKNOWN') as any,
+                  accreditedReporterId: c.election.accreditedReporterId ?? null,
+                  accreditedCorroborations: c.election.reporterKind === 'ACCREDITED' ? 1 : 0,
                 }
               : {}),
             channel: c.channel,

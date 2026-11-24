@@ -95,6 +95,7 @@ export interface CorroborationOutcome {
   ticketId: string;
   ticketNumber: string;
   corroborations: number;
+  accreditedCorroborations: number;
   verification: IncidentVerification;
 }
 
@@ -115,7 +116,7 @@ export interface CorroborationOutcome {
 export async function corroborateExisting(
   organizationId: string,
   clusterKey: string | null,
-  reporter: { contactId: string; account: string },
+  reporter: { contactId: string; account: string; accredited?: boolean },
 ): Promise<CorroborationOutcome | null> {
   if (!clusterKey) return null;
 
@@ -124,7 +125,8 @@ export async function corroborateExisting(
       where: { organizationId, clusterKey },
       orderBy: { createdAt: 'asc' },
       select: {
-        id: true, ticketNumber: true, corroborations: true, verification: true, contactId: true,
+        id: true, ticketNumber: true, corroborations: true, accreditedCorroborations: true,
+        verification: true, contactId: true,
         events: { where: { type: 'CORROBORATION' }, select: { body: true } },
       },
     });
@@ -136,6 +138,7 @@ export async function corroborateExisting(
       existing.events.some((e) => (e.body ?? '').includes(`contact:${reporter.contactId}`));
 
     let corroborations = existing.corroborations;
+    let accreditedCorroborations = existing.accreditedCorroborations;
     let verification = existing.verification as IncidentVerification;
 
     if (!alreadyCounted) {
@@ -152,8 +155,14 @@ export async function corroborateExisting(
       const [updated] = await prisma.$transaction([
         prisma.ticket.update({
           where: { id: existing.id },
-          data: { corroborations: { increment: 1 } },
-          select: { corroborations: true, verification: true },
+          data: {
+            corroborations: { increment: 1 },
+            // Counted apart, because two accredited observers is a finding and
+            // two anonymous tips is a lead, and a brief that cannot tell them
+            // apart is one rumour from being wrong in public.
+            ...(reporter.accredited ? { accreditedCorroborations: { increment: 1 } } : {}),
+          },
+          select: { corroborations: true, accreditedCorroborations: true, verification: true },
         }),
         prisma.caseEvent.create({
           data: {
@@ -169,6 +178,7 @@ export async function corroborateExisting(
       ]);
 
       corroborations = updated.corroborations;
+      accreditedCorroborations = updated.accreditedCorroborations;
       verification = verificationFromCorroboration(
         updated.verification as IncidentVerification,
         corroborations,
@@ -197,6 +207,7 @@ export async function corroborateExisting(
       ticketId: existing.id,
       ticketNumber: existing.ticketNumber,
       corroborations,
+      accreditedCorroborations,
       verification,
     };
   } catch (err: any) {
