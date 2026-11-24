@@ -224,15 +224,19 @@ describe('Agent tool catalogue', () => {
   // multilingual v3 model with expressive mode, lowered stability and an
   // off-1.0 speed. Two voices only — Garba, and the Governor for his
   // opening — at the settings they sounded right on.
-  it('speaks in exactly two voices, on the English model, at normal speed', () => {
+  it('speaks in ONE voice by default, on the English model, at normal speed', () => {
     const def = agentDefinitionFor({ ...ORG, voiceId: null }, []) as any;
     const tts = def.conversationConfig.tts;
     expect(tts.modelId).toBe('eleven_flash_v2');
     expect(tts.voiceId).toBe('KpLREcAbIIKFKpEkPEIR');
     expect(tts.expressiveMode).toBeUndefined();
     expect(tts.speed).toBe(1.0);
-    expect(tts.supportedVoices.map((v: any) => [v.label, v.voiceId])).toEqual([['governor', 'pAqGcXrGBThHKNv6yJnM']]);
-    expect(tts.supportedVoices[0].speed).toBe(1.0);
+    // ONE voice by default, not two. The Governor's voice is opt-in via
+    // GOVERNOR_OPENING=1 and must stay off for an election deployment: a
+    // sitting Governor is a party principal, and an assistant that answers a
+    // report of vote buying in the incumbent's voice is the first thing anyone
+    // will use to attack the credibility of the whole dataset.
+    expect(tts.supportedVoices).toEqual([]);
   });
 
   // Calls dropped in the middle of the agent talking. ElevenLabs counts this

@@ -60,6 +60,14 @@ describe('Live agent settings drift', () => {
   });
 
   it('names every setting a refused sync left behind', () => {
+    // The Governor's voice is opt-in (GOVERNOR_OPENING=1) and off for an
+    // election deployment, so "Governor speaking speed" can only drift where
+    // it is switched on. Enabled just for this case, which is what keeps that
+    // drift check covered — `liveSettingsDrift` itself handles an empty
+    // supportedVoices, and the default is now empty.
+    const priorOpening = process.env.GOVERNOR_OPENING;
+    process.env.GOVERNOR_OPENING = '1';
+    try {
     const live = liveCopy();
     live.conversationConfig.tts.speed = 0.9;
     live.conversationConfig.tts.supportedVoices[0].speed = 0.9;
@@ -80,6 +88,10 @@ describe('Live agent settings drift', () => {
     });
     expect(by['Other languages offered'].live).toBe('ha');
     expect(by['Instructions (system prompt)']).toBeDefined();
+    } finally {
+      if (priorOpening === undefined) delete process.env.GOVERNOR_OPENING;
+      else process.env.GOVERNOR_OPENING = priorOpening;
+    }
   });
 
   it('catches the conversation-start webhook left on (the "all circuits are busy" setting)', () => {

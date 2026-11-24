@@ -25,6 +25,18 @@
  * in as organizationId — never read from the request body.
  */
 import { reportRegisteredReply, urgentReportReply, spokenReference } from './spoken-replies';
+import {
+  classifyIncident,
+  incidentType as lookupIncidentType,
+  normaliseUnitCode,
+} from '@ace/database';
+import {
+  electionIncidentFields,
+  corroborateExisting,
+  corroborationReply,
+  shouldSkipReadBack,
+  discreetReply,
+} from './election-incident';
 import { rotateGombeAssistantName } from './gombe-name-rotation';
 import { speakableHonours } from './spoken-names';
 import { BadRequestException, HttpException, HttpStatus, Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
@@ -1375,6 +1387,22 @@ export class AgentToolsService implements OnModuleInit, OnModuleDestroy {
       alternativePhoneConfirmed?: boolean | string;
       /** This call, so its record can be attached to the case when it ends. */
       conversationId?: string;
+
+      // ── Election incident reporting ──────────────────────────────────────
+      /** An explicit type from `election-incidents.ts`; wins over keywords. */
+      incidentType?: string;
+      /** Force the election path even when no keyword matched. */
+      electionIncident?: boolean | string;
+      /** INEC polling unit code, e.g. "15-04-07-012". */
+      pollingUnitCode?: string;
+      /** The unit as the reporter named it, when they have no code. */
+      pollingUnit?: string;
+      /** INEC Registration Area (ward), when known. */
+      registrationArea?: string;
+      latitude?: number;
+      longitude?: number;
+      /** The reporter asked not to have the report read back aloud. */
+      noReadBack?: boolean | string;
     }
   ): Promise<ToolResult> {
     try {
@@ -1401,6 +1429,29 @@ export class AgentToolsService implements OnModuleInit, OnModuleDestroy {
         : null;
       const ongoing = yes(input.isOngoing);
 
+      // ── Election incident path ────────────────────────────────────────────
+      //
+      // Entered when the agent names a type, when it asks for it explicitly,
+      // or when the reporter's own words match the election taxonomy. Outside
+      // an election this never fires: none of the service categories matches
+      // the election keyword list.
+      const electionText = `${input.subject} ${input.description} ${input.additionalEvidence ?? ''}`;
+      const isElection =
+        !!lookupIncidentType(input.incidentType) ||
+        yes(input.electionIncident) ||
+        classifyIncident(electionText) !== null;
+
+      const unitCode = normaliseUnitCode(input.pollingUnitCode) ?? null;
+      const election = isElection
+        ? electionIncidentFields({
+            text: electionText,
+            incidentType: input.incidentType ?? null,
+            isOngoing: ongoing,
+            victimsOrInjuries: input.victimsOrInjuries ?? null,
+            pollingUnitCode: unitCode,
+          })
+        : null;
+
       // The words alone are not enough once the agent has named the area
       // (Phase 3). "The culvert collapsed last week" matched DISASTER and was
       // filed as an urgent incident, with SEMA's emergency line read to a
@@ -1422,7 +1473,17 @@ export class AgentToolsService implements OnModuleInit, OnModuleDestroy {
       // on — so nothing is written until the caller has said it is right. The
       // one exception is an emergency still happening: someone in danger is not
       // asked to approve a summary first.
-      const activeEmergency = !!kind && ongoing;
+      // An election reporter may be standing a few feet from the people they
+      // are reporting. Reciting "you said armed men are snatching ballot boxes
+      // at Unit 012" out loud can be overheard, so the read-back is skipped for
+      // anything in the SAFETY group, anything still happening, and whenever
+      // the reporter asks — and the confirmation that replaces it names no
+      // detail. See `shouldSkipReadBack`.
+      const skipReadBack =
+        !!election &&
+        shouldSkipReadBack(election, { reporterAsked: yes(input.noReadBack), isOngoing: ongoing });
+
+      const activeEmergency = (!!kind && ongoing) || skipReadBack;
       if (!yes(input.summaryConfirmed) && !activeEmergency) {
         return {
           ok: false,
@@ -1526,6 +1587,38 @@ export class AgentToolsService implements OnModuleInit, OnModuleDestroy {
       const anonymous = yes(input.anonymous) || wantsAnonymity(text);
       const stage = cls.category === 'other' ? 'RECEIVED' : 'CLASSIFIED';
 
+      // ── One event, many reporters ─────────────────────────────────────────
+      //
+      // Twenty observers at one polling unit watching one ballot box carried
+      // off is ONE incident with twenty corroborations. Filed as twenty it both
+      // overstates the violation and buries it, and a situation room briefing
+      // "twenty incidents in Akko" when there was one is how a credible dataset
+      // stops being credible. So an election report that matches an existing
+      // incident at the same unit is added to it and the reporter is given the
+      // SAME reference, not a new one.
+      if (election?.clusterKey) {
+        const existing = await corroborateExisting(organizationId, election.clusterKey, {
+          contactId: contact.id,
+          account: details,
+        });
+        if (existing) {
+          return {
+            ok: true,
+            speak: corroborationReply(existing, spokenReference(existing.ticketNumber)),
+            data: {
+              filed: true,
+              corroborated: true,
+              ticketId: existing.ticketId,
+              ticketNumber: existing.ticketNumber,
+              corroborations: existing.corroborations,
+              verification: existing.verification,
+              incidentType: election.incidentType,
+              severity: election.severity,
+            },
+          };
+        }
+      }
+
       const ticket = await this.crm.createTicket(organizationId, {
         contactId: contact.id,
         subject,
@@ -1543,7 +1636,10 @@ export class AgentToolsService implements OnModuleInit, OnModuleDestroy {
           // The read-back the caller confirmed — the record of what they agreed
           // they reported, kept beside their own words in `description`.
           summary: input.summary?.trim() || null,
-          dueAt: new Date(Date.now() + cls.serviceDays * 86_400_000),
+          // An election incident's deadline is in MINUTES (5 for critical).
+          // The service charter's days would have an ongoing attack "on time"
+          // until after the result was declared.
+          dueAt: election ? election.dueAt : new Date(Date.now() + cls.serviceDays * 86_400_000),
           channel: 'VOICE',
           openedBy: 'system:voice-agent',
           eventBody:
@@ -1551,6 +1647,24 @@ export class AgentToolsService implements OnModuleInit, OnModuleDestroy {
               ? `Opened from a phone call after the caller confirmed the summary; classified as ${cls.category}, marked for ${routedToMda}.`
               : `Opened from a phone call as an emergency still in progress, without a read-back; classified as ${cls.category}, marked for ${routedToMda}.`) +
             (input.conversationId?.trim() ? callReferenceText(input.conversationId.trim()) : ''),
+          ...(election
+            ? {
+                election: {
+                  incidentType: election.incidentType,
+                  severity: election.severity,
+                  registrationArea: input.registrationArea?.trim() || null,
+                  pollingUnitCode: unitCode,
+                  // The unit as the REPORTER named it, kept even when it could
+                  // not be resolved: the register is incomplete, and a report
+                  // must never be blocked by our reference data.
+                  pollingUnitName: input.pollingUnit?.trim() || null,
+                  latitude: typeof input.latitude === 'number' ? input.latitude : null,
+                  longitude: typeof input.longitude === 'number' ? input.longitude : null,
+                  clusterKey: election.clusterKey,
+                  needsClassification: election.needsClassification,
+                },
+              }
+            : {}),
         },
       });
 
@@ -1595,10 +1709,25 @@ export class AgentToolsService implements OnModuleInit, OnModuleDestroy {
       // case to that office, an officer refers it.
       return {
         ok: true,
-        speak: reportRegisteredReply(ticket.ticketNumber, callerDisplayName),
+        // A reporter who may be overheard gets a confirmation that names no
+        // detail and no name — not the full read-back, which would recite back
+        // to the room exactly what they just risked telling us.
+        speak: skipReadBack
+          ? discreetReply(spokenReference(ticket.ticketNumber))
+          : reportRegisteredReply(ticket.ticketNumber, callerDisplayName),
         data: {
           ticketId: ticket.id,
           ticketNumber: ticket.ticketNumber,
+          ...(election
+            ? {
+                incidentType: election.incidentType,
+                severity: election.severity,
+                verification: 'UNVERIFIED',
+                corroborations: 1,
+                needsClassification: election.needsClassification,
+                readBackSkipped: skipReadBack,
+              }
+            : {}),
           category: cls.category,
           sector,
           routedToMda,

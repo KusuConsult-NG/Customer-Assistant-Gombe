@@ -253,6 +253,22 @@ export class CrmService {
         channel: string;
         openedBy: string;
         eventBody: string;
+        /**
+         * Election incident fields. Absent for an ordinary service case, and
+         * when absent the columns stay null — one ticket model, two taxonomies,
+         * neither distorting the other. See `election-incidents.ts`.
+         */
+        election?: {
+          incidentType: string;
+          severity: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
+          registrationArea?: string | null;
+          pollingUnitCode?: string | null;
+          pollingUnitName?: string | null;
+          latitude?: number | null;
+          longitude?: number | null;
+          clusterKey?: string | null;
+          needsClassification?: boolean;
+        };
       };
     }
   ) {
@@ -287,6 +303,19 @@ export class CrmService {
             responsibleMda: c.responsibleMda ?? null,
             summary: c.summary,
             dueAt: c.dueAt,
+            ...(c.election
+              ? {
+                  incidentType: c.election.incidentType,
+                  severity: c.election.severity as any,
+                  registrationArea: c.election.registrationArea ?? null,
+                  pollingUnitCode: c.election.pollingUnitCode ?? null,
+                  pollingUnitName: c.election.pollingUnitName ?? null,
+                  latitude: c.election.latitude ?? null,
+                  longitude: c.election.longitude ?? null,
+                  clusterKey: c.election.clusterKey ?? null,
+                  needsClassification: c.election.needsClassification ?? false,
+                }
+              : {}),
             channel: c.channel,
             events: {
               create: {

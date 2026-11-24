@@ -46,6 +46,19 @@ export interface IncidentType {
   readonly baseSeverity: Severity;
   /** Words a reporter actually uses, for the keyword matcher. */
   readonly says: readonly string[];
+  /**
+   * Words that describe WHO was there rather than WHAT happened.
+   *
+   * "Thugs came and snatched the ballot box" is a report of ballot snatching.
+   * Matching it on "thugs" filed it as generic violence and lost the one fact
+   * that tells a situation room what to do — that the box is gone. Actor words
+   * therefore only classify when nothing stronger matched anywhere, so they
+   * still catch "there are thugs at my polling unit", which is a real report
+   * with no act in it yet.
+   *
+   * It costs no urgency: `ballot_snatching` is CRITICAL in its own right.
+   */
+  readonly weakSays?: readonly string[];
 }
 
 export const INCIDENT_TYPES: readonly IncidentType[] = [
@@ -55,7 +68,8 @@ export const INCIDENT_TYPES: readonly IncidentType[] = [
     label: 'Violence or attack',
     group: 'SAFETY',
     baseSeverity: 'CRITICAL',
-    says: ['violence', 'attack', 'attacked', 'shooting', 'gunmen', 'gunshot', 'thugs', 'thuggery', 'machete', 'stabbed', 'beaten', 'killed', 'dead', 'injured', 'fighting', 'riot', 'bomb', 'explosion'],
+    says: ['violence', 'attack', 'attacked', 'shooting', 'gunshot', 'machete', 'stabbed', 'beaten', 'killed', 'dead', 'injured', 'fighting', 'riot', 'bomb', 'explosion'],
+    weakSays: ['thugs', 'thuggery', 'gunmen', 'hoodlums', 'miscreants'],
   },
   {
     id: 'voter_intimidation',
@@ -201,19 +215,25 @@ export function classifyIncident(text: string | null | undefined): IncidentType 
   if (said.trim().length === 0) return null;
 
   const GROUP_RANK: Record<IncidentGroup, number> = { SAFETY: 0, INTEGRITY: 1, TECHNOLOGY: 2, PROCESS: 3 };
-  let best: { type: IncidentType; phraseLength: number } | null = null;
 
-  for (const type of INCIDENT_TYPES) {
-    for (const phrase of type.says) {
-      if (!said.includes(` ${phrase} `) && !said.includes(` ${phrase}`)) continue;
-      const better =
-        !best ||
-        GROUP_RANK[type.group] < GROUP_RANK[best.type.group] ||
-        (GROUP_RANK[type.group] === GROUP_RANK[best.type.group] && phrase.length > best.phraseLength);
-      if (better) best = { type, phraseLength: phrase.length };
+  const match = (pick: (t: IncidentType) => readonly string[]) => {
+    let best: { type: IncidentType; phraseLength: number } | null = null;
+    for (const type of INCIDENT_TYPES) {
+      for (const phrase of pick(type)) {
+        if (!said.includes(` ${phrase} `) && !said.includes(` ${phrase}`)) continue;
+        const better =
+          !best ||
+          GROUP_RANK[type.group] < GROUP_RANK[best.type.group] ||
+          (GROUP_RANK[type.group] === GROUP_RANK[best.type.group] && phrase.length > best.phraseLength);
+        if (better) best = { type, phraseLength: phrase.length };
+      }
     }
-  }
-  return best?.type ?? null;
+    return best?.type ?? null;
+  };
+
+  // What happened beats who was there. Only when no act was named at all does
+  // an actor word ("thugs at my polling unit") classify on its own.
+  return match((t) => t.says) ?? match((t) => t.weakSays ?? []);
 }
 
 /**

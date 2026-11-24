@@ -236,8 +236,39 @@ export const VOICE_MODEL_ID = 'eleven_flash_v2';
 /** Garba — every word the agent says outside the Governor's opening. */
 export const GARBA_VOICE_ID = 'KpLREcAbIIKFKpEkPEIR'; // TODO(gombe): Plateau clone — re-record.
 
-/** His Excellency the Governor — the `<governor>` part of the opening only. */
-export const GOVERNOR_VOICE_ID = 'pAqGcXrGBThHKNv6yJnM'; // TODO(gombe): Mutfwang's voice — re-record.
+/**
+ * His Excellency the Governor — the `<governor>` part of the opening only.
+ *
+ * ⚠ OFF BY DEFAULT, and it should stay off for an election deployment.
+ *
+ * Two separate problems, and only the first is fixed by re-recording:
+ *
+ *   1. This id is still a clone of CALEB MUTFWANG, Governor of PLATEAU State.
+ *      "Welcome to the Gombe State Government Citizen Contact Centre" would be
+ *      spoken in another State's Governor's voice, under Inuwa Yahaya's name.
+ *   2. Even with a correctly recorded and consented Gombe voice, THE GOVERNOR'S
+ *      VOICE MUST NOT GREET AN ELECTION INCIDENT REPORTER. A sitting Governor
+ *      is a party principal and usually a candidate. An assistant that answers
+ *      a report of vote buying by playing the incumbent's voice is a conflict
+ *      of interest on its face, and it is the first thing anyone will use to
+ *      attack the credibility of the whole dataset — including the reports that
+ *      are true. A reporter who recognises that voice may also simply hang up.
+ *
+ * So the opening is the assistant's own voice unless `GOVERNOR_OPENING=1` is
+ * set deliberately, which an election deployment must not do.
+ */
+export const GOVERNOR_VOICE_ID = 'pAqGcXrGBThHKNv6yJnM'; // TODO(gombe): Plateau's clone — re-record if ever re-enabled.
+
+/**
+ * Whether the Governor's voice is offered to the agent at all.
+ *
+ * Opt-IN. When off, the voice is not in `supportedVoices`, so the model cannot
+ * reach it even if a stale prompt still contains a `<governor>` tag — the tag
+ * is stripped from spoken text either way (`spoken-replies.ts`).
+ */
+export function governorOpeningEnabled(): boolean {
+  return process.env.GOVERNOR_OPENING === '1';
+}
 
 /**
  * The settings both voices are spoken with. Stability and similarity are the
@@ -448,19 +479,21 @@ export function agentDefinition(spec: AgentSpec) {
         // ElevenLabs' current low-latency English model (replacing deprecated
         // eleven_turbo_v2) and avoids dropped-word artifacts.
         modelId: VOICE_MODEL_ID,
-        // The Governor's opening only: `<governor>…</governor>` in the first
-        // message. Every other word is Garba's voice (spec.voiceId). No other
-        // voices are offered, so the model cannot switch to one.
-        supportedVoices: [
-          {
-            label: 'governor',
-            voiceId: GOVERNOR_VOICE_ID,
-            description:
-              'His Excellency the Governor — used ONLY inside <governor>...</governor> in the opening welcome. Never use this voice anywhere else.',
-            language: 'en',
-            ...VOICE_SETTINGS,
-          },
-        ],
+        // No second voice unless the Governor's opening is deliberately
+        // enabled. Offering it is what makes it reachable, so an election
+        // deployment simply does not offer it. See `governorOpeningEnabled`.
+        supportedVoices: governorOpeningEnabled()
+          ? [
+              {
+                label: 'governor',
+                voiceId: GOVERNOR_VOICE_ID,
+                description:
+                  'His Excellency the Governor — used ONLY inside <governor>...</governor> in the opening welcome. Never use this voice anywhere else.',
+                language: 'en',
+                ...VOICE_SETTINGS,
+              },
+            ]
+          : [],
         // ulaw_8000 = G.711 μ-law 8kHz — the universal format for telephony / PSTN networks.
         agentOutputAudioFormat: 'ulaw_8000',
         // 0 = full buffer smoothing; eleven_flash_v2 is already low-latency,
