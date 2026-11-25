@@ -28,7 +28,7 @@ import {
   AlertTriangle, RefreshCw, MapPin, EyeOff, ShieldCheck, ShieldAlert,
   Clock, Download, Radio, Users,
 } from 'lucide-react';
-import { apiFetch } from '@/lib/api';
+import { apiFetch, API_URL } from '@/lib/api';
 import { useToast } from '@/components/ui/Toast';
 import EmptyState from '@/components/ui/EmptyState';
 import { RoleNotice } from '@/components/RoleNotice';
@@ -120,13 +120,13 @@ export default function SituationRoomPage() {
     setLoading(true);
     try {
       const [o, s, u, c] = await Promise.all([
-        apiFetch('/api/situation-room/overview'),
-        apiFetch('/api/situation-room/silent'),
+        apiFetch(`${API_URL}/api/situation-room/overview`),
+        apiFetch(`${API_URL}/api/situation-room/silent`),
         // Every unit with something that could be filed, not just the ones
         // overdue: a lawyer deciding where to petition wants all of them.
         // 403 for a non-admin is expected and left silent.
-        apiFetch('/api/situation-room/petition/units'),
-        apiFetch('/api/situation-room/coalition'),
+        apiFetch(`${API_URL}/api/situation-room/petition/units`),
+        apiFetch(`${API_URL}/api/situation-room/coalition`),
       ]);
       if (o.ok) setOverview(await o.json());
       else toast.error(`Could not load the overview — the server answered ${o.status}.`);
@@ -152,7 +152,7 @@ export default function SituationRoomPage() {
   const exportBundle = async (code: string) => {
     setExporting(code);
     try {
-      const res = await apiFetch(`/api/situation-room/petition/unit/${encodeURIComponent(code)}`, {
+      const res = await apiFetch(`${API_URL}/api/situation-room/petition/unit/${encodeURIComponent(code)}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ reason: `Exported from the situation room screen on ${new Date().toISOString()}` }),
