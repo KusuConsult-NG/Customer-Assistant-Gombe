@@ -26,6 +26,29 @@ export interface SituationRoomQuery {
   lga?: string | null;
 }
 
+/**
+ * Triage order. Mirrors RESPONSE_MINUTES in @ace/database — if that changes,
+ * this is the other place that encodes "worse first".
+ */
+const SEVERITY_RANK: Record<string, number> = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3 };
+
+/**
+ * What a person should read for an incident type.
+ *
+ * The taxonomy's own label where there is one. Where there is NOT — a record
+ * written before a type was renamed, or by a classifier that has since
+ * changed — the id is humanised rather than printed raw. An officer should
+ * never be shown `result_alteration`; they are reading a list of emergencies,
+ * not a database.
+ */
+function labelFor(id: string | null): string {
+  if (!id) return 'Not yet classified';
+  const known = incidentType(id)?.label;
+  if (known) return known;
+  const words = id.replace(/[_-]+/g, ' ').trim();
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) : 'Not yet classified';
+}
+
 @Injectable()
 export class SituationRoomService {
   /**
@@ -167,7 +190,7 @@ export class SituationRoomService {
         .map((i) => ({
           ticketNumber: i.ticketNumber,
           incidentType: i.incidentType,
-          label: incidentType(i.incidentType)?.label ?? i.incidentType,
+          label: labelFor(i.incidentType),
           severity: i.severity,
           verification: i.verification,
           lga: i.lga,
@@ -183,15 +206,34 @@ export class SituationRoomService {
        */
       needsAttention: incidents
         .filter((i) => i.severity === 'CRITICAL' || (i.dueAt && i.dueAt.getTime() < now) || i.needsClassification)
+        // Worst first, then longest overdue, then oldest. The list used to
+        // come out in whatever order the query returned, which is by time
+        // across the whole State — so a screen of fifty rows could be fifty
+        // rows of one LGA while a critical incident in another waited below
+        // the fold. A triage list that is not ordered by triage is a list.
+        .sort((a, b) => {
+          const rank = (s: string | null) => SEVERITY_RANK[String(s)] ?? 99;
+          if (rank(a.severity) !== rank(b.severity)) return rank(a.severity) - rank(b.severity);
+          const over = (i: typeof a) => (i.dueAt ? now - i.dueAt.getTime() : -1);
+          if (over(a) !== over(b)) return over(b) - over(a);
+          return a.createdAt.getTime() - b.createdAt.getTime();
+        })
         .slice(0, 50)
         .map((i) => ({
           ticketNumber: i.ticketNumber,
           why: i.needsClassification ? 'not classified' : i.severity === 'CRITICAL' ? 'critical' : 'overdue',
           incidentType: i.incidentType,
+          /** What a person should read. The id is for the machine. */
+          incidentLabel: labelFor(i.incidentType),
           severity: i.severity,
           lga: i.lga,
           pollingUnitCode: i.pollingUnitCode,
+          /** When it reached us — the screen works to a minute-scale target. */
+          reportedAt: i.createdAt.toISOString(),
           dueAt: i.dueAt?.toISOString() ?? null,
+          overdueByMinutes: i.dueAt && i.dueAt.getTime() < now
+            ? Math.round((now - i.dueAt.getTime()) / 60000)
+            : null,
           corroborations: i.corroborations,
           accreditedCorroborations: i.accreditedCorroborations,
         })),
@@ -295,6 +337,8 @@ export class SituationRoomService {
         'organisation boundary — only what happened and where, attributed to the organisation that recorded it.',
       incidents: incidents.map((i) => ({
         ...i,
+        /** The same human label the rest of the screens use. */
+        incidentLabel: labelFor(i.incidentType),
         mine: i.organizationId === organizationId,
         reportedByOrganisation: i.organizationId === organizationId ? 'this organisation' : sharerNames.get(i.organizationId) ?? 'a coalition member',
         organizationId: undefined,

@@ -422,22 +422,36 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
                   ? 'bg-[#0b0f19]/80 border-slate-800/80' 
                   : 'bg-white/80 border-slate-200/80'
               } backdrop-blur-xl z-20`}>
-                <div className="flex items-center gap-2 text-sm text-slate-500 dark:text-slate-400">
-                  <button 
-                    className="md:hidden mr-2 p-1.5 rounded-lg text-slate-500 dark:text-slate-400 hover:text-slate-200 hover:bg-slate-800/50" 
+                {/*
+                  `min-w-0` is what makes the truncation work.
+
+                  Without it a flex child refuses to shrink below its content,
+                  so at 375px this breadcrumb kept its full width and pushed
+                  the theme toggle, the notification bell and the account menu
+                  122px off the right edge of the screen — on every page, in
+                  both themes. The body has `overflow-x: hidden`, so there was
+                  no scrollbar to reveal them: they were simply gone, and the
+                  page reported no horizontal overflow while they were.
+                */}
+                <div className="flex min-w-0 flex-1 items-center gap-2 text-sm text-slate-500 dark:text-slate-400">
+                  <button
+                    className="mr-2 shrink-0 rounded-lg p-1.5 text-slate-500 hover:bg-slate-800/50 hover:text-slate-200 md:hidden dark:text-slate-400"
                     onClick={() => setSidebarOpen(true)}
+                    aria-label="Open navigation"
                   >
-                    <Menu className="w-5 h-5" />
+                    <Menu className="h-5 w-5" />
                   </button>
                   {/* Breadcrumb */}
-                  <span className="font-semibold truncate max-w-[14rem] text-brand-700 dark:text-brand-300">{user?.organizationName || 'Customer Care'}</span>
-                  <ChevronRight className="w-3.5 h-3.5 opacity-60" />
-                  <span className={`font-semibold capitalize ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>
+                  <span className="max-w-[14rem] truncate font-semibold text-brand-700 dark:text-brand-300">{user?.organizationName || 'Customer Care'}</span>
+                  <ChevronRight className="hidden h-3.5 w-3.5 shrink-0 opacity-60 sm:block" />
+                  {/* The page name repeats the heading on the page itself, so
+                      it is the first thing to go when there is no room. */}
+                  <span className={`hidden truncate font-semibold capitalize sm:block ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>
                     {pathname === '/' ? 'Executive Dashboard' : pathname.slice(1).replace(/-/g, ' ')}
                   </span>
                 </div>
 
-                <div className="flex items-center gap-3">
+                <div className="flex shrink-0 items-center gap-3">
                   {/* Theme Switcher Button */}
                   <button
                     onClick={toggleTheme}

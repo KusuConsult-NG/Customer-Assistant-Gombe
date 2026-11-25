@@ -70,7 +70,6 @@ export default function DashboardPage() {
   // request had returned, so a populated account briefly read as an empty one.
   const [loading, setLoading] = useState(true);
   const [orgName, setOrgName] = useState('');
-  const [firstName, setFirstName] = useState('');
   const [timeRange, setTimeRange] = useState<'7d' | '30d' | '90d'>('7d');
   const [dashboardData, setDashboardData] = useState<any>(null);
 
@@ -201,7 +200,6 @@ export default function DashboardPage() {
       // The signed-in user's own name, from the session the login flow stored.
       try {
         const u = JSON.parse(localStorage.getItem('ace_user') || 'null');
-        if (u?.fullName) setFirstName(String(u.fullName).split(' ')[0]);
       } catch { /* a malformed session is not worth failing the dashboard over */ }
 
       const recentActivities: Activity[] = [];
@@ -382,21 +380,30 @@ export default function DashboardPage() {
         </div>
       )}
 
-      {/* Top Welcome Bar */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-6 rounded-2xl bg-gradient-to-r from-brand-500/10 via-brand-600/10 to-brand-500/5 border border-brand-500/30 dark:border-brand-500/20 shadow-sm">
-        <div>
-          <div className="flex items-center gap-2 text-xs font-bold text-brand-700 dark:text-brand-300 mb-1 uppercase tracking-wider">
-            <Sparkles className="w-3.5 h-3.5" /> Service Dashboard
-          </div>
-          <h1 className="text-2xl font-extrabold text-slate-900 dark:text-white tracking-tight">
-            {firstName ? `Welcome back, ${firstName}` : 'Welcome back'} 👋
+      {/*
+        The masthead.
+
+        This was a 200px gradient panel whose largest text was "Welcome back,
+        Hadiza 👋" over a ✨ eyebrow reading SERVICE DASHBOARD. On a phone it
+        filled the entire first screen, so an officer opening the dashboard
+        saw a greeting and had to scroll to reach a single figure.
+
+        A greeting is not information. The top of the screen now carries what
+        the officer came for — which agency, as of when, and the controls that
+        change what is shown — in one dense row, and the space it used to take
+        is given back to the data.
+      */}
+      <div className="flex flex-col gap-3 border-b border-[var(--border-main)] pb-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="min-w-0">
+          <h1 className="truncate text-xl font-bold tracking-tight text-[var(--text-main)]">
+            {orgName || 'Service dashboard'}
           </h1>
-          <p className="text-sm text-slate-600 dark:text-slate-400 mt-1">
-            {orgName ? `${orgName} \u2014 ` : ''}Gombe State Government &bull; {today}
+          <p className="mt-0.5 text-sm text-[var(--text-muted)]">
+            Gombe State Government · {today}
           </p>
         </div>
-        <div className="flex items-center gap-3">
-          <div className="flex bg-slate-200/70 dark:bg-slate-800/60 p-1 rounded-xl">
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="flex rounded-xl bg-slate-200/70 p-1 dark:bg-slate-800/60">
             <button onClick={() => setTimeRange('7d')} className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors ${timeRange === '7d' ? 'bg-brand-600 text-white shadow-sm' : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'}`}>7d</button>
             <button onClick={() => setTimeRange('30d')} className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors ${timeRange === '30d' ? 'bg-brand-600 text-white shadow-sm' : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'}`}>30d</button>
             <button onClick={() => setTimeRange('90d')} className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors ${timeRange === '90d' ? 'bg-brand-600 text-white shadow-sm' : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'}`}>90d</button>
@@ -410,42 +417,45 @@ export default function DashboardPage() {
           </button>
           <Link
             href="/agent-console"
-            className="flex items-center gap-2 px-4 py-2.5 rounded-xl text-white font-semibold transition-all text-sm shadow-md"
-            style={{ background: 'linear-gradient(135deg, #3b6102, #4d7d02)' }}
+            className="flex min-h-[44px] flex-1 items-center justify-center gap-2 whitespace-nowrap rounded-xl bg-brand-600 px-4 py-2.5 text-sm font-semibold text-white shadow-md transition-colors hover:bg-brand-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600 sm:flex-none"
+            
           >
             <Bot className="w-4 h-4 text-white" /> Open Live Console
           </Link>
         </div>
       </div>
 
-      {/* KPI Cards */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+      {/* KPI Cards.
+
+          Five columns at desktop, not four: the lead card spans two, so a
+          four-column grid left the fourth card orphaned on a row of its own,
+          which reads as "and one more thing" rather than as one row of
+          figures. 2 + 1 + 1 + 1 resolves exactly. */}
+      <div className="grid grid-cols-2 gap-4 lg:grid-cols-5">
+        {/* Open cases leads: it is the only figure here somebody acts on. */}
+        <KpiCard
+          title="Open Cases"
+          href="/cases"
+          emphasis="lead"
+          value={num(stats.openTickets)}
+          subtitle="Complaints and requests awaiting resolution"
+          icon={<Activity className="h-5 w-5 text-[var(--sev-medium-edge)]" />}
+          badge={stats.openTickets ? 'Needs action' : undefined}
+          badgeColor="border-[var(--sev-medium-edge)] bg-[var(--sev-medium-bg)] text-[var(--sev-medium-fg)]"
+        />
         <KpiCard
           title="Total Citizens"
           href="/crm"
           value={num(stats.contacts)}
           subtitle="Citizens who have contacted the agency"
-          icon={<Users className="w-5 h-5 text-brand-700 dark:text-brand-300" />}
-          badge={`${timeRange} active`}
-          badgeColor="bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/20"
-        />
-        <KpiCard
-          title="Open Cases"
-          href="/cases"
-          value={num(stats.openTickets)}
-          subtitle="Complaints and requests awaiting resolution"
-          icon={<Activity className="w-5 h-5 text-purple-700 dark:text-purple-400" />}
-          badge="Needs action"
-          badgeColor="bg-purple-50 dark:bg-purple-500/10 text-purple-700 dark:text-purple-400 border-purple-200 dark:border-purple-500/20"
+          icon={<Users className="h-5 w-5 text-brand-700 dark:text-brand-300" />}
         />
         <KpiCard
           title="Calls"
           href="/telephony"
           value={num(stats.calls)}
           subtitle="Handled by the voice assistant"
-          icon={<PhoneCall className="w-5 h-5 text-brand-700 dark:text-brand-300" />}
-          badge={`${timeRange} calls`}
-          badgeColor="bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/20"
+          icon={<PhoneCall className="h-5 w-5 text-brand-700 dark:text-brand-300" />}
         />
         {/* This slot held "Open Pipeline" — the naira value of sales deals —
             and a "conversion rate", both inherited from the commercial CRM
@@ -457,9 +467,7 @@ export default function DashboardPage() {
           href="/conversations"
           value={num(stats.conversations)}
           subtitle="Voice & WhatsApp threads with citizens"
-          icon={<MessageSquareText className="w-5 h-5 text-amber-700 dark:text-amber-400" />}
-          badge={`${timeRange} threads`}
-          badgeColor="bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-500/20"
+          icon={<MessageSquareText className="h-5 w-5 text-brand-700 dark:text-brand-300" />}
         />
       </div>
 
@@ -675,7 +683,10 @@ export default function DashboardPage() {
                         <span
                           className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold shrink-0 ${
                             step.done
-                              ? 'bg-emerald-500 text-white'
+                              // Was white on emerald-500: 2.54:1, under AA.
+                              // A ring and a coloured mark, matching the rule
+                              // that a checked state is a mark, not a fill.
+                              ? 'border border-[var(--verify-verified)] text-[var(--verify-verified)]'
                               : 'border border-slate-300 dark:border-slate-600 text-transparent'
                           }`}
                         >
@@ -765,30 +776,48 @@ export default function DashboardPage() {
  * card is a real link, so it works from the keyboard and shows a focus ring,
  * and the screen it opens still applies its own permissions.
  */
-function KpiCard({ title, value, subtitle, icon, badge, badgeColor, href }: any) {
+/**
+ * A headline figure.
+ *
+ * `emphasis="lead"` is for the one figure on the row somebody is meant to act
+ * on. The four cards used to be identical — same size, same weight, same icon
+ * chip — so "total citizens", which nobody acts on, carried exactly as much
+ * visual authority as "open cases", which is the whole job. A row where
+ * everything is emphasised has nothing emphasised.
+ *
+ * `badge` is optional and now carries only something a reader could act on.
+ * Three of the four badges used to repeat the selected time range, which is
+ * stated once in the masthead and did not need saying four more times in four
+ * different colours.
+ */
+function KpiCard({ title, value, subtitle, icon, badge, badgeColor, href, emphasis }: any) {
+  const lead = emphasis === 'lead';
   const body = (
     <>
-      <div className="flex items-center justify-between">
-        <span className="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider">{title}</span>
-        <div className="p-2 rounded-xl bg-slate-100 dark:bg-slate-800/60 border border-slate-200/80 dark:border-slate-700/50">{icon}</div>
+      <div className="flex items-center justify-between gap-2">
+        <span className="min-w-0 text-xs font-bold uppercase leading-tight tracking-wider text-[var(--text-muted)]">{title}</span>
+        <div className="shrink-0 rounded-xl border border-[var(--border-main)] bg-[var(--bg-subtle)] p-2">{icon}</div>
       </div>
       <div>
-        <p className="text-2xl font-extrabold text-slate-900 dark:text-white tracking-tight">{value}</p>
-        <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5 font-medium">{subtitle}</p>
+        <p className={`font-extrabold tabular-nums tracking-tight text-[var(--text-main)] ${lead ? 'text-4xl' : 'text-2xl'}`}>{value}</p>
+        <p className="mt-0.5 text-xs font-medium text-[var(--text-muted)]">{subtitle}</p>
       </div>
-      <div className="pt-2 border-t border-slate-100 dark:border-slate-800/60">
-        <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-extrabold border ${badgeColor}`}>{badge}</span>
-      </div>
+      {badge && (
+        <div className="border-t border-[var(--border-main)] pt-2">
+          <span className={`rounded-full border px-2.5 py-0.5 text-[10px] font-extrabold ${badgeColor}`}>{badge}</span>
+        </div>
+      )}
     </>
   );
   const frame =
-    'block p-5 rounded-2xl bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800/80 shadow-sm transition-all space-y-3';
+    `block space-y-3 rounded-2xl border bg-[var(--bg-card)] p-5 shadow-sm transition-all ${
+      lead ? 'border-[var(--sev-medium-edge)] sm:col-span-2' : 'border-[var(--border-main)]'}`;
   if (!href) return <div className={frame}>{body}</div>;
   return (
     <Link
       href={href}
-      aria-label={`${title}: ${value}. Open ${title.toLowerCase()}`}
-      className={`${frame} hover:shadow-md hover:border-brand-300 dark:hover:border-brand-500/40 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500`}
+      aria-label={`${title}: ${value}. Open ${String(title).toLowerCase()}`}
+      className={`${frame} hover:border-brand-300 hover:shadow-md focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 dark:hover:border-brand-500/40`}
     >
       {body}
     </Link>

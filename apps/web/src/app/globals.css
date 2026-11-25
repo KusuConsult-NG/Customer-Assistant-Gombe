@@ -10,6 +10,60 @@
     --text-main: #0f172a;
     --text-muted: #64748b;
     --border-main: #e2e8f0;
+
+    /* ── Severity ────────────────────────────────────────────────────────
+       How bad is it. The ONE axis that must read at a glance, across the
+       room, in either theme. `edge` is the spine down the left of a row:
+       colour carries the meaning but never alone — the label is always
+       written out, because about 1 in 12 men cannot separate these hues.   */
+    --sev-critical-bg: #fee2e2;
+    --sev-critical-fg: #7f1d1d;
+    --sev-critical-edge: #dc2626;
+    --sev-high-bg: #ffedd5;
+    --sev-high-fg: #7c2d12;
+    --sev-high-edge: #ea580c;
+    --sev-medium-bg: #fef3c7;
+    --sev-medium-fg: #78350f;
+    --sev-medium-edge: #d97706;
+    --sev-low-bg: #f1f5f9;
+    --sev-low-fg: #334155;
+    --sev-low-edge: #64748b;
+
+    /* ── Verification ────────────────────────────────────────────────────
+       Whether anyone checked. Deliberately NOT a second set of filled
+       chips: severity and verification are orthogonal in the data model
+       and collapsing them into one visual device is how a situation room
+       starts reading an unverified rumour as a confirmed emergency. These
+       are text and a mark on the card surface, never a fill.             */
+    --verify-verified: #047857;
+    --verify-corroborated: #1d4ed8;
+    --verify-unverified: #475569;
+    --verify-disputed: #b45309;
+    --verify-false: #be123c;
+
+    /* ── Notice ──────────────────────────────────────────────────────────
+       The caveats that keep this product honest ("a silent unit is not a
+       quiet one"). They must stay legible; they are not decoration.      */
+    --notice-bg: #fffbeb;
+    --notice-fg: #713f12;
+    --notice-edge: #fcd34d;
+
+    /* Alert panel: the "needs attention now" region. It needs its own muted
+       role: the page's --text-muted measures 4.35:1 on this pink, which is
+       under the line, and that muted role carries the unit code and the
+       clock — the two things a person reads off these rows. */
+    --panel-alert-bg: #fef2f2;
+    --panel-alert-edge: #fecaca;
+    --panel-alert-fg: #991b1b;
+    --panel-alert-muted: #475569;
+
+    /* ── Accent TEXT ─────────────────────────────────────────────────────
+       Separate from the `edge` colours on purpose. An edge is a 3px rule
+       and clears the 3:1 graphical floor; the same hex set as a headline
+       figure measured 3.19:1 and failed. These are measured as text.     */
+    --figure-critical: #b91c1c;
+    --figure-warn: #b45309;
+    --figure-good: #047857;
   }
 
   .dark {
@@ -19,6 +73,40 @@
     --text-main: #f8fafc;
     --text-muted: #94a3b8;
     --border-main: #1c3310;
+
+    /* The same roles, re-measured for the dark surface. An operations room
+       runs with the lights down; these are not the light values dimmed.  */
+    --sev-critical-bg: #450a0a;
+    --sev-critical-fg: #fecaca;
+    --sev-critical-edge: #f87171;
+    --sev-high-bg: #431407;
+    --sev-high-fg: #fed7aa;
+    --sev-high-edge: #fb923c;
+    --sev-medium-bg: #451a03;
+    --sev-medium-fg: #fde68a;
+    --sev-medium-edge: #fbbf24;
+    --sev-low-bg: #1e293b;
+    --sev-low-fg: #cbd5e1;
+    --sev-low-edge: #64748b;
+
+    --verify-verified: #6ee7b7;
+    --verify-corroborated: #93c5fd;
+    --verify-unverified: #cbd5e1;
+    --verify-disputed: #fcd34d;
+    --verify-false: #fda4af;
+
+    --notice-bg: #2c2410;
+    --notice-fg: #fde68a;
+    --notice-edge: #92400e;
+
+    --panel-alert-bg: #1b0d0d;
+    --panel-alert-edge: #7f1d1d;
+    --panel-alert-fg: #fecaca;
+    --panel-alert-muted: #cbd5e1;
+
+    --figure-critical: #f87171;
+    --figure-warn: #fcd34d;
+    --figure-good: #6ee7b7;
   }
 
   /* Force correct body background in both modes */
