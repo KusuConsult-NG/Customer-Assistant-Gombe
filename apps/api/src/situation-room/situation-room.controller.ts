@@ -52,6 +52,23 @@ export class SituationRoomController {
     );
   }
 
+  /**
+   * The coalition pool. See `coalitionIncidents` for exactly what crosses an
+   * organisation boundary and what does not.
+   */
+  @Get('coalition')
+  coalition(
+    @Req() req: { user: AuthUser },
+    @Query('since') since?: string,
+    @Query('lga') lga?: string,
+  ) {
+    const from = since ? new Date(since) : undefined;
+    return this.room.coalitionIncidents(req.user.organizationId, {
+      since: from && !Number.isNaN(from.getTime()) ? from : undefined,
+      lga: lga?.trim() || null,
+    });
+  }
+
   /** Which polling units have anything that could be filed. */
   @Get('petition/units')
   @Roles('OWNER', 'ADMIN')

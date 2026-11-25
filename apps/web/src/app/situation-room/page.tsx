@@ -26,7 +26,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   AlertTriangle, RefreshCw, MapPin, EyeOff, ShieldCheck, ShieldAlert,
-  Clock, Download, Radio,
+  Clock, Download, Radio, Users,
 } from 'lucide-react';
 import { apiFetch } from '@/lib/api';
 import { useToast } from '@/components/ui/Toast';
@@ -71,6 +71,18 @@ type Overview = {
   }>;
 };
 
+type Coalition = {
+  inCoalition: boolean;
+  note: string;
+  coalitions?: Array<{ id: string; name: string }>;
+  sharingOrganisations?: string[];
+  incidents: Array<{
+    ticketNumber: string; incidentType: string | null; severity: string | null;
+    verification: string; lga: string | null; pollingUnitCode: string | null;
+    mine: boolean; reportedByOrganisation: string; createdAt: string;
+  }>;
+};
+
 type PetitionUnit = {
   pollingUnitCode: string | null;
   lga: string | null;
@@ -100,24 +112,27 @@ export default function SituationRoomPage() {
   const [overview, setOverview] = useState<Overview | null>(null);
   const [silent, setSilent] = useState<Silent | null>(null);
   const [petitionUnits, setPetitionUnits] = useState<PetitionUnit[] | null>(null);
+  const [coalition, setCoalition] = useState<Coalition | null>(null);
   const [loading, setLoading] = useState(true);
   const [exporting, setExporting] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [o, s, u] = await Promise.all([
+      const [o, s, u, c] = await Promise.all([
         apiFetch('/api/situation-room/overview'),
         apiFetch('/api/situation-room/silent'),
         // Every unit with something that could be filed, not just the ones
         // overdue: a lawyer deciding where to petition wants all of them.
         // 403 for a non-admin is expected and left silent.
         apiFetch('/api/situation-room/petition/units'),
+        apiFetch('/api/situation-room/coalition'),
       ]);
       if (o.ok) setOverview(await o.json());
       else toast.error(`Could not load the overview — the server answered ${o.status}.`);
       if (s.ok) setSilent(await s.json());
       setPetitionUnits(u.ok ? await u.json() : null);
+      setCoalition(c.ok ? await c.json() : null);
     } catch (err: any) {
       toast.error(`Could not reach the server — ${String(err?.message ?? err)}`);
     } finally {
@@ -368,6 +383,34 @@ export default function SituationRoomPage() {
           </ul>
         )}
       </section>
+
+      {/* ── The coalition pool ── */}
+      {coalition?.inCoalition && (
+        <section className="rounded-lg border bg-white p-4">
+          <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500 flex items-center gap-2">
+            <Users className="h-4 w-4" /> Coalition pool
+          </h2>
+          <p className="mt-2 text-xs text-slate-500">
+            Sharing with {coalition.sharingOrganisations?.join(', ') || 'no other organisation yet'}.{' '}
+            {coalition.note}
+          </p>
+          <ul className="mt-3 divide-y text-sm">
+            {coalition.incidents.slice(0, 40).map((i) => (
+              <li key={`${i.reportedByOrganisation}-${i.ticketNumber}`} className="flex flex-wrap items-center gap-3 py-2">
+                <span className={`rounded border px-2 py-0.5 text-xs ${SEVERITY_STYLE[i.severity ?? 'LOW']}`}>
+                  {i.severity ?? '—'}
+                </span>
+                <span className="font-medium">{i.incidentType}</span>
+                <span className="text-slate-600">{i.pollingUnitCode ?? 'no unit'} · {i.lga}</span>
+                <span className="text-xs text-slate-500">{i.verification}</span>
+                <span className={`text-xs ${i.mine ? 'text-slate-500' : 'font-medium text-indigo-700'}`}>
+                  {i.mine ? 'ours' : i.reportedByOrganisation}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
 
       {/* ── Petition bundles ── */}
       <section className="rounded-lg border bg-white p-4">

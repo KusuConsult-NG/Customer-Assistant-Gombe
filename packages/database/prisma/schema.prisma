@@ -240,6 +240,7 @@ model Organization {
   tickets            Ticket[]
   evidence           Evidence[]
   accreditedReporters AccreditedReporter[]
+  coalitionMemberships CoalitionMember[]
   conversations      Conversation[]
   callLogs           CallLog[]
   knowledgeDocuments KnowledgeDocument[]
@@ -1898,4 +1899,76 @@ model AccreditedReporter {
   @@index([organizationId, active])
   @@index([organizationId, deployedLga])
   @@map("accredited_reporters")
+}
+
+
+/// A coalition of organisations that pool election incident reports.
+///
+/// ── Why this is a SHARE and not a change to tenant isolation ───────────────
+///
+/// A situation room is a coalition: several civil society organisations, each
+/// with its own observers, pooling what they see. The obvious implementation is
+/// to relax tenant isolation so coalition members can read each other's rows.
+/// That would be a mistake, and a dangerous one, because tenant isolation in
+/// this platform is not a convenience — it is what stops the lands registry
+/// reading health records, and every query in the codebase is written assuming
+/// `organizationId` is a hard boundary.
+///
+/// So nothing about isolation changes. Instead:
+///
+///   - a coalition is an explicit, named object with explicit members;
+///   - sharing covers ELECTION INCIDENTS ONLY, never contacts, calls,
+///     conversations, bookings, or anything else a tenant holds;
+///   - a member sees another member's incident with ATTRIBUTION — whose report
+///     it is, never presented as their own;
+///   - a reporter's identity is NOT shared. An anonymous reporter is anonymous
+///     to the coalition too, and a named one is visible only to the
+///     organisation that accredited them. What crosses the boundary is the
+///     incident, not the person;
+///   - and it is opt-in per organisation, revocable, and recorded.
+///
+/// The read is served by one deliberately narrow query
+/// (`SituationRoomService.coalitionIncidents`) rather than by widening the
+/// tenant filter anywhere, so there is exactly one place to audit.
+model Coalition {
+  id   String @id @default(uuid())
+  name String
+  /// What this coalition exists for, in the words of whoever set it up.
+  purpose String? @db.Text
+
+  /// The election this covers. A coalition for the 2027 general election should
+  /// not silently keep sharing through the next one.
+  electionLabel String?
+  sharingEndsAt DateTime?
+
+  members   CoalitionMember[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("coalitions")
+}
+
+model CoalitionMember {
+  id             String       @id @default(uuid())
+  coalitionId    String
+  coalition      Coalition    @relation(fields: [coalitionId], references: [id], onDelete: Cascade)
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  /// Reads other members' incidents. Opt-in.
+  canRead  Boolean @default(true)
+  /// Its own incidents are readable by other members. Opt-in, and SEPARATE
+  /// from `canRead`: an organisation may consume the pool without publishing
+  /// into it, which is a real arrangement and not a bug.
+  canShare Boolean @default(true)
+
+  /// Who agreed, and when. A coalition share is a data-sharing decision.
+  agreedByUserId String?
+  joinedAt       DateTime  @default(now())
+  leftAt         DateTime?
+  leftReason     String?
+
+  @@unique([coalitionId, organizationId])
+  @@index([organizationId, leftAt])
+  @@map("coalition_members")
 }

@@ -199,6 +199,111 @@ export class SituationRoomService {
   }
 
   /**
+   * The coalition pool: other members' incidents, attributed.
+   *
+   * ── The one place tenant isolation is crossed, and how ────────────────────
+   *
+   * Nothing else in this codebase reads across `organizationId`, and nothing
+   * else should. This method exists so that crossing is in ONE auditable
+   * place, with every narrowing written out rather than implied:
+   *
+   *   - only organisations in a coalition this organisation also belongs to;
+   *   - only members who have opted IN to sharing (`canShare`), and only if
+   *     this organisation has opted in to reading (`canRead`);
+   *   - only members who have not left;
+   *   - only while the coalition's sharing window is open;
+   *   - only ELECTION INCIDENTS — rows with an `incidentType`. Service cases,
+   *     contacts, calls, conversations and bookings never cross;
+   *   - and no reporter identity. `isAnonymous` is honoured, the accredited
+   *     reporter relation is not selected at all, and the description — which
+   *     is the reporter's own words and routinely contains their phone number
+   *     and name — is NOT returned. The pool carries WHAT happened and WHERE,
+   *     attributed to the organisation, never to the person.
+   *
+   * Returns this organisation's own incidents too, flagged `mine`, so a screen
+   * can show the pooled picture without a second query that might be written
+   * with a looser filter.
+   */
+  async coalitionIncidents(organizationId: string, q: SituationRoomQuery = {}) {
+    const since = q.since ?? new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const now = new Date();
+
+    const myMemberships = await prisma.coalitionMember.findMany({
+      where: { organizationId, leftAt: null, canRead: true },
+      select: { coalitionId: true, coalition: { select: { id: true, name: true, sharingEndsAt: true } } },
+    });
+
+    const openCoalitions = myMemberships
+      .filter((m) => !m.coalition.sharingEndsAt || m.coalition.sharingEndsAt > now)
+      .map((m) => m.coalitionId);
+
+    if (openCoalitions.length === 0) {
+      return {
+        inCoalition: false,
+        note: 'This organisation is not reading from any coalition pool, or its sharing window has closed.',
+        incidents: [],
+      };
+    }
+
+    const sharers = await prisma.coalitionMember.findMany({
+      where: {
+        coalitionId: { in: openCoalitions },
+        leftAt: null,
+        canShare: true,
+        organizationId: { not: organizationId },
+      },
+      select: { organizationId: true, organization: { select: { name: true } } },
+    });
+    const sharerNames = new Map(sharers.map((s) => [s.organizationId, s.organization.name]));
+
+    const incidents = await prisma.ticket.findMany({
+      where: {
+        organizationId: { in: [organizationId, ...sharerNames.keys()] },
+        incidentType: { not: null },
+        createdAt: { gte: since },
+        ...(q.lga ? { lga: q.lga } : {}),
+      },
+      // Deliberately NOT selecting description, contact, or the accredited
+      // reporter. See the note above: the incident crosses, the person does not.
+      select: {
+        organizationId: true,
+        ticketNumber: true,
+        incidentType: true,
+        severity: true,
+        verification: true,
+        corroborations: true,
+        accreditedCorroborations: true,
+        lga: true,
+        registrationArea: true,
+        pollingUnitCode: true,
+        pollingUnitName: true,
+        latitude: true,
+        longitude: true,
+        createdAt: true,
+        isAnonymous: true,
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 1_000,
+    });
+
+    return {
+      inCoalition: true,
+      coalitions: myMemberships.map((m) => ({ id: m.coalition.id, name: m.coalition.name })),
+      sharingOrganisations: [...sharerNames.values()],
+      note:
+        'Pooled election incidents only. No reporter identity, contact details or report text crosses an ' +
+        'organisation boundary — only what happened and where, attributed to the organisation that recorded it.',
+      incidents: incidents.map((i) => ({
+        ...i,
+        mine: i.organizationId === organizationId,
+        reportedByOrganisation: i.organizationId === organizationId ? 'this organisation' : sharerNames.get(i.organizationId) ?? 'a coalition member',
+        organizationId: undefined,
+        createdAt: i.createdAt.toISOString(),
+      })),
+    };
+  }
+
+  /**
    * Which Registration Areas have reported nothing.
    *
    * Separate from `overview` because it answers a different question and the
