@@ -31,7 +31,7 @@ export default function LoginPage() {
     localStorage.setItem('ace_token', token);
     if (res.refreshToken) localStorage.setItem('ace_refresh_token', res.refreshToken);
     if (res.user) localStorage.setItem('ace_user', JSON.stringify(res.user));
-    router.push('/');
+    router.push('/situation-room');
   };
 
   const handleCode = async (e: React.FormEvent) => {
@@ -82,7 +82,7 @@ export default function LoginPage() {
         if (res.user) {
           localStorage.setItem('ace_user', JSON.stringify(res.user));
         }
-        router.push('/');
+        router.push('/situation-room');
       } else {
         setError('Login failed: Token not returned from server');
       }
@@ -101,41 +101,38 @@ export default function LoginPage() {
         
         <div className="relative z-10 flex items-center gap-3">
           <div className="w-12 h-12 rounded-xl flex items-center justify-center shadow-lg" style={{ background: 'linear-gradient(135deg, #3b6102, #4d7d02)' }}>
-            {/* A neutral mark. This was a medical cross, which is a claim
-                about what the agency does — wrong for a lands registry or a
-                revenue board, and the same reason the sidebar dropped it. */}
-            <Landmark className="w-7 h-7 text-white" />
+            <ShieldCheck className="w-7 h-7 text-white" />
           </div>
           <div>
             <h1 className="font-bold text-2xl text-white">
-              Customer Care Platform
+              Election Situation Room
             </h1>
             <p className="text-xs font-semibold text-brand-400">
-              Gombe State Government
+              Dr. Jamil Isyaku Gwamna · APC Gombe 2027
             </p>
           </div>
         </div>
         
         <div className="relative z-10">
           <h2 className="text-4xl font-bold text-white mb-6 leading-tight">
-            State Customer Care <br/><span className="text-brand-400">&amp; Citizen Services Portal</span>
+            Gombe 2027 Campaign <br/><span className="text-brand-400">&amp; Election Command Center</span>
           </h2>
           <p className="text-slate-300 text-base max-w-md">
-            One place for citizens to reach any ministry, department or agency of the State — on WhatsApp, by phone, in the language they speak.
+            Real-time coordination across all 11 LGAs, 114 Registration Areas, and 2,988 polling units — voice hotline, 2G SMS/USSD intake, agent deployment, and verified Form EC8A collation.
           </p>
 
           <div className="mt-8 p-4 rounded-2xl bg-brand-500/10 border border-brand-500/20 max-w-md">
             <div className="flex items-center gap-2 text-brand-400 text-sm font-semibold mb-1">
-              <ShieldCheck className="w-4 h-4" /> Official Government Service
+              <ShieldCheck className="w-4 h-4" /> Authorized Campaign Command Access
             </div>
             <p className="text-xs text-slate-300">
-              Authorized desk officer and admin access for helpline operations, citizen records, case handling, and inquiries.
+              Restricted to accredited Situation Room desk officers, LGA coordinators, legal desk analysts, and campaign leadership.
             </p>
           </div>
         </div>
         
         <div className="relative z-10 text-sm text-slate-400">
-          © 2026 Gombe State Government. All rights reserved.
+          © 2026–2027 Dr. Jamil Isyaku Gwamna (Sardaunan Gombe) APC Governorship Campaign.
         </div>
       </div>
       

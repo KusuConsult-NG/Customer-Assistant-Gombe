@@ -43,9 +43,9 @@ export const ENV_SPECS: EnvSpec[] = [
   { key: 'EMBEDDING_MODEL', required: false, description: 'Embedding model id (default text-embedding-3-small)' },
   { key: 'EMBEDDING_DIMENSIONS', required: false, description: 'Embedding vector width; must match the Qdrant collection (default 1536)' },
 
-  // ─── WhatsApp / Meta ─────────────────────────────────────────────────────────
-  { key: 'WHATSAPP_APP_SECRET', required: true, description: 'Meta App Secret for X-Hub-Signature-256 verification', rejectPlaceholder: true },
-  { key: 'WHATSAPP_VERIFY_TOKEN', required: true, description: 'Webhook verify token set on Meta Developer Console', rejectPlaceholder: true },
+  // ─── WhatsApp / Meta (Optional — webhooks fail closed when unset) ─────────────
+  { key: 'WHATSAPP_APP_SECRET', required: false, description: 'Meta App Secret for X-Hub-Signature-256 verification (optional when WhatsApp is not enabled; webhook rejects requests if unset)', rejectPlaceholder: true },
+  { key: 'WHATSAPP_VERIFY_TOKEN', required: false, description: 'Webhook verify token set on Meta Developer Console (optional when WhatsApp is not enabled)', rejectPlaceholder: true },
 
   // ─── Paystack (Optional until payments enabled) ────────────────────────────────
 

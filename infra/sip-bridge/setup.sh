@@ -26,7 +26,7 @@ for v in ALPHATECH_HOST ALPHATECH_IP ALPHATECH_EXTENSION ALPHATECH_PASSWORD ELEV
          ELEVENLABS_SIP_USERNAME ELEVENLABS_SIP_PASSWORD TOLLFREE_E164; do
   [ -n "${!v:-}" ] || { echo "bridge.env: $v is empty"; exit 1; }
 done
-[[ "$TOLLFREE_E164" =~ ^\+[0-9]{8,15}$ ]] || { echo "TOLLFREE_E164 must be E.164, e.g. +2348000000456"; exit 1; }
+[[ "$TOLLFREE_E164" =~ ^\+[0-9]{8,15}$ ]] || { echo "TOLLFREE_E164 must be E.164, e.g. +2348000000779"; exit 1; }
 FALLBACK_SOUND="${FALLBACK_SOUND:-all-circuits-busy-now}"
 INTRO_SOUND="${INTRO_SOUND:-}"
 if [ -z "${PUBLIC_IP:-}" ]; then

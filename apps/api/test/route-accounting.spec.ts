@@ -174,6 +174,10 @@ const MACHINE_FACING: Array<{ method: string; path: string; calledBy: string }> 
   { method: 'POST', path: '/api/telephony/status/twilio', calledBy: 'Twilio status callback' },
   { method: 'POST', path: '/api/telephony/status/telnyx', calledBy: 'Telnyx status callback' },
 
+  // ── 2G SMS & USSD election intake webhooks ──────────────────────────────
+  { method: 'POST', path: '/api/sms/inbound', calledBy: "SMS aggregator webhook (Africa's Talking / Termii / Infobip)" },
+  { method: 'POST', path: '/api/ussd/callback', calledBy: "USSD aggregator callback (Africa's Talking / Infobip)" },
+
   // ── Probes ─────────────────────────────────────────────────────────────
   //
   // Liveness is shallow because the only remedy for failing it is a restart;

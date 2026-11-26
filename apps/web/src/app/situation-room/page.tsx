@@ -24,6 +24,7 @@
  */
 
 import React, { useCallback, useEffect, useState } from 'react';
+import Link from 'next/link';
 import {
   AlertTriangle, RefreshCw, MapPin, EyeOff, ShieldCheck, ShieldAlert,
   Clock, Download, Radio, Users,
@@ -68,6 +69,7 @@ type Overview = {
     latitude: number; longitude: number; at: string;
   }>;
   needsAttention: Array<{
+    id?: string;
     ticketNumber: string; why: string; incidentType: string | null; severity: string | null;
     incidentLabel: string;
     lga: string | null; pollingUnitCode: string | null; dueAt: string | null;
@@ -178,6 +180,23 @@ export default function SituationRoomPage() {
     }
   };
 
+  const verifyIncident = async (id: string, ticketNumber: string, status: 'VERIFIED' | 'DISMISSED') => {
+    const res = await apiFetch(`${API_URL}/api/situation-room/incidents/${encodeURIComponent(id)}/verify`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        status,
+        note: `${status === 'VERIFIED' ? 'Confirmed' : 'Dismissed'} from Situation Room triage desk`,
+      }),
+    });
+    if (!res.ok) {
+      toast.error(`Could not update ${ticketNumber} (HTTP ${res.status})`);
+      return;
+    }
+    toast.success(`${ticketNumber} marked ${status}`);
+    await load();
+  };
+
   if (loading && !overview) {
     return <div className="p-8 text-[var(--text-muted)]">Loading the situation room…</div>;
   }
@@ -198,18 +217,38 @@ export default function SituationRoomPage() {
         <div className="min-w-0">
           <h1 className="flex items-center gap-2 text-2xl font-semibold text-[var(--text-main)]">
             <Radio aria-hidden className="h-5 w-5 shrink-0 text-[var(--sev-critical-edge)]" />
-            Situation room
+            APC Gombe 2027 — Election Situation Room
           </h1>
           <p className="mt-0.5 text-sm text-[var(--text-muted)]">
             Window opened <Since at={o.since} />, refreshed <Since at={o.generatedAt} />
           </p>
         </div>
-        <button
-          onClick={() => void load()}
-          className="inline-flex min-h-[44px] items-center gap-2 rounded-lg border border-[var(--border-main)] bg-[var(--bg-card)] px-3 py-2 text-sm font-medium text-[var(--text-main)] hover:bg-[var(--bg-subtle)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--sev-critical-edge)]"
-        >
-          <RefreshCw aria-hidden className="h-4 w-4" /> Refresh
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <Link
+            href="/results"
+            className="inline-flex min-h-[44px] items-center rounded-lg bg-emerald-700 px-3 py-2 text-sm font-semibold text-white hover:bg-emerald-800"
+          >
+            Live Results (EC8A)
+          </Link>
+          <Link
+            href="/polling-units"
+            className="inline-flex min-h-[44px] items-center rounded-lg border border-[var(--border-main)] bg-[var(--bg-card)] px-3 py-2 text-sm font-medium text-[var(--text-main)] hover:bg-[var(--bg-subtle)]"
+          >
+            Polling Units (2,988)
+          </Link>
+          <Link
+            href="/agents"
+            className="inline-flex min-h-[44px] items-center rounded-lg border border-[var(--border-main)] bg-[var(--bg-card)] px-3 py-2 text-sm font-medium text-[var(--text-main)] hover:bg-[var(--bg-subtle)]"
+          >
+            Party Agents Roster
+          </Link>
+          <button
+            onClick={() => void load()}
+            className="inline-flex min-h-[44px] items-center gap-2 rounded-lg border border-[var(--border-main)] bg-[var(--bg-card)] px-3 py-2 text-sm font-medium text-[var(--text-main)] hover:bg-[var(--bg-subtle)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--sev-critical-edge)]"
+          >
+            <RefreshCw aria-hidden className="h-4 w-4" /> Refresh
+          </button>
+        </div>
       </header>
 
       {/* ── Coverage, first, because a map without it misleads ── */}
@@ -287,7 +326,7 @@ export default function SituationRoomPage() {
               <li
                 key={n.ticketNumber}
                 style={severitySpine(n.severity)}
-                className="flex flex-col gap-1.5 py-2.5 pl-3 pr-4 sm:flex-row sm:items-baseline sm:gap-3"
+                className="flex flex-col gap-1.5 py-2.5 pl-3 pr-4 sm:flex-row sm:items-center sm:justify-between sm:gap-3"
               >
                 {/* Line one: what happened, and how bad. Everything an officer
                     needs to decide whether to read line two. */}
@@ -299,10 +338,8 @@ export default function SituationRoomPage() {
                   </span>
                 </div>
 
-                {/* Line two: the clock, which is what makes this list urgent,
-                    and the reference, which is the least useful field for
-                    triage and so goes last rather than second. */}
-                <div className="flex shrink-0 flex-wrap items-baseline gap-x-3 gap-y-1 text-xs">
+                {/* Line two: the clock, reference, and inline triage actions. */}
+                <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs">
                   {n.overdueByMinutes !== null ? (
                     <span className="inline-flex items-center gap-1 font-semibold text-[var(--sev-critical-edge)]">
                       <Clock aria-hidden className="h-3 w-3" />
@@ -311,22 +348,32 @@ export default function SituationRoomPage() {
                         : `${Math.floor(n.overdueByMinutes / 60)}h ${n.overdueByMinutes % 60}m overdue`}
                     </span>
                   ) : n.why !== 'critical' ? (
-                    // `why` is "critical" | "overdue" | "not classified".
-                    // "critical" restates the chip two inches to the left, so
-                    // the row said CRITICAL … critical. Only the reason that
-                    // ADDS something is worth the width.
                     <span className="text-[var(--panel-alert-muted)]">{n.why}</span>
                   ) : null}
                   <Since at={n.reportedAt} className="!text-[var(--panel-alert-muted)]" />
                   <span className="text-[var(--panel-alert-muted)]">
-                    {/* "reports" meant corroborations and read as though the
-                        incident itself had not been reported. */}
                     {n.corroborations === 0
                       ? 'no corroboration yet'
                       : `${n.corroborations} corroborating ${n.corroborations === 1 ? 'report' : 'reports'}`}
                     {n.accreditedCorroborations > 0 && `, ${n.accreditedCorroborations} accredited`}
                   </span>
                   <span className="font-mono text-[var(--panel-alert-muted)]">{n.ticketNumber}</span>
+                  {n.id && (
+                    <span className="inline-flex items-center gap-1.5">
+                      <button
+                        onClick={() => void verifyIncident(n.id!, n.ticketNumber, 'VERIFIED')}
+                        className="rounded bg-emerald-700 px-2.5 py-1 text-xs font-semibold text-white hover:bg-emerald-800"
+                      >
+                        Verify
+                      </button>
+                      <button
+                        onClick={() => void verifyIncident(n.id!, n.ticketNumber, 'DISMISSED')}
+                        className="rounded border border-[var(--border-main)] bg-[var(--bg-card)] px-2.5 py-1 text-xs font-semibold text-[var(--text-main)] hover:bg-[var(--bg-subtle)]"
+                      >
+                        Dismiss
+                      </button>
+                    </span>
+                  )}
                 </div>
               </li>
             ))}

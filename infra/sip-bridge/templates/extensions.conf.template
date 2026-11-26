@@ -17,8 +17,8 @@ exten => s,1,NoOp(Inbound from Alphatech: caller=${CALLERID(num)} dialled=${EXTE
  same => n,Set(CN=${CALLERID(num)})
  same => n,ExecIf($[${REGEX("^0[789][01][0-9]{8}$" ${CN})}]?Set(CALLERID(num)=+234${CN:1}))
  same => n,ExecIf($[${REGEX("^234[0-9]{10}$" ${CN})}]?Set(CALLERID(num)=+${CN}))
- ; If INTRO_SOUND is set (e.g. Governor Bala Mohammed's recorded welcome),
- ; answer and play it before handing the call to Garba on ElevenLabs.
+ ; If INTRO_SOUND is set (e.g. a recorded agency welcome message),
+ ; answer and play it before handing the call to the assistant on ElevenLabs.
  same => n,ExecIf($["${INTRO_SOUND}" != ""]?Answer())
  same => n,ExecIf($["${INTRO_SOUND}" != ""]?Playback(${INTRO_SOUND}))
  same => n,Dial(PJSIP/elevenlabs/sip:${TOLLFREE_E164}@${ELEVENLABS_SIP_HOST}:5060\;transport=tcp,60)

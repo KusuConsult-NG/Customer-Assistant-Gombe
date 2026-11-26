@@ -1,4 +1,4 @@
-import { Controller, Post, Get, Body, UseGuards, Req } from '@nestjs/common';
+import { Controller, Post, Get, Body, UseGuards, Req, ForbiddenException } from '@nestjs/common';
 import { JwtAuthGuard } from './jwt-auth.guard';
 import { AuthUser } from '@ace/shared-types';
 import { Throttle } from '@nestjs/throttler';
@@ -48,6 +48,11 @@ export class AuthController {
   @Throttle({ default: { limit: 5, ttl: 60_000 } })
   @Post('register')
   async register(@Body() body: RegisterDto) {
+    if (process.env.ALLOW_PUBLIC_REGISTRATION === 'false') {
+      throw new ForbiddenException(
+        'Public registration is disabled for this Situation Room deployment. Ask an administrator for an invite.',
+      );
+    }
     return this.authService.registerOrganization(body);
   }
 

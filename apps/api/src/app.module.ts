@@ -24,6 +24,7 @@ import { WorkflowsModule } from './workflows/workflows.module';
 import { RedisThrottlerStorage } from './config/redis-throttler-storage';
 import { WorkflowTriggerModule } from './workflows/workflow-trigger.module';
 import { OnboardingModule } from './onboarding/onboarding.module';
+import { SmsModule } from './sms/sms.module';
 
 @Module({
   imports: [
@@ -55,6 +56,7 @@ import { OnboardingModule } from './onboarding/onboarding.module';
     PlatformModule,
     CatalogueModule,
     SituationRoomModule,
+    SmsModule,
     BudgetModule,
     CasesModule,
     CrmModule,

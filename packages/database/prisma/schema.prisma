@@ -241,6 +241,8 @@ model Organization {
   evidence           Evidence[]
   accreditedReporters AccreditedReporter[]
   coalitionMemberships CoalitionMember[]
+  pollingUnitStatuses PollingUnitStatus[]
+  pollingUnitResults  PollingUnitResult[]
   conversations      Conversation[]
   callLogs           CallLog[]
   knowledgeDocuments KnowledgeDocument[]
@@ -1972,3 +1974,91 @@ model CoalitionMember {
   @@index([organizationId, leftAt])
   @@map("coalition_members")
 }
+
+/// Election-Day milestone tracker per polling unit for one campaign/situation room.
+/// Tracks whether an accredited party agent checked in, materials & BVAS arrived,
+/// voting opened/closed, counting finished, and EC8A/IReV were submitted.
+model PollingUnitStatus {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  /// Normalized INEC polling unit code, e.g. "15-01-01-003".
+  pollingUnitCode String
+  lga              String
+  registrationArea String
+  pollingUnitName  String
+
+  checkedInByReporterId String?
+  agentCheckedInAt      DateTime?
+  materialsArrivedAt    DateTime?
+  bvasWorking           Boolean?
+  votingStartedAt       DateTime?
+  votingClosedAt        DateTime?
+  countingCompletedAt   DateTime?
+  ec8aSubmittedAt       DateTime?
+  irevUploadedAt        DateTime?
+  accreditedVotersCount Int?
+  lastChannel           String?
+  notes                 String?      @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([organizationId, pollingUnitCode])
+  @@index([organizationId, lga])
+  @@index([organizationId, registrationArea])
+  @@map("polling_unit_statuses")
+}
+
+enum ResultStatus {
+  PENDING_REVIEW
+  VERIFIED
+  DISPUTED
+  SUPERSEDED
+}
+
+/// Polling unit Form EC8A vote collation record (Parallel Vote Tabulation).
+/// Previous submissions are never silently overwritten; a newer verified or
+/// competing submission marks prior rows SUPERSEDED or flags CONFLICTING_SUBMISSION.
+model PollingUnitResult {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  pollingUnitCode  String
+  lga              String
+  registrationArea String
+  pollingUnitName  String
+
+  submittedByReporterId String?
+  submittedByUserId     String?
+  /// VOICE | SMS | USSD | WEB
+  channel               String       @default("WEB")
+
+  accreditedVoters Int
+  /// Map of party code -> vote count, e.g. { "APC": 312, "PDP": 148, "NNPP": 22, "OTHER": 9 }.
+  votesByParty     Json
+  validVotes       Int
+  rejectedVotes    Int          @default(0)
+  totalVotesCast   Int
+
+  /// Optional reference to SHA-256 hashed Form EC8A photo in `evidence`.
+  ec8aEvidenceId String?
+
+  status           ResultStatus @default(PENDING_REVIEW)
+  /// Automated integrity flags (e.g. OVER_VOTING_EXCEEDS_ACCREDITED, ARITHMETIC_MISMATCH).
+  flags            String[]     @default([])
+  verifiedByUserId String?
+  verifiedAt       DateTime?
+  notes            String?      @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([organizationId, pollingUnitCode])
+  @@index([organizationId, status])
+  @@index([organizationId, lga, status])
+  @@map("polling_unit_results")
+}
+

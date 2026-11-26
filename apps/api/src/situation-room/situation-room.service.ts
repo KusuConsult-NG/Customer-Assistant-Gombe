@@ -220,6 +220,7 @@ export class SituationRoomService {
         })
         .slice(0, 50)
         .map((i) => ({
+          id: i.id,
           ticketNumber: i.ticketNumber,
           why: i.needsClassification ? 'not classified' : i.severity === 'CRITICAL' ? 'critical' : 'overdue',
           incidentType: i.incidentType,

@@ -7,15 +7,12 @@ import { usePathname, useRouter } from 'next/navigation';
 import {
   LayoutDashboard,
   BarChart3,
-  MessageSquareText,
-  MessageCircle,
   Users,
   BookOpen,
   Settings,
   Building2,
   Sparkles,
   LogOut,
-  Calendar,
   PhoneCall,
   ChevronRight,
   Bell,
@@ -25,9 +22,12 @@ import {
   Sun,
   Moon,
   Landmark,
-  Briefcase,
   ClipboardList,
-  Bot
+  Bot,
+  Radio,
+  MapPin,
+  ShieldCheck,
+  CheckSquare
 } from 'lucide-react';
 import { io } from 'socket.io-client';
 
@@ -300,8 +300,8 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
                       overlapped the portal label under it. Agency names come
                       from the database and are as long as the agency is. */}
                   <div className="min-w-0 flex-1">
-                    <h1 className={`font-bold text-base tracking-tight leading-tight truncate ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>{user?.organizationName || 'Customer Care'}</h1>
-                    <p className="text-[11px] font-medium text-brand-700 dark:text-brand-300 truncate">Citizen Care Portal</p>
+                    <h1 className={`font-bold text-base tracking-tight leading-tight truncate ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>{user?.organizationName || 'APC Gombe 2027'}</h1>
+                    <p className="text-[11px] font-medium text-brand-700 dark:text-brand-300 truncate">Election Situation Room</p>
                   </div>
                 </div>
 
@@ -314,31 +314,19 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
                   <div className="flex items-center gap-2 overflow-hidden min-w-0">
                     <Building2 className="w-4 h-4 text-brand-700 dark:text-brand-300 flex-shrink-0" />
                     <span className={`text-xs font-semibold truncate ${theme === 'dark' ? 'text-slate-200' : 'text-slate-800'}`}>
-                      {user?.organizationName || 'Your agency'}
+                      {user?.organizationName || 'Campaign Room'}
                     </span>
                   </div>
                   <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 font-bold tracking-wider flex-shrink-0 ml-2 border border-emerald-500/20">LIVE</span>
                 </div>
 
                 {/* Nav */}
-                {/* Role-aware. A front-desk officer used to be shown the
-                    agency's whole administration surface — System Settings,
-                    Branding, Agent Provisioning, Workflows, Broadcasts — and
-                    learned it was not theirs by clicking a button and getting a
-                    403 back. The server rules were right; the dashboard simply
-                    did not reflect them.
-
-                    Like the platform link below, this is what to OFFER, not a
-                    permission: `ace_user` is editable, so every screen still
-                    calls the API and still renders whatever refusal it gets. */}
                 <nav className="flex-1 px-3.5 py-3 space-y-1 overflow-y-auto">
                   {(() => {
                     const link = (href: string, icon: React.ReactNode, label: string) =>
                       canView(href, role) ? (
                         <SidebarLink key={href} href={href} icon={icon} label={label} pathname={pathname} theme={theme} onClick={() => setSidebarOpen(false)} />
                       ) : null;
-                    // A heading with nothing under it is a section that looks
-                    // broken rather than one that does not apply.
                     const section = (title: string, links: React.ReactNode[]) =>
                       links.some(Boolean) ? (
                         <React.Fragment key={title}>
@@ -349,42 +337,30 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
 
                     return (
                       <>
-                        {section('Service', [
-                          link('/', <LayoutDashboard className="w-4 h-4" />, 'Dashboard'),
-                          link('/analytics', <BarChart3 className="w-4 h-4" />, 'Analytics'),
-                          link('/crm', <Users className="w-4 h-4" />, 'Citizens & Contacts'),
-                          link('/agent-console', <MessageSquareText className="w-4 h-4" />, 'Agent Console'),
-                          link('/conversations', <MessageCircle className="w-4 h-4" />, 'Live Conversations'),
-                          link('/knowledge', <BookOpen className="w-4 h-4" />, 'Knowledge & FAQs'),
-                          link('/workflows', <GitFork className="w-4 h-4" />, 'Automation Workflows'),
+                        {section('Command Center', [
+                          link('/situation-room', <Radio className="w-4 h-4" />, 'Situation Room'),
+                          link('/results', <CheckSquare className="w-4 h-4" />, 'Live Results (EC8A)'),
+                          link('/polling-units', <MapPin className="w-4 h-4" />, 'Polling Units (2,988)'),
+                          link('/cases', <ClipboardList className="w-4 h-4" />, 'Incidents & Triage'),
                         ])}
 
-                        {section('Channels', [
-                          link('/broadcasts', <MessageSquareText className="w-4 h-4" />, 'WhatsApp Broadcasts'),
-                          link('/telephony', <PhoneCall className="w-4 h-4" />, 'Telephone Service'),
-                          link('/scheduling', <Calendar className="w-4 h-4" />, 'Appointments'),
+                        {section('Field Operations', [
+                          link('/agents', <ShieldCheck className="w-4 h-4" />, 'Party Agents Roster'),
+                          link('/telephony', <PhoneCall className="w-4 h-4" />, 'Hotline & Calls'),
                           link('/callbacks', <PhoneCall className="w-4 h-4" />, 'Callback Queue'),
-                          link('/cases', <ClipboardList className="w-4 h-4" />, 'Cases'),
-                          link('/agent-provisioning', <Bot className="w-4 h-4" />, 'Agent Provisioning'),
+                          link('/crm', <Users className="w-4 h-4" />, 'Contacts & Supporters'),
                         ])}
 
-                        {/* Shown only to a platform operator. This is a
-                            CONVENIENCE, not a permission — localStorage is
-                            editable, and every /api/platform/* route re-checks
-                            the flag against the database. Someone who forces
-                            their way to the page gets a plain "unavailable"
-                            panel, not a broken dashboard. */}
-                        {user?.isPlatformAdmin && (
-                          <>
-                            <p className="text-[10px] font-bold uppercase tracking-widest text-slate-500 dark:text-slate-400 px-3 py-1.5 mt-4">State Platform</p>
-                            <SidebarLink href="/platform" icon={<Landmark className="w-4 h-4" />} label="Platform Console" pathname={pathname} theme={theme} onClick={() => setSidebarOpen(false)} />
-                          </>
-                        )}
+                        {section('Campaign & Strategy', [
+                          link('/', <LayoutDashboard className="w-4 h-4" />, 'Overview'),
+                          link('/analytics', <BarChart3 className="w-4 h-4" />, 'Analytics'),
+                          link('/knowledge', <BookOpen className="w-4 h-4" />, 'Manifesto & Knowledge'),
+                          link('/workflows', <GitFork className="w-4 h-4" />, 'Escalation Workflows'),
+                        ])}
 
                         {section('Administration', [
-                          link('/services', <Briefcase className="w-4 h-4" />, 'Services & Locations'),
-                          link('/budget', <Landmark className="w-4 h-4" />, 'Budget & Projects'),
-                          link('/white-label', <Building2 className="w-4 h-4" />, 'Branding & White Label'),
+                          link('/agent-provisioning', <Bot className="w-4 h-4" />, 'Voice Agent & Hotline'),
+                          link('/white-label', <Building2 className="w-4 h-4" />, 'Campaign Branding'),
                           link('/settings', <Settings className="w-4 h-4" />, 'System Settings'),
                         ])}
                       </>

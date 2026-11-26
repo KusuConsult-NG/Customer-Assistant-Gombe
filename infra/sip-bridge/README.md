@@ -2,19 +2,19 @@
 
 ## Why this exists
 
-Alphatech's PBX will not forward calls for **08000000456** to an outside SIP
+Alphatech's PBX will not forward calls for **08000000779** to an outside SIP
 address. It only delivers calls to a device **registered** as an extension
-(1000). ElevenLabs cannot register to a PBX — it only receives calls sent to
+(1001). ElevenLabs cannot register to a PBX — it only receives calls sent to
 `sip.rtc.elevenlabs.io`. Nothing in the app or in ElevenLabs can close that gap
 on its own, and Render cannot carry voice media (no UDP), so the bridge runs on
 a small server of its own:
 
 ```
-caller → toll-free 08000000456 → Alphatech PBX ──(ext 1000, UDP)──▶ THIS BRIDGE
-        ──(TCP 5060, +2348000000456)──▶ ElevenLabs agent "Garba" ──▶ our API tools
+caller → toll-free 08000000779 → Alphatech PBX ──(ext 1001, UDP)──▶ THIS BRIDGE
+        ──(TCP 5060, +2348000000779)──▶ ElevenLabs agent "Garba" ──▶ our API tools
 ```
 
-It registers as extension 1000, takes every call Alphatech delivers, rewrites
+It registers as extension 1001, takes every call Alphatech delivers, rewrites
 the caller's number to E.164 (`0803…` → `+234803…`, so officers can call back),
 and dials the agent. If ElevenLabs cannot be reached the caller hears
 "all circuits are busy" instead of dead air. Officer callbacks are unchanged:
@@ -33,9 +33,9 @@ they go out through ElevenLabs' own trunk straight to Alphatech.
    ssh root@SERVER_IP
    cd /opt/sip-bridge && cp bridge.env.example bridge.env && nano bridge.env
    ```
-   - `ALPHATECH_PASSWORD`: extension 1000's password from Alphatech.
+   - `ALPHATECH_PASSWORD`: extension 1001's password from Alphatech.
    - `ELEVENLABS_SIP_PASSWORD`: the password set on the ElevenLabs phone
-     number's **inbound** trunk (username 1000).
+     number's **inbound** trunk (username 1001).
 
 3. **Install**: `sudo ./setup.sh` — installs Asterisk, renders the config,
    opens the firewall, starts it, and prints the status.
@@ -45,14 +45,14 @@ they go out through ElevenLabs' own trunk straight to Alphatech.
    number's inbound *allowed addresses* (Agents → Phone numbers → the toll-free
    number → Inbound). Without it ElevenLabs refuses the calls.
 
-5. **Call 08000000456.** `sudo ./check.sh` shows registration, live calls and
+5. **Call 08000000779.** `sudo ./check.sh` shows registration, live calls and
    the last log lines.
 
 ## When it does not work
 
 | `check.sh` shows | Meaning | Fix |
 |---|---|---|
-| `alphatech-reg … Rejected` | Alphatech refused the password | Check `ALPHATECH_PASSWORD`; ask Alphatech to confirm ext 1000 can register from your server's IP |
+| `alphatech-reg … Rejected` | Alphatech refused the password | Check `ALPHATECH_PASSWORD`; ask Alphatech to confirm ext 1001 can register from your server's IP |
 | `… Unregistered` / timeouts | Can't reach the PBX | Provider firewall: allow UDP 5060 outbound/inbound |
 | Registered, call rings, then busy message | ElevenLabs refused the leg | Server IP missing from ElevenLabs allowed addresses, or wrong `ELEVENLABS_SIP_PASSWORD` |
 | Call connects, no audio | RTP blocked or NAT | Open UDP 10000–20000; set `PUBLIC_IP` explicitly in `bridge.env` |

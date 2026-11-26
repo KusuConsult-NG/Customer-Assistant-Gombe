@@ -184,8 +184,8 @@ services:
         sync: false
       - key: WHATSAPP_BUSINESS_ID
         sync: false
-      # Required by startup validation (env.validation.ts) — the API exits(1)
-      # without these two. APP_SECRET verifies X-Hub-Signature-256 on webhooks;
+      # Optional when WhatsApp is disabled (webhook routes fail closed if unset).
+      # APP_SECRET verifies X-Hub-Signature-256 on webhooks;
       # VERIFY_TOKEN answers Meta's GET verification handshake.
       - key: WHATSAPP_APP_SECRET
         sync: false
