@@ -397,8 +397,17 @@ export default function AgentConsolePage() {
     }
   };
 
+  // Three panes side by side — but the list pane is a fixed 320px that cannot
+  // shrink, so at 375px the thread pane was pushed 31px off the right edge and
+  // the console was unusable on a phone: you could see the list of
+  // conversations and never the conversation.
+  //
+  // Below `lg` the panes stack and the list takes a fixed height, so both are
+  // reachable by scrolling the page. The height clamp is lifted there too:
+  // `100vh - 8.5rem` on a phone leaves a thread pane too short to hold a
+  // message and a composer at once.
   return (
-    <div className="flex h-[calc(100vh-8.5rem)] gap-4">
+    <div className="flex flex-col gap-4 lg:h-[calc(100vh-8.5rem)] lg:flex-row">
       {/*
         Full-height split pane with no room for a visible title, but it still
         needs a page heading: without one the document's only h1 is the app
@@ -407,7 +416,7 @@ export default function AgentConsolePage() {
       */}
       <h1 className="sr-only">Agent Console</h1>
       {/* Left: Conversation List */}
-      <div className="w-80 flex-shrink-0 flex flex-col border border-slate-200 dark:border-slate-800 rounded-2xl bg-white dark:bg-slate-900/80 overflow-hidden">
+      <div className="flex h-80 w-full flex-shrink-0 flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white lg:h-auto lg:w-80 dark:border-slate-800 dark:bg-slate-900/80">
         <div className="p-4 border-b border-slate-200 dark:border-slate-800 space-y-3">
           <div className="flex items-center justify-between">
             <h2 className="font-bold text-slate-900 dark:text-white text-sm flex items-center gap-2">
@@ -568,7 +577,7 @@ export default function AgentConsolePage() {
       </div>
 
       {/* Middle: Chat Window */}
-      <div className="flex-1 flex flex-col border border-slate-200 dark:border-slate-800 rounded-2xl bg-white dark:bg-slate-900/80 overflow-hidden">
+      <div className="flex min-h-[28rem] flex-1 flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white lg:min-h-0 dark:border-slate-800 dark:bg-slate-900/80">
         {liveId ? (
           /*
             A live call, read-only.

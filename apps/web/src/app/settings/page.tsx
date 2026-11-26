@@ -204,7 +204,7 @@ function TwoStepPanel({ org, authHeaders, showToast, onSaved }: any) {
     <section className="mt-6 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 space-y-4" aria-labelledby="two-step">
       <h2 id="two-step" className="text-base font-bold text-slate-900 dark:text-white">Two-step sign-in</h2>
       {!status ? (
-        <p className="text-xs text-slate-500">Could not load the current setting.</p>
+        <p className="text-xs text-[var(--text-muted)]">Could not load the current setting.</p>
       ) : status.enabled ? (
         <>
           <p className="text-sm text-slate-700 dark:text-slate-300">

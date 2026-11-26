@@ -213,7 +213,7 @@ export default function LoginPage() {
               >
                 {loading ? 'Checking…' : step === 'enrol' ? 'Turn on and sign in' : 'Verify and sign in'}
               </button>
-              <button type="button" onClick={() => { setStep('password'); setCode(''); setMfaToken(''); }} className="w-full text-xs text-slate-500 underline">
+              <button type="button" onClick={() => { setStep('password'); setCode(''); setMfaToken(''); }} className="w-full text-xs text-[var(--text-muted)] underline">
                 Start again
               </button>
             </form>

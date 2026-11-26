@@ -308,8 +308,8 @@ export default function CallbacksPage() {
                     {r.escalated && (
                       <div className="text-[10px] font-bold text-red-700 dark:text-red-400 mt-1">ESCALATED — over an hour late</div>
                     )}
-                    {r.preferredTime && <div className="text-[11px] text-slate-500 mt-1">Prefers: {r.preferredTime}</div>}
-                    {r.assignedUser && <div className="text-[11px] text-slate-500 mt-1">With {r.assignedUser.fullName}</div>}
+                    {r.preferredTime && <div className="text-[11px] text-[var(--text-muted)] mt-1">Prefers: {r.preferredTime}</div>}
+                    {r.assignedUser && <div className="text-[11px] text-[var(--text-muted)] mt-1">With {r.assignedUser.fullName}</div>}
                   </td>
                   <td className="px-5 py-4">
                     <span className={`px-2.5 py-1 text-[10px] font-bold rounded-lg border ${STATUS_STYLES[r.status]}`}>{STATUS_LABELS[r.status] ?? r.status}</span>

@@ -210,7 +210,7 @@ export function OfficerPhone() {
       aria-live="polite"
     >
       <div className="flex items-center gap-3">
-        <Phone className={`w-4 h-4 ${ringing ? 'text-emerald-600' : 'text-slate-500'}`} />
+        <Phone className={`w-4 h-4 ${ringing ? 'text-emerald-600' : 'text-[var(--text-muted)]'}`} />
         <span className="font-medium">{label}</span>
 
         {ringing && (

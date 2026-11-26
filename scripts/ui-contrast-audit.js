@@ -42,6 +42,13 @@ const PASSWORD = process.env.AUDIT_PASSWORD || 'SituationRoom1!';
 const pathsIdx = process.argv.indexOf('--paths');
 const PATHS = pathsIdx > -1 ? process.argv.slice(pathsIdx + 1).filter((a) => !a.startsWith('--')) : ['/', '/situation-room'];
 const WIDTHS = { phone: 375, tablet: 768, desktop: 1440 };
+/**
+ * `--by-pair` groups findings by the COLOUR PAIR rather than listing every
+ * element. A theme bug is one wrong token rendered a few hundred times; a
+ * flat list of 209 lines hides that it is really four fixes.
+ */
+const BY_PAIR = process.argv.includes('--by-pair');
+const pairs = new Map();
 
 const srgb = (c) => { const v = c / 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
 const lum = ([r, g, b]) => 0.2126 * srgb(r) + 0.7152 * srgb(g) + 0.0722 * srgb(b);
@@ -153,13 +160,20 @@ function collect() {
           if (seen.has(key)) continue;
           seen.add(key);
           const r = ratio(t.fg, t.bg);
-          if (r < t.floor) bad.push(`    ${r.toFixed(2)}:1 (needs ${t.floor})  "${t.label}"`);
+          if (r < t.floor) {
+            bad.push(`    ${r.toFixed(2)}:1 (needs ${t.floor})  "${t.label}"`);
+            const key = `rgb(${t.fg}) on rgb(${t.bg})`;
+            const seenPair = pairs.get(key) || { n: 0, ratio: r, floor: t.floor, where: new Set(), sample: t.label };
+            seenPair.n++; seenPair.where.add(`${theme}:${path}`);
+            pairs.set(key, seenPair);
+          }
         }
         const clips = [...new Map(clipped.map((c) => [c.label, c])).values()]
           .map((c) => `    ${c.px}px past the right edge: "${c.label}"`);
 
         const n = bad.length + clips.length;
         failures += n;
+        if (BY_PAIR) { await ctx.close(); continue; }
         const skipped = new Set(unknown).size;
         console.log(`${theme.padEnd(5)} ${device.padEnd(7)} ${path.padEnd(18)} ${n === 0 ? 'ok' : `${n} problem(s)`}${skipped ? `  (${skipped} over a gradient, not measurable — check by eye)` : ''}`);
         [...bad, ...clips].slice(0, 10).forEach((l) => console.log(l));
@@ -169,6 +183,14 @@ function collect() {
   }
 
   await browser.close();
+  if (BY_PAIR) {
+    console.log('\nDistinct colour pairs below their floor, worst first:\n');
+    [...pairs.entries()].sort((a, b) => a[1].ratio - b[1].ratio).forEach(([pair, v]) => {
+      console.log(`  ${v.ratio.toFixed(2)}:1 (needs ${v.floor})  ${pair}`);
+      console.log(`      ${v.n} element(s), e.g. "${v.sample}"`);
+      console.log(`      on: ${[...v.where].slice(0, 6).join(', ')}${v.where.size > 6 ? ` +${v.where.size - 6} more` : ''}\n`);
+    });
+  }
   console.log(failures === 0 ? '\nNothing below its contrast floor, nothing clipped.' : `\n${failures} problem(s).`);
   process.exit(failures === 0 ? 0 : 1);
 })();

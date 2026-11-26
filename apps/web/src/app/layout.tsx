@@ -462,17 +462,17 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
                     }`}
                     title={theme === 'dark' ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
                   >
+                    {/* Only the icon and the word change between themes; the
+                        label's colour is the same role in both, so it is one
+                        token rather than two hand-picked greys. */}
                     {theme === 'dark' ? (
-                      <>
-                        <Sun className="w-4 h-4 text-brand-700 dark:text-brand-300" />
-                        <span className="hidden sm:inline text-slate-200">Light Mode</span>
-                      </>
+                      <Sun className="h-4 w-4 text-brand-700 dark:text-brand-300" />
                     ) : (
-                      <>
-                        <Moon className="w-4 h-4 text-brand-700" />
-                        <span className="hidden sm:inline text-slate-700">Dark Mode</span>
-                      </>
+                      <Moon className="h-4 w-4 text-brand-700" />
                     )}
+                    <span className="hidden text-[var(--text-main)] sm:inline">
+                      {theme === 'dark' ? 'Light Mode' : 'Dark Mode'}
+                    </span>
                   </button>
 
                   {/* Notifications Bell */}
@@ -481,7 +481,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
                       className={`relative p-2 rounded-xl border transition-colors ${
                         theme === 'dark'
                           ? 'bg-slate-800/50 border-slate-700/60 text-slate-300 hover:text-white hover:bg-slate-800'
-                          : 'bg-slate-100 border-slate-200 text-slate-600 hover:text-slate-900 hover:bg-slate-200/70'
+                          : 'bg-slate-100 border-slate-200 text-[var(--text-muted)] hover:text-slate-900 hover:bg-slate-200/70'
                       }`}
                       onClick={() => setShowNotifications(!showNotifications)}
                     >
@@ -548,7 +548,7 @@ function SidebarLink({ href, icon, label, pathname, theme, onClick }: { href: st
             : 'bg-emerald-50 text-brand-700 border border-brand-500/30 shadow-sm'
           : theme === 'dark'
             ? 'text-slate-500 dark:text-slate-400 hover:text-slate-100 hover:bg-slate-800/40 border border-transparent'
-            : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100 border border-transparent'
+            : 'text-[var(--text-muted)] hover:text-slate-900 hover:bg-slate-100 border border-transparent'
       }`}
     >
       <span className={`transition-transform duration-200 group-hover:scale-110 ${

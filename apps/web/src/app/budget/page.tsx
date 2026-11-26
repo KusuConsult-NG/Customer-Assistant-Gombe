@@ -136,7 +136,7 @@ export default function BudgetPage() {
             role="tab"
             aria-selected={tab === k}
             onClick={() => setTab(k)}
-            className={`px-4 py-2 text-sm font-semibold border-b-2 -mb-px ${tab === k ? 'border-[#3b6102] text-slate-900 dark:text-white' : 'border-transparent text-slate-500'}`}
+            className={`px-4 py-2 text-sm font-semibold border-b-2 -mb-px ${tab === k ? 'border-[#3b6102] text-slate-900 dark:text-white' : 'border-transparent text-[var(--text-muted)]'}`}
           >
             {l}
           </button>
@@ -237,7 +237,7 @@ function Documents(props: {
         <h2 id="new-doc" className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
           <FileSpreadsheet className="w-4 h-4" /> Add a published document
         </h2>
-        <p className="text-xs text-slate-500 mt-1">
+        <p className="text-xs text-[var(--text-muted)] mt-1">
           Enter the total the document itself states. Approval is refused until the imported lines add up to it, so a
           dropped page cannot pass as the whole budget.
         </p>
@@ -289,11 +289,11 @@ function Documents(props: {
 
       <section aria-label="Budget documents" className="space-y-3">
         {docs === null ? (
-          <p className="text-xs text-slate-500">Loading…</p>
+          <p className="text-xs text-[var(--text-muted)]">Loading…</p>
         ) : docs.length === 0 ? (
           <div className={card}>
             <p className="text-sm text-slate-700 dark:text-slate-200 font-semibold">No budget documents yet.</p>
-            <p className="text-xs text-slate-500 mt-1">
+            <p className="text-xs text-[var(--text-muted)] mt-1">
               Until one is approved, the assistant answers budget questions by saying it has no verified figure.
             </p>
           </div>
@@ -305,7 +305,7 @@ function Documents(props: {
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div className="min-w-0">
                     <h3 className="text-sm font-bold text-slate-900 dark:text-white">{d.title}</h3>
-                    <p className="text-xs text-slate-500 mt-0.5">
+                    <p className="text-xs text-[var(--text-muted)] mt-0.5">
                       {DOC_TYPES.find(([k]) => k === d.documentType)?.[1]} · FY {d.fiscalYear}
                       {d.reportingPeriod ? ` · ${d.reportingPeriod}` : ''} · {d._count.lines} line(s) · stated total {naira(d.declaredTotal)}
                     </p>
@@ -349,7 +349,7 @@ function Documents(props: {
 
       <details className={card}>
         <summary className="text-sm font-bold text-slate-900 dark:text-white cursor-pointer">CSV format for budget lines</summary>
-        <p className="text-xs text-slate-500 mt-2">
+        <p className="text-xs text-[var(--text-muted)] mt-2">
           Required columns: <code>mda</code>, <code>amount</code>. Optional: <code>stage</code> (APPROVED, PROPOSED, REVISED, RELEASED,
           ACTUAL_EXPENDITURE — taken from the document type when omitted), <code>sector</code>, <code>programme</code>, <code>lineCode</code>,{' '}
           <code>description</code>, <code>economicClass</code>, <code>lga</code>, <code>period</code>, <code>sourcePage</code>, <code>sourceTable</code>.
@@ -384,7 +384,7 @@ function CheckFigure() {
       <h2 id="check" className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
         <Search className="w-4 h-4" /> What would a citizen be told?
       </h2>
-      <p className="text-xs text-slate-500 mt-1">
+      <p className="text-xs text-[var(--text-muted)] mt-1">
         This is the same figure the assistant would give, from approved documents only, never added across documents.
       </p>
       {err && <p role="alert" className="text-xs text-rose-700 mt-3">{err}</p>}
@@ -439,7 +439,7 @@ function CheckFigure() {
           {result.kind === 'figure' && (
             <>
               <p className="text-2xl font-bold text-slate-900 dark:text-white tabular-nums">{naira(result.total)}</p>
-              <p className="text-xs text-slate-500 mt-1">
+              <p className="text-xs text-[var(--text-muted)] mt-1">
                 {STAGES.find(([k]) => k === result.stage)?.[1]} · FY {result.fiscalYear} · {result.lineCount} line(s)
               </p>
               <ul className="text-xs mt-3 space-y-1">
@@ -479,14 +479,14 @@ function Projects(props: {
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h2 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2"><MapPin className="w-4 h-4" /> Project register</h2>
-            <p className="text-xs text-slate-500 mt-1">Projects are added as drafts and need a source before another administrator can publish them.</p>
+            <p className="text-xs text-[var(--text-muted)] mt-1">Projects are added as drafts and need a source before another administrator can publish them.</p>
           </div>
           <label className={`${btn} cursor-pointer`}>
             <Upload className="w-3.5 h-3.5" /> Import projects (CSV)
             <input type="file" accept=".csv,text/csv" className="sr-only" onChange={(e) => readFile(e, props.onImport)} />
           </label>
         </div>
-        <p className="text-[11px] text-slate-500 mt-3">
+        <p className="text-[11px] text-[var(--text-muted)] mt-3">
           Columns: <code>name</code>, <code>responsibleMda</code> (required); <code>projectCode</code>, <code>fiscalYear</code>, <code>lga</code>, <code>ward</code>,{' '}
           <code>community</code>, <code>approvedAllocation</code>, <code>contractValue</code>, <code>contractor</code>, <code>reportedExpenditure</code>, <code>status</code>,{' '}
           <code>physicalProgress</code>, <code>startDate</code>, <code>expectedCompletion</code>, <code>sourceUrl</code>, <code>sourceDocument</code>.
@@ -496,7 +496,7 @@ function Projects(props: {
       {open.length > 0 && (
         <section className={card} aria-labelledby="obs">
           <h2 id="obs" className="text-sm font-bold text-slate-900 dark:text-white">Citizen reports awaiting referral ({open.length})</h2>
-          <p className="text-xs text-slate-500 mt-1">What citizens said about a project. These never change its official status.</p>
+          <p className="text-xs text-[var(--text-muted)] mt-1">What citizens said about a project. These never change its official status.</p>
           <ul className="mt-3 divide-y divide-slate-100 dark:divide-slate-800">
             {open.map((o) => (
               <li key={o.id} className="py-3 flex flex-wrap items-start justify-between gap-3">
@@ -514,12 +514,12 @@ function Projects(props: {
 
       <section aria-label="Projects" className="overflow-x-auto rounded-2xl border border-slate-200 dark:border-slate-800">
         {props.projects === null ? (
-          <p className="text-xs text-slate-500 p-4">Loading…</p>
+          <p className="text-xs text-[var(--text-muted)] p-4">Loading…</p>
         ) : props.projects.length === 0 ? (
           <p className="text-xs text-slate-600 dark:text-slate-300 p-4">No projects yet. The assistant will say it has no published record rather than guess.</p>
         ) : (
           <table className="w-full text-xs">
-            <thead className="bg-slate-50 dark:bg-slate-900 text-left text-slate-500">
+            <thead className="bg-slate-50 dark:bg-slate-900 text-left text-[var(--text-muted)]">
               <tr>
                 <th className="p-3">Project</th><th className="p-3">LGA</th><th className="p-3">Status</th>
                 <th className="p-3 text-right">Allocation</th><th className="p-3 text-right">Contract</th><th className="p-3 text-right">Reported spend</th>
@@ -531,7 +531,7 @@ function Projects(props: {
                 <tr key={p.id} className="bg-white dark:bg-slate-950">
                   <td className="p-3">
                     <p className="font-semibold text-slate-900 dark:text-white">{p.name}</p>
-                    <p className="text-slate-500">{p.responsibleMda}{p._count.observations ? ` · ${p._count.observations} citizen report(s)` : ''}</p>
+                    <p className="text-[var(--text-muted)]">{p.responsibleMda}{p._count.observations ? ` · ${p._count.observations} citizen report(s)` : ''}</p>
                   </td>
                   <td className="p-3">{[p.community, p.lga].filter(Boolean).join(', ') || '—'}</td>
                   <td className="p-3">{p.status.toLowerCase()}{p.physicalProgress != null ? ` · ${p.physicalProgress}%` : ''}</td>
@@ -550,7 +550,7 @@ function Projects(props: {
           </table>
         )}
       </section>
-      <p className="text-[11px] text-slate-500 flex items-center gap-1"><Landmark className="w-3 h-3" /> A contract value is not money paid, and physical progress is not expenditure.</p>
+      <p className="text-[11px] text-[var(--text-muted)] flex items-center gap-1"><Landmark className="w-3 h-3" /> A contract value is not money paid, and physical progress is not expenditure.</p>
     </div>
   );
 }

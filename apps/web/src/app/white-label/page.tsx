@@ -395,14 +395,27 @@ export default function WhiteLabelPage() {
                           // inactive items are OUR chrome, so they follow the
                           // dashboard's own muted step instead of a hardcoded grey
                           // that measured 3.7:1 on the dark card.
+                          // The active item shows the agency's colour as a
+                          // TINT and a SPINE, with the label in the normal
+                          // text colour.
+                          //
+                          // It used to set `color: primaryColor` on a 19%
+                          // tint of that same colour, which measured 2.83:1
+                          // for the default blue and is unreadable for most
+                          // mid-tone choices. That pairing was not faithful
+                          // either: the real sidebar renders its active label
+                          // in the product's own text colour, not the
+                          // tenant's. So this shows the colour truthfully in
+                          // the place the product actually uses it, and stays
+                          // legible whatever the agency picks.
                           <div
                             key={item}
-                            className={`px-2 py-1.5 rounded-lg text-[10px] font-medium ${
-                              i === 0 ? '' : 'text-slate-500 dark:text-slate-400'
+                            className={`rounded-lg px-2 py-1.5 text-[10px] font-medium ${
+                              i === 0 ? 'text-[var(--text-main)]' : 'text-[var(--text-muted)]'
                             }`}
                             style={{
                               background: i === 0 ? `${primaryColor}30` : 'transparent',
-                              ...(i === 0 ? { color: primaryColor } : {}),
+                              ...(i === 0 ? { borderLeft: `2px solid ${primaryColor}` } : {}),
                             }}
                           >{item}</div>
                         ))}

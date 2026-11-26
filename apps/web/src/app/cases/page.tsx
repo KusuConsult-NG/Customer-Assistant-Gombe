@@ -117,7 +117,7 @@ export default function CasesPage() {
             ['Resolved', (summary.byStage.RESOLVED ?? 0) + (summary.byStage.CLOSED ?? 0)],
           ].map(([k, v]) => (
             <div key={k as string} className={`${card} p-4`}>
-              <p className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">{k}</p>
+              <p className="text-[11px] font-semibold text-[var(--text-muted)] uppercase tracking-wide">{k}</p>
               <p className={`text-2xl font-bold tabular-nums mt-1 ${k === 'Overdue' && Number(v) > 0 ? 'text-rose-700 dark:text-rose-400' : 'text-slate-900 dark:text-white'}`}>{v as number}</p>
             </div>
           ))}
@@ -126,14 +126,14 @@ export default function CasesPage() {
 
       <section aria-label="Filters" className="flex flex-wrap gap-2 items-end">
         <div>
-          <label className="block text-[11px] font-semibold text-slate-500 mb-1" htmlFor="f-stage">Stage</label>
+          <label className="block text-[11px] font-semibold text-[var(--text-muted)] mb-1" htmlFor="f-stage">Stage</label>
           <select id="f-stage" className={input} value={filters.stage ?? ''} onChange={(e) => setFilters({ ...filters, stage: e.target.value || undefined })}>
             <option value="">Any</option>
             {STAGES.map((s) => <option key={s} value={s}>{label(s)}</option>)}
           </select>
         </div>
         <div>
-          <label className="block text-[11px] font-semibold text-slate-500 mb-1" htmlFor="f-cat">Category</label>
+          <label className="block text-[11px] font-semibold text-[var(--text-muted)] mb-1" htmlFor="f-cat">Category</label>
           <select id="f-cat" className={input} value={filters.category ?? ''} onChange={(e) => setFilters({ ...filters, category: e.target.value || undefined })}>
             <option value="">Any</option>
             {CATEGORIES.map((c) => <option key={c} value={c}>{label(c)}</option>)}
@@ -157,7 +157,7 @@ export default function CasesPage() {
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]">
         <section aria-label="Cases" className={`${card} overflow-hidden`}>
           {cases === null ? (
-            <p className="p-4 text-xs text-slate-500">{error ? 'Not loaded.' : 'Loading…'}</p>
+            <p className="p-4 text-xs text-[var(--text-muted)]">{error ? 'Not loaded.' : 'Loading…'}</p>
           ) : cases.length === 0 ? (
             <p className="p-4 text-xs text-slate-600 dark:text-slate-300">No cases match.</p>
           ) : (
@@ -169,11 +169,11 @@ export default function CasesPage() {
                     className={`w-full text-left p-4 hover:bg-slate-50 dark:hover:bg-slate-800/50 ${selected?.id === c.id ? 'bg-slate-50 dark:bg-slate-800/50' : ''}`}
                   >
                     <div className="flex items-center justify-between gap-2">
-                      <span className="text-xs font-mono text-slate-500">{c.ticketNumber}</span>
+                      <span className="text-xs font-mono text-[var(--text-muted)]">{c.ticketNumber}</span>
                       <span className={`text-[11px] font-bold px-2 py-0.5 rounded-full ${stageTone(c.caseStage)}`}>{label(c.caseStage)}</span>
                     </div>
                     <p className="text-sm font-semibold text-slate-900 dark:text-white mt-1 line-clamp-2">{c.summary || c.subject}</p>
-                    <p className="text-[11px] text-slate-500 mt-1 flex flex-wrap gap-x-3 gap-y-1">
+                    <p className="text-[11px] text-[var(--text-muted)] mt-1 flex flex-wrap gap-x-3 gap-y-1">
                       <span>{label(c.category ?? 'unclassified')}</span>
                       {c.lga && <span>{c.lga}</span>}
                       {c.responsibleMda && <span>{c.responsibleMda}</span>}
@@ -190,7 +190,7 @@ export default function CasesPage() {
 
         <section aria-label="Case detail">
           {!selected ? (
-            <div className={`${card} p-6 text-xs text-slate-500 flex items-center gap-2`}><ClipboardList className="w-4 h-4" /> Choose a case to work it.</div>
+            <div className={`${card} p-6 text-xs text-[var(--text-muted)] flex items-center gap-2`}><ClipboardList className="w-4 h-4" /> Choose a case to work it.</div>
           ) : (
             <CaseDetail c={selected} members={members} busy={busy} isLiaison={isLiaison} liaisonMda={me.mdaName ?? null} act={act} />
           )}
@@ -215,13 +215,13 @@ function CaseDetail({ c, members, busy, isLiaison, liaisonMda, act }: {
       <article className={`${card} p-5`}>
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0">
-            <p className="text-xs font-mono text-slate-500">{c.ticketNumber}</p>
+            <p className="text-xs font-mono text-[var(--text-muted)]">{c.ticketNumber}</p>
             <h2 className="text-base font-bold text-slate-900 dark:text-white mt-1">{c.summary || c.subject}</h2>
           </div>
           <span className={`text-[11px] font-bold px-2 py-1 rounded-full ${stageTone(c.caseStage)}`}>{label(c.caseStage)}</span>
         </div>
         <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-xs mt-4">
-          <dt className="text-slate-500">Reporter</dt>
+          <dt className="text-[var(--text-muted)]">Reporter</dt>
           <dd className="text-slate-900 dark:text-slate-100">
             {c.isAnonymous && !c.contactId ? (
               <span className="inline-flex items-center gap-1"><EyeOff className="w-3 h-3" /> Withheld: the citizen asked not to be named</span>
@@ -229,17 +229,17 @@ function CaseDetail({ c, members, busy, isLiaison, liaisonMda, act }: {
               <>{c.contact?.fullName} {c.contact?.phoneNumber ? `· ${c.contact.phoneNumber}` : ''}</>
             )}
           </dd>
-          <dt className="text-slate-500">Category</dt><dd>{label(c.category ?? 'unclassified')}</dd>
-          <dt className="text-slate-500">Where</dt><dd>{[c.community, c.ward, c.lga].filter(Boolean).join(', ') || 'Not given yet'}</dd>
-          <dt className="text-slate-500">Responsible MDA</dt><dd>{c.responsibleMda ?? 'Not set'}</dd>
-          <dt className="text-slate-500">Assigned to</dt><dd>{c.assignedUser?.fullName ?? 'Nobody'}</dd>
-          <dt className="text-slate-500">Deadline</dt>
+          <dt className="text-[var(--text-muted)]">Category</dt><dd>{label(c.category ?? 'unclassified')}</dd>
+          <dt className="text-[var(--text-muted)]">Where</dt><dd>{[c.community, c.ward, c.lga].filter(Boolean).join(', ') || 'Not given yet'}</dd>
+          <dt className="text-[var(--text-muted)]">Responsible MDA</dt><dd>{c.responsibleMda ?? 'Not set'}</dd>
+          <dt className="text-[var(--text-muted)]">Assigned to</dt><dd>{c.assignedUser?.fullName ?? 'Nobody'}</dd>
+          <dt className="text-[var(--text-muted)]">Deadline</dt>
           <dd className={c.overdue ? 'text-rose-700 dark:text-rose-400 font-semibold' : ''}>{c.dueAt ? new Date(c.dueAt).toLocaleDateString() : 'None'}{c.overdue ? ' (overdue)' : ''}</dd>
-          {c.resolutionOutcome && (<><dt className="text-slate-500">Outcome</dt><dd>{c.resolutionOutcome}</dd></>)}
-          {c.citizenNotifiedAt && (<><dt className="text-slate-500">Citizen told</dt><dd>{new Date(c.citizenNotifiedAt).toLocaleString()}</dd></>)}
+          {c.resolutionOutcome && (<><dt className="text-[var(--text-muted)]">Outcome</dt><dd>{c.resolutionOutcome}</dd></>)}
+          {c.citizenNotifiedAt && (<><dt className="text-[var(--text-muted)]">Citizen told</dt><dd>{new Date(c.citizenNotifiedAt).toLocaleString()}</dd></>)}
         </dl>
         <div className="mt-4">
-          <p className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">In the citizen&apos;s words</p>
+          <p className="text-[11px] font-semibold text-[var(--text-muted)] uppercase tracking-wide">In the citizen&apos;s words</p>
           <p className="text-sm text-slate-800 dark:text-slate-200 mt-1 whitespace-pre-wrap">{c.description}</p>
         </div>
       </article>
@@ -249,7 +249,7 @@ function CaseDetail({ c, members, busy, isLiaison, liaisonMda, act }: {
           <h3 className="text-sm font-bold text-slate-900 dark:text-white">Work the case</h3>
           <div className="grid gap-3 sm:grid-cols-2">
             <div>
-              <label className="block text-[11px] font-semibold text-slate-500 mb-1" htmlFor="assign">Assign to</label>
+              <label className="block text-[11px] font-semibold text-[var(--text-muted)] mb-1" htmlFor="assign">Assign to</label>
               <select id="assign" className={input} value={c.assignedUserId ?? ''} disabled={busy}
                 onChange={(e) => act(() => api.cases.assign(c.id, e.target.value || null))}>
                 <option value="">Nobody</option>
@@ -257,7 +257,7 @@ function CaseDetail({ c, members, busy, isLiaison, liaisonMda, act }: {
               </select>
             </div>
             <div>
-              <label className="block text-[11px] font-semibold text-slate-500 mb-1" htmlFor="cat">Category</label>
+              <label className="block text-[11px] font-semibold text-[var(--text-muted)] mb-1" htmlFor="cat">Category</label>
               <select id="cat" className={input} value={c.category ?? ''} disabled={busy}
                 onChange={(e) => act(() => api.cases.classify(c.id, { category: e.target.value }))}>
                 <option value="">Unclassified</option>
@@ -271,7 +271,7 @@ function CaseDetail({ c, members, busy, isLiaison, liaisonMda, act }: {
             if (!nextStage) return;
             act(() => api.cases.moveStage(c.id, { stage: nextStage, ...(outcome ? { outcome } : {}), ...(note ? { note } : {}) }).then(() => { setNextStage(''); setOutcome(''); setNote(''); }));
           }}>
-            <label className="block text-[11px] font-semibold text-slate-500" htmlFor="stage">Move to</label>
+            <label className="block text-[11px] font-semibold text-[var(--text-muted)]" htmlFor="stage">Move to</label>
             <div className="flex flex-wrap gap-2">
               <select id="stage" className={`${input} sm:w-56`} value={nextStage} onChange={(e) => setNextStage(e.target.value)}>
                 <option value="">Choose a stage…</option>
@@ -296,7 +296,7 @@ function CaseDetail({ c, members, busy, isLiaison, liaisonMda, act }: {
               ...(refer.dueAt ? { dueAt: refer.dueAt } : {}),
             }).then(() => setRefer({ mdaName: '', liaisonName: '', liaisonContact: '', note: '', dueAt: '' })));
           }}>
-            <p className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">Refer to an MDA</p>
+            <p className="text-[11px] font-semibold text-[var(--text-muted)] uppercase tracking-wide">Refer to an MDA</p>
             <div className="grid gap-2 sm:grid-cols-2">
               <input className={input} required value={refer.mdaName} onChange={(e) => setRefer({ ...refer, mdaName: e.target.value })} placeholder="MDA name" aria-label="MDA name" />
               <input type="date" className={input} value={refer.dueAt} onChange={(e) => setRefer({ ...refer, dueAt: e.target.value })} aria-label="Response due" />
@@ -304,7 +304,7 @@ function CaseDetail({ c, members, busy, isLiaison, liaisonMda, act }: {
               <input className={input} value={refer.liaisonContact} onChange={(e) => setRefer({ ...refer, liaisonContact: e.target.value })} placeholder="Liaison contact (optional)" aria-label="Liaison contact" />
             </div>
             <input className={input} value={refer.note} onChange={(e) => setRefer({ ...refer, note: e.target.value })} placeholder="What you are asking the MDA to do" aria-label="Referral note" />
-            {c.isAnonymous && <p className="text-[11px] text-slate-500 flex items-center gap-1"><ShieldCheck className="w-3 h-3" /> The reporter&apos;s identity is not shared with the MDA.</p>}
+            {c.isAnonymous && <p className="text-[11px] text-[var(--text-muted)] flex items-center gap-1"><ShieldCheck className="w-3 h-3" /> The reporter&apos;s identity is not shared with the MDA.</p>}
             <button type="submit" className={btn} disabled={busy}><Send className="w-3.5 h-3.5" /> Refer</button>
           </form>
 
@@ -313,7 +313,7 @@ function CaseDetail({ c, members, busy, isLiaison, liaisonMda, act }: {
               e.preventDefault();
               act(() => api.cases.citizenNotified(c.id, { channel: notified.channel, ...(notified.note ? { note: notified.note } : {}) }));
             }}>
-              <p className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">Record that the citizen was told the outcome</p>
+              <p className="text-[11px] font-semibold text-[var(--text-muted)] uppercase tracking-wide">Record that the citizen was told the outcome</p>
               <div className="flex flex-wrap gap-2">
                 <select className={`${input} sm:w-40`} value={notified.channel} onChange={(e) => setNotified({ ...notified, channel: e.target.value })} aria-label="How they were told">
                   <option value="phone">Phone call</option><option value="WhatsApp">WhatsApp</option><option value="in person">In person</option><option value="letter">Letter</option>
@@ -329,7 +329,7 @@ function CaseDetail({ c, members, busy, isLiaison, liaisonMda, act }: {
       <article className={`${card} p-5`}>
         <h3 className="text-sm font-bold text-slate-900 dark:text-white">MDA referrals</h3>
         {(c.referrals ?? []).length === 0 ? (
-          <p className="text-xs text-slate-500 mt-2">Not referred.</p>
+          <p className="text-xs text-[var(--text-muted)] mt-2">Not referred.</p>
         ) : (
           <ul className="mt-3 space-y-3">
             {c.referrals.map((r: any) => (
@@ -357,13 +357,13 @@ function CaseDetail({ c, members, busy, isLiaison, liaisonMda, act }: {
         <article className={`${card} p-5`}>
           <h3 className="text-sm font-bold text-slate-900 dark:text-white">Call record</h3>
           {c.calls?.withheld ? (
-            <p className="mt-2 text-xs text-slate-500">The call record is withheld: it identifies the reporter of a confidential report.</p>
+            <p className="mt-2 text-xs text-[var(--text-muted)]">The call record is withheld: it identifies the reporter of a confidential report.</p>
           ) : (
             <ul className="mt-3 space-y-3">
               {c.calls.items.map((call: any) => (
                 <li key={call.id} className="text-xs space-y-2">
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <span className="text-slate-500">
+                    <span className="text-[var(--text-muted)]">
                       {new Date(call.startedAt).toLocaleString()} · {Math.floor((call.durationSeconds || 0) / 60)}m {(call.durationSeconds || 0) % 60}s
                     </span>
                     <CallRecordingPlayer callId={call.id} playable={call.recordingPlayable} />
@@ -375,7 +375,7 @@ function CaseDetail({ c, members, busy, isLiaison, liaisonMda, act }: {
                       <p className="mt-1 whitespace-pre-wrap text-slate-600 dark:text-slate-300">{call.transcript}</p>
                     </details>
                   ) : (
-                    <p className="text-slate-500">No transcript is held for this call.</p>
+                    <p className="text-[var(--text-muted)]">No transcript is held for this call.</p>
                   )}
                 </li>
               ))}
@@ -391,7 +391,7 @@ function CaseDetail({ c, members, busy, isLiaison, liaisonMda, act }: {
             <li key={e.id} className="text-xs">
               <span className="text-slate-400">{new Date(e.createdAt).toLocaleString()}</span>{' '}
               <span className="font-semibold text-slate-700 dark:text-slate-200">{label(e.type)}</span>
-              {e.toStage && <span className="text-slate-500"> → {label(e.toStage)}</span>}
+              {e.toStage && <span className="text-[var(--text-muted)]"> → {label(e.toStage)}</span>}
               {e.body && <p className="text-slate-600 dark:text-slate-300 whitespace-pre-wrap">{e.body}</p>}
             </li>
           ))}

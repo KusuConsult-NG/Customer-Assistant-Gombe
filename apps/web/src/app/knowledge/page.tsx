@@ -1112,15 +1112,15 @@ function GovernanceRow({ doc, onChanged }: { doc: any; onChanged: (d: any) => vo
   };
 
   const tone =
-    status === 'APPROVED' ? 'text-emerald-700 dark:text-emerald-400' : status === 'WITHDRAWN' ? 'text-slate-500' : 'text-amber-700 dark:text-amber-400';
+    status === 'APPROVED' ? 'text-emerald-700 dark:text-emerald-400' : status === 'WITHDRAWN' ? 'text-[var(--text-muted)]' : 'text-amber-700 dark:text-amber-400';
 
   return (
     <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px]" onClick={(e) => e.stopPropagation()}>
       <span className={`font-bold ${tone}`}>
         {status === 'APPROVED' ? 'Answering citizens' : status === 'WITHDRAWN' ? 'Withdrawn — not used' : 'Draft — not used until approved'}
       </span>
-      {doc.mdaOwner && <span className="text-slate-500">Owner: {doc.mdaOwner}</span>}
-      {doc.verifiedAt && <span className="text-slate-500">Verified {new Date(doc.verifiedAt).toLocaleDateString()}</span>}
+      {doc.mdaOwner && <span className="text-[var(--text-muted)]">Owner: {doc.mdaOwner}</span>}
+      {doc.verifiedAt && <span className="text-[var(--text-muted)]">Verified {new Date(doc.verifiedAt).toLocaleDateString()}</span>}
       {reviewOverdue && <span className="font-bold text-red-700 dark:text-red-400">Review overdue</span>}
       {status !== 'APPROVED' && (
         <button className="underline font-semibold text-slate-700 dark:text-slate-200" disabled={busy}
@@ -1175,11 +1175,11 @@ function KnowledgeGaps() {
           <li key={g.id} className="py-2 flex flex-wrap items-start justify-between gap-2">
             <div className="min-w-0">
               <p className="text-sm text-slate-800 dark:text-slate-100">“{g.sampleText}”</p>
-              <p className="text-[11px] text-slate-500">Asked {g.count} time{g.count === 1 ? '' : 's'} · last {new Date(g.lastAskedAt).toLocaleDateString()}{g.status === 'ASSIGNED' ? ' · assigned' : ''}</p>
+              <p className="text-[11px] text-[var(--text-muted)]">Asked {g.count} time{g.count === 1 ? '' : 's'} · last {new Date(g.lastAskedAt).toLocaleDateString()}{g.status === 'ASSIGNED' ? ' · assigned' : ''}</p>
             </div>
             <div className="flex gap-2 text-xs">
               <button className="underline font-semibold" onClick={() => { const resolution = window.prompt('Where is the answer now? (document or FAQ title)'); if (resolution) update(g.id, { status: 'RESOLVED', resolution }); }}>Resolved</button>
-              <button className="underline text-slate-500" onClick={() => update(g.id, { status: 'DISMISSED' })}>Not a real gap</button>
+              <button className="underline text-[var(--text-muted)]" onClick={() => update(g.id, { status: 'DISMISSED' })}>Not a real gap</button>
             </div>
           </li>
         ))}
