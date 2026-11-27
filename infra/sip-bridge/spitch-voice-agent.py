@@ -514,23 +514,50 @@ def run_spitch_direct_turn_sync(user_text: str, lang: str, caller_id: str) -> Tu
         return reply, False
 
     # Knowledge search (IMPACTS Manifesto, Party Agent Handbook, Situation Room Protocol)
-    kb = call_agent_tool_sync("search-knowledge", {"query": english_text})
+    def clean_kb_query(raw_q: str) -> str:
+        q = re.sub(r"\b(guamna[sz]?|gwamna[sz]?)\b", "Gwamna", raw_q, flags=re.I)
+        q = re.sub(r"\b(isheku|ishaku)\b", "Isyaku", q, flags=re.I)
+        q = re.sub(r"\b(what|is|are|tell|me|about|the|please|can|you|explain|goals|in|of|for)\b", " ", q, flags=re.I)
+        return re.sub(r"\s+", " ", q).strip() or raw_q
+
+    kb_query = clean_kb_query(english_text)
+    kb = call_agent_tool_sync("search-knowledge", {"query": kb_query})
     speak = str(kb.get("speak") or "").strip()
-    if speak:
+    is_miss = (not kb.get("ok")) or ("don't have that detail" in speak.lower()) or (not speak)
+    if is_miss:
+        # Retry with high-signal domain keyword
+        fallback_q = "IMPACTS manifesto"
+        if re.search(r"\b(agri|farm|noma|food)\b", low):
+            fallback_q = "IMPACTS Agriculture Food Security"
+        elif re.search(r"\b(educat|school|youth|ilimi)\b", low):
+            fallback_q = "IMPACTS People First Education Youth"
+        elif re.search(r"\b(health|hospital|lafiya)\b", low):
+            fallback_q = "IMPACTS Community Healthcare"
+        elif re.search(r"\b(sms|code|check.?in|ec8a|result|agent)\b", low):
+            fallback_q = "SMS check-in Form EC8A party agent"
+        elif re.search(r"\b(hotline|number|lga|ward|polling)\b", low):
+            fallback_q = "Situation Room toll-free hotline LGAs polling units"
+        kb = call_agent_tool_sync("search-knowledge", {"query": fallback_q})
+        speak = str(kb.get("speak") or "").strip()
+        is_miss = (not kb.get("ok")) or ("don't have that detail" in speak.lower()) or (not speak)
+
+    if not is_miss and speak:
         # Trim to 2-3 clean spoken sentences
         clean_lines = [
             re.sub(r"^[#*\-\s]+", "", ln).strip()
             for ln in speak.splitlines()
-            if ln.strip() and not ln.strip().startswith("Also known as:")
+            if ln.strip()
+            and not ln.strip().startswith("Also known as:")
+            and not ln.strip().startswith("Overview")
         ]
-        summary = " ".join(clean_lines)[:360]
-        if "." in summary[120:]:
+        summary = " ".join(clean_lines)[:340]
+        if "." in summary[110:]:
             summary = summary[: summary.rfind(".") + 1]
-        en_reply = f"{summary} Would you like more details or to log a polling unit report?"
+        en_reply = f"{summary} Would you like more details, or to report a polling unit update?"
     else:
         en_reply = (
-            "I am here to help with Doctor Jamil Isyaku Gwamna's IMPACTS manifesto "
-            "or to log an election-day polling unit report. Please tell me what you need."
+            "I did not find that exact detail in our campaign records. "
+            "Would you like a Situation Room desk officer to call you back on this number?"
         )
     reply = spitch_translate_sync(en_reply, "en", "ha") if lang == "ha" else en_reply
     return reply, False
