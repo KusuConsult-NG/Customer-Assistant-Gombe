@@ -5,25 +5,65 @@ static = yes
 writeprotect = yes
 
 ; Every call Alphatech delivers to extension ${ALPHATECH_EXTENSION}, whatever
-; number the INVITE carries, goes to the ElevenLabs agent as the toll-free DID.
+; number the INVITE carries, enters [bridge].
 [from-alphatech]
 exten => _[+0-9a-zA-Z*#].,1,Goto(bridge,s,1)
 exten => s,1,Goto(bridge,s,1)
 
 [bridge]
-exten => s,1,NoOp(Inbound from Alphatech: caller=${CALLERID(num)} dialled=${EXTEN})
+exten => s,1,NoOp(Inbound from Alphatech: caller=${CALLERID(num)} dialled=${EXTEN} mode=${VOICE_MODE})
  ; Callers' numbers to E.164, so officers can ring them back:
- ;   08031234567 → +2348031234567 ; 2348031234567 → +2348031234567
+ ;   08031234567 -> +2348031234567 ; 2348031234567 -> +2348031234567
  same => n,Set(CN=${CALLERID(num)})
  same => n,ExecIf($[${REGEX("^0[789][01][0-9]{8}$" ${CN})}]?Set(CALLERID(num)=+234${CN:1}))
  same => n,ExecIf($[${REGEX("^234[0-9]{10}$" ${CN})}]?Set(CALLERID(num)=+${CN}))
- ; If INTRO_SOUND is set (e.g. a recorded agency welcome message),
- ; answer and play it before handing the call to the assistant on ElevenLabs.
+ ; When VOICE_MODE=spitch-ivr, route to the bilingual Press-1 Hausa / Press-2 Nigerian English IVR.
+ same => n,GotoIf($["${VOICE_MODE}" = "spitch-ivr"]?spitch-ivr,s,1)
+ ; Legacy direct ElevenLabs handoff
  same => n,ExecIf($["${INTRO_SOUND}" != ""]?Answer())
  same => n,ExecIf($["${INTRO_SOUND}" != ""]?Playback(${INTRO_SOUND}))
+ same => n,Goto(fallback-el,s,1)
+
+[spitch-ivr]
+exten => s,1,Answer()
+ same => n,Set(IVR_TRIES=0)
+ same => n(menu),NoOp(Bilingual IVR menu try=${IVR_TRIES} caller=${CALLERID(num)})
+ same => n,Set(TIMEOUT(digit)=4)
+ same => n,Set(TIMEOUT(response)=7)
+ same => n,Background(custom/gombe-ivr-menu)
+ same => n,WaitExten(7)
+
+; Press 1 -> Native Hausa (Spitch Hasan)
+exten => 1,1,NoOp(Caller ${CALLERID(num)} selected 1: Hausa)
+ same => n,Playback(custom/gombe-ivr-connecting-ha)
+ same => n,Set(CALL_UUID=${CURL(http://127.0.0.1:9091/session?lang=ha&caller=${URIENCODE(${CALLERID(num)})})})
+ same => n,GotoIf($["${CALL_UUID}" = ""]?fallback-el,s,1)
+ same => n,AudioSocket(${CALL_UUID},127.0.0.1:9092)
+ same => n,Hangup()
+
+; Press 2 -> Nigerian English (Spitch Kingsley)
+exten => 2,1,NoOp(Caller ${CALLERID(num)} selected 2: Nigerian English)
+ same => n,Playback(custom/gombe-ivr-connecting-en)
+ same => n,Set(CALL_UUID=${CURL(http://127.0.0.1:9091/session?lang=en&caller=${URIENCODE(${CALLERID(num)})})})
+ same => n,GotoIf($["${CALL_UUID}" = ""]?fallback-el,s,1)
+ same => n,AudioSocket(${CALL_UUID},127.0.0.1:9092)
+ same => n,Hangup()
+
+; Invalid digit -> play bilingual retry once, then connect Hausa
+exten => i,1,Set(IVR_TRIES=$[${IVR_TRIES} + 1])
+ same => n,GotoIf($[${IVR_TRIES} >= 2]?1,1)
+ same => n,Playback(custom/gombe-ivr-invalid)
+ same => n,Goto(s,menu)
+
+; No selection -> replay menu once, then default to Hausa (1)
+exten => t,1,Set(IVR_TRIES=$[${IVR_TRIES} + 1])
+ same => n,GotoIf($[${IVR_TRIES} >= 2]?1,1)
+ same => n,Goto(s,menu)
+
+[fallback-el]
+exten => s,1,NoOp(Dialing ElevenLabs SIP trunk for ${TOLLFREE_E164})
  same => n,Dial(PJSIP/elevenlabs/sip:${TOLLFREE_E164}@${ELEVENLABS_SIP_HOST}:5060\;transport=tcp,60)
  same => n,NoOp(ElevenLabs leg ended: DIALSTATUS=${DIALSTATUS} HANGUPCAUSE=${HANGUPCAUSE})
- ; If the AI could not be reached, the caller is told rather than dropped.
  same => n,ExecIf($["${DIALSTATUS}" != "ANSWER"]?Playback(${FALLBACK_SOUND}))
  same => n,Hangup()
 

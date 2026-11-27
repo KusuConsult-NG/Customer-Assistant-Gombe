@@ -10,15 +10,19 @@ on its own, and Render cannot carry voice media (no UDP), so the bridge runs on
 a small server of its own:
 
 ```
-caller → toll-free 08000000779 → Alphatech PBX ──(ext 1001, UDP)──▶ THIS BRIDGE
-        ──(TCP 5060, +2348000000779)──▶ ElevenLabs agent "Garba" ──▶ our API tools
+caller → toll-free 08000000779 → Alphatech PBX ──(ext 1001, UDP)──▶ THIS BRIDGE (Asterisk)
+        ├── Press 1 → Spitch Hausa Voice Agent (hasan, ha) ──────▶ /api/agent-tools/*
+        ├── Press 2 → Spitch Nigerian English Agent (kingsley, en) ▶ /api/agent-tools/*
+        └── Fallback → ElevenLabs SIP trunk (+2348000000779)
 ```
 
 It registers as extension 1001, takes every call Alphatech delivers, rewrites
 the caller's number to E.164 (`0803…` → `+234803…`, so officers can call back),
-and dials the agent. If ElevenLabs cannot be reached the caller hears
-"all circuits are busy" instead of dead air. Officer callbacks are unchanged:
-they go out through ElevenLabs' own trunk straight to Alphatech.
+and in `VOICE_MODE=spitch-ivr` plays a bilingual Hausa + Nigerian English IVR
+menu (*Press 1 for Hausa, Press 2 for Nigerian English*) before connecting the
+caller over Asterisk `AudioSocket` to `spitch-voice-agent.py` (with automatic
+fallback to ElevenLabs if the local voice daemon is unavailable). Officer
+callbacks go out through ElevenLabs' own trunk straight to Alphatech.
 
 ## Set up (about 20 minutes)
 
