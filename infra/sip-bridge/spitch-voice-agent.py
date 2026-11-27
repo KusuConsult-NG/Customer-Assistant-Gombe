@@ -22,20 +22,24 @@ Architecture (zero third-party pip dependencies, Python 3.12 stdlib only):
 """
 import asyncio
 import audioop
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 import io
 import json
 import logging
 import os
 import re
+import shutil
+import socket
 import struct
+import subprocess
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid as uuidlib
 import wave
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,6 +55,7 @@ MSG_AUDIO = 0x10
 MSG_ERROR = 0xFF
 
 FRAME_BYTES = 320  # 20ms of 8kHz 16-bit mono PCM
+SILENCE_FRAME = b"\x00" * FRAME_BYTES
 SAMPLE_RATE = 8000
 
 GOMBE_SPECIAL_WORDS = (
@@ -66,6 +71,19 @@ GOMBE_LGAS = [
 
 EXECUTOR = ThreadPoolExecutor(max_workers=12)
 SESSIONS: Dict[str, Dict[str, Any]] = {}
+TTS_CACHE: Dict[str, bytes] = {}
+HAS_SOX = bool(shutil.which("sox"))
+
+OPENINGS = {
+    "ha": (
+        "Sannu da zuwa. Sunana Hasan daga dakin kula da zabe na Dakta Jamil Isyaku Gwamna. "
+        "Kana da rahoton rumfar zabe ko tambaya game da manufofin IMPACTS?"
+    ),
+    "en": (
+        "Hello, my name is Kingsley from the Doctor Jamil Isyaku Gwamna 2027 A P C Election Situation Room. "
+        "Are you calling with a polling unit report, or a question about the IMPACTS manifesto?"
+    ),
+}
 
 
 def load_env(path: str) -> None:
@@ -125,6 +143,31 @@ def strip_wav_header(data: bytes) -> Tuple[bytes, int, int, int]:
     raise ValueError("WAV data chunk missing")
 
 
+def resample_to_8k(pcm: bytes, channels: int, sampwidth: int, rate: int) -> bytes:
+    if channels == 2:
+        pcm = audioop.tomono(pcm, sampwidth, 0.5, 0.5)
+    if sampwidth != 2:
+        pcm = audioop.lin2lin(pcm, sampwidth, 2)
+    if HAS_SOX:
+        proc = subprocess.run(
+            [
+                "sox",
+                "-q",
+                "-t", "raw", "-r", str(rate), "-e", "signed-integer", "-b", "16", "-c", "1", "-",
+                "-t", "raw", "-r", "8000", "-e", "signed-integer", "-b", "16", "-c", "1", "-",
+                "highpass", "100", "lowpass", "3500", "norm", "-3",
+            ],
+            input=pcm,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        return proc.stdout
+    if rate != SAMPLE_RATE:
+        pcm, _ = audioop.ratecv(pcm, 2, 1, rate, SAMPLE_RATE, None)
+    return pcm
+
+
 def pcm8k_to_wav_bytes(pcm: bytes) -> bytes:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
@@ -140,6 +183,10 @@ def spitch_tts_sync(text: str, lang: str) -> bytes:
     clean = re.sub(r"[*_`#]+", "", text).strip()
     if not clean:
         return b""
+    cache_key = f"{lang}:{voice}:{clean}"
+    cached = TTS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     payload = json.dumps(
         {
             "language": lang,
@@ -161,13 +208,10 @@ def spitch_tts_sync(text: str, lang: str) -> bytes:
     with urllib.request.urlopen(req, timeout=25) as resp:
         raw = resp.read()
     pcm, channels, sampwidth, rate = strip_wav_header(raw)
-    if channels == 2:
-        pcm = audioop.tomono(pcm, sampwidth, 0.5, 0.5)
-    if sampwidth != 2:
-        pcm = audioop.lin2lin(pcm, sampwidth, 2)
-    if rate != SAMPLE_RATE:
-        pcm, _ = audioop.ratecv(pcm, 2, 1, rate, SAMPLE_RATE, None)
-    return pcm
+    pcm8 = resample_to_8k(pcm, channels, sampwidth, rate)
+    if len(TTS_CACHE) < 32 and len(clean) < 260:
+        TTS_CACHE[cache_key] = pcm8
+    return pcm8
 
 
 def spitch_stt_sync(pcm8k: bytes, lang: str) -> str:
@@ -563,64 +607,94 @@ def run_spitch_direct_turn_sync(user_text: str, lang: str, caller_id: str) -> Tu
     return reply, False
 
 
-# ── AudioSocket Call Handler ─────────────────────────────────────────────────
+# ── Full-Duplex AudioSocket Call Handler ─────────────────────────────────────
 
 
-async def send_frame(writer: asyncio.StreamWriter, msg_type: int, payload: bytes) -> None:
-    header = struct.pack("!BH", msg_type, len(payload))
-    writer.write(header + payload)
-    await writer.drain()
-
-
-async def stream_pcm(
-    writer: asyncio.StreamWriter,
-    pcm8k: bytes,
-    stop_event: asyncio.Event,
-) -> None:
-    """Stream 8kHz slin16 PCM to Asterisk in paced 20ms (320-byte) AudioSocket frames."""
+def pcm_to_frames(pcm8k: bytes) -> List[bytes]:
     if not pcm8k:
-        return
-    # Pad tail to 320-byte boundary
+        return []
     rem = len(pcm8k) % FRAME_BYTES
     if rem:
         pcm8k += b"\x00" * (FRAME_BYTES - rem)
-
-    t0 = time.monotonic()
-    for idx in range(0, len(pcm8k), FRAME_BYTES):
-        if stop_event.is_set() or writer.is_closing():
-            break
-        chunk = pcm8k[idx : idx + FRAME_BYTES]
-        await send_frame(writer, MSG_AUDIO, chunk)
-        frame_num = (idx // FRAME_BYTES) + 1
-        target = t0 + frame_num * 0.020
-        delay = target - time.monotonic()
-        if delay > 0:
-            await asyncio.sleep(delay)
+    return [pcm8k[i : i + FRAME_BYTES] for i in range(0, len(pcm8k), FRAME_BYTES)]
 
 
 async def handle_audiosocket(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     loop = asyncio.get_running_loop()
-    call_uuid = ""
-    session: Dict[str, Any] = {"callerId": "", "lang": "ha"}
-    playback_stop = asyncio.Event()
-    is_speaking = False
-    hangup_requested = False
+    sock = writer.get_extra_info("socket")
+    if sock is not None:
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
 
-    async def speak_text(text: str, lang: str) -> None:
-        nonlocal is_speaking
-        if not text.strip():
+    call_uuid = ""
+    closed = asyncio.Event()
+    out_frames: Deque[bytes] = deque()
+    utterance_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=4)
+    processing_turn = False
+    lang = "ha"
+    caller_id = ""
+    hangup_after_audio = False
+
+    def enqueue_pcm(pcm8k: bytes) -> None:
+        for frame in pcm_to_frames(pcm8k):
+            out_frames.append(frame)
+
+    async def speak_text(text: str, target_lang: str) -> None:
+        if not text.strip() or closed.is_set():
             return
         try:
             t0 = time.time()
-            pcm = await loop.run_in_executor(EXECUTOR, spitch_tts_sync, text, lang)
-            log.info("[%s] TTS %s (%dms, %.1fs): %s", call_uuid[:8], lang, int((time.time() - t0) * 1000), len(pcm) / 16000, text[:90])
-            playback_stop.clear()
-            is_speaking = True
-            await stream_pcm(writer, pcm, playback_stop)
+            pcm = await loop.run_in_executor(EXECUTOR, spitch_tts_sync, text, target_lang)
+            if closed.is_set():
+                return
+            log.info(
+                "[%s] TTS %s (%dms, %.1fs): %s",
+                call_uuid[:8],
+                target_lang,
+                int((time.time() - t0) * 1000),
+                len(pcm) / 16000,
+                text[:90],
+            )
+            enqueue_pcm(pcm)
         except Exception as exc:
             log.error("[%s] TTS error: %s", call_uuid[:8], exc)
-        finally:
-            is_speaking = False
+
+    async def writer_loop() -> None:
+        """Steady 20ms full-duplex AudioSocket frame clock — never starves Asterisk RTP."""
+        next_tick = time.monotonic()
+        audio_hdr = struct.pack("!BH", MSG_AUDIO, FRAME_BYTES)
+        try:
+            while not closed.is_set() and not writer.is_closing():
+                if out_frames:
+                    frame = out_frames.popleft()
+                    writer.write(audio_hdr + frame)
+                else:
+                    if hangup_after_audio:
+                        writer.write(struct.pack("!BH", MSG_HANGUP, 0))
+                        await writer.drain()
+                        closed.set()
+                        return
+                    writer.write(audio_hdr + SILENCE_FRAME)
+
+                # Drain periodically without stalling the 20ms cadence
+                if writer.transport and writer.transport.get_write_buffer_size() > 8192:
+                    await writer.drain()
+
+                next_tick += 0.020
+                sleep_for = next_tick - time.monotonic()
+                if sleep_for > 0:
+                    await asyncio.sleep(sleep_for)
+                else:
+                    # Resync clock if OS paused briefly so we never burst frames
+                    if sleep_for < -0.200:
+                        next_tick = time.monotonic()
+                    await asyncio.sleep(0)
+        except Exception as exc:
+            if not closed.is_set():
+                log.debug("[%s] Writer loop ended: %s", call_uuid[:8], exc)
+            closed.set()
 
     try:
         # 1. Read initial UUID frame (0x01)
@@ -632,26 +706,31 @@ async def handle_audiosocket(reader: asyncio.StreamReader, writer: asyncio.Strea
         else:
             call_uuid = str(uuidlib.uuid4())
 
-        session = SESSIONS.pop(call_uuid, None) or SESSIONS.pop(call_uuid.replace("-", ""), None) or {"callerId": "", "lang": "ha"}
+        session = (
+            SESSIONS.pop(call_uuid, None)
+            or SESSIONS.pop(call_uuid.replace("-", ""), None)
+            or {"callerId": "", "lang": "ha"}
+        )
         lang = "en" if session.get("lang") == "en" else "ha"
         caller_id = str(session.get("callerId") or "")
         log.info("[%s] Call connected: caller=%s lang=%s", call_uuid[:8], caller_id or "unknown", lang)
 
-        # Look up caller in background while greeting plays
-        profile_fut = loop.run_in_executor(
-            EXECUTOR,
-            call_agent_tool_sync,
-            "lookup-customer",
-            {"phoneNumber": caller_id},
-        ) if caller_id else None
+        # Start steady 20ms writer immediately so Asterisk RTP stays unbroken
+        writer_task = asyncio.create_task(writer_loop())
 
-        opening = (
-            "Sannu da zuwa. Sunana Hasan daga dakin kula da zabe na Dakta Jamil Isyaku Gwamna. "
-            "Kana da rahoton rumfar zabe ko tambaya game da manufofin IMPACTS?"
-            if lang == "ha"
-            else "Hello, my name is Kingsley from the Doctor Jamil Isyaku Gwamna 2027 A P C Election Situation Room. "
-            "Are you calling with a polling unit report, or a question about the IMPACTS manifesto?"
+        # Background caller lookup while cached greeting plays
+        profile_fut = (
+            loop.run_in_executor(
+                EXECUTOR,
+                call_agent_tool_sync,
+                "lookup-customer",
+                {"phoneNumber": caller_id},
+            )
+            if caller_id
+            else None
         )
+
+        opening = OPENINGS[lang]
         await speak_text(opening, lang)
 
         caller_profile = None
@@ -666,22 +745,74 @@ async def handle_audiosocket(reader: asyncio.StreamReader, writer: asyncio.Strea
             {"role": "assistant", "content": opening},
         ]
 
-        # 2. Main VAD + Turn Loop
+        async def turn_worker() -> None:
+            nonlocal processing_turn, hangup_after_audio
+            while not closed.is_set():
+                try:
+                    captured = await asyncio.wait_for(utterance_queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+                if closed.is_set():
+                    break
+                processing_turn = True
+                try:
+                    t0 = time.time()
+                    transcript = await loop.run_in_executor(EXECUTOR, spitch_stt_sync, captured, lang)
+                    log.info(
+                        "[%s] STT %s (%dms): %s",
+                        call_uuid[:8],
+                        lang,
+                        int((time.time() - t0) * 1000),
+                        transcript,
+                    )
+                    if len(transcript.strip()) < 2 or closed.is_set():
+                        continue
+
+                    messages.append({"role": "user", "content": transcript})
+                    if CFG.llm_api_key:
+                        try:
+                            reply, should_end = await loop.run_in_executor(
+                                EXECUTOR, run_llm_turn_sync, messages, caller_id
+                            )
+                        except Exception as exc:
+                            log.warning("[%s] LLM failed (%s), using Spitch-Direct", call_uuid[:8], exc)
+                            reply, should_end = await loop.run_in_executor(
+                                EXECUTOR, run_spitch_direct_turn_sync, transcript, lang, caller_id
+                            )
+                    else:
+                        reply, should_end = await loop.run_in_executor(
+                            EXECUTOR, run_spitch_direct_turn_sync, transcript, lang, caller_id
+                        )
+
+                    if reply and not closed.is_set():
+                        await speak_text(reply, lang)
+                    if should_end:
+                        hangup_after_audio = True
+                        break
+                except Exception as exc:
+                    log.error("[%s] Turn error: %s", call_uuid[:8], exc)
+                finally:
+                    processing_turn = False
+
+        turn_task = asyncio.create_task(turn_worker())
+
+        # 2. Continuous Non-Blocking Reader + VAD Loop (NEVER stalls TCP socket!)
+        preroll: Deque[bytes] = deque(maxlen=6)  # 120ms pre-roll so first syllable is never clipped
         speech_buf = bytearray()
         in_speech = False
         speech_frames = 0
         silence_frames = 0
         idle_frames = 0
         prompted_silence = 0
-        RMS_THRESHOLD = 420
-        SILENCE_END_FRAMES = 42  # 840ms of silence ends utterance
-        MIN_SPEECH_FRAMES = 14   # 280ms minimum real speech
-        MAX_UTTERANCE_FRAMES = 1000  # 20s cap
-        IDLE_PROMPT_FRAMES = 450  # 9s of silence prompts caller
+        RMS_THRESHOLD = 300
+        SILENCE_END_FRAMES = 45   # 900ms silence ends utterance
+        MIN_SPEECH_FRAMES = 14    # 280ms minimum real speech
+        MAX_UTTERANCE_FRAMES = 900  # 18s cap
+        IDLE_PROMPT_FRAMES = 500  # 10s of quiet prompts caller
 
-        while not hangup_requested:
+        while not closed.is_set():
             try:
-                hdr = await asyncio.wait_for(reader.readexactly(3), timeout=30.0)
+                hdr = await asyncio.wait_for(reader.readexactly(3), timeout=35.0)
             except (asyncio.IncompleteReadError, asyncio.TimeoutError):
                 break
             mtype, mlen = struct.unpack("!BH", hdr)
@@ -695,17 +826,33 @@ async def handle_audiosocket(reader: asyncio.StreamReader, writer: asyncio.Strea
                 log.info("[%s] Mid-call DTMF: %s", call_uuid[:8], digit)
                 if digit == "1" and lang != "ha":
                     lang = "ha"
-                    await speak_text("An koma harshen Hausa. Yaya zan taimaka maka?", "ha")
+                    out_frames.clear()
+                    asyncio.create_task(speak_text("An koma harshen Hausa. Yaya zan taimaka maka?", "ha"))
                 elif digit == "2" and lang != "en":
                     lang = "en"
-                    await speak_text("Switched to Nigerian English. How can I help you?", "en")
+                    out_frames.clear()
+                    asyncio.create_task(speak_text("Switched to Nigerian English. How can I help you?", "en"))
                 continue
-            if mtype != MSG_AUDIO or is_speaking:
+            if mtype != MSG_AUDIO:
+                continue
+
+            # Drain audio while assistant is speaking or processing a turn (prevents echo & TCP stall)
+            if out_frames or processing_turn:
+                in_speech = False
+                speech_frames = 0
+                silence_frames = 0
+                speech_buf.clear()
+                preroll.clear()
+                idle_frames = 0
                 continue
 
             rms = audioop.rms(payload, 2) if len(payload) >= 2 else 0
             if rms >= RMS_THRESHOLD:
-                in_speech = True
+                if not in_speech:
+                    in_speech = True
+                    for pre in preroll:
+                        speech_buf.extend(pre)
+                    preroll.clear()
                 speech_frames += 1
                 silence_frames = 0
                 idle_frames = 0
@@ -718,6 +865,7 @@ async def handle_audiosocket(reader: asyncio.StreamReader, writer: asyncio.Strea
                 if silence_frames < SILENCE_END_FRAMES:
                     continue
             else:
+                preroll.append(payload)
                 idle_frames += 1
                 if idle_frames >= IDLE_PROMPT_FRAMES:
                     idle_frames = 0
@@ -729,67 +877,39 @@ async def handle_audiosocket(reader: asyncio.StreamReader, writer: asyncio.Strea
                             else "I cannot hear you on the line. Thank you for calling, goodbye."
                         )
                         await speak_text(bye, lang)
-                        break
-                    check = (
-                        "Kana kan layi har yanzu? Ina sauraronka."
-                        if lang == "ha"
-                        else "Are you still on the line? I am listening."
-                    )
-                    await speak_text(check, lang)
+                        hangup_after_audio = True
+                    else:
+                        check = (
+                            "Kana kan layi har yanzu? Ina sauraronka."
+                            if lang == "ha"
+                            else "Are you still on the line? I am listening."
+                        )
+                        asyncio.create_task(speak_text(check, lang))
                 continue
 
-            # Utterance completed
+            # Utterance completed -> hand off to turn_worker without blocking reader!
             captured = bytes(speech_buf)
             captured_frames = speech_frames
             speech_buf.clear()
             in_speech = False
             speech_frames = 0
             silence_frames = 0
-
-            if captured_frames < MIN_SPEECH_FRAMES:
-                continue
-
-            t0 = time.time()
-            try:
-                transcript = await loop.run_in_executor(EXECUTOR, spitch_stt_sync, captured, lang)
-            except Exception as exc:
-                log.error("[%s] STT error: %s", call_uuid[:8], exc)
-                continue
-
-            log.info("[%s] STT %s (%dms): %s", call_uuid[:8], lang, int((time.time() - t0) * 1000), transcript)
-            if len(transcript.strip()) < 2:
-                continue
-
-            prompted_silence = 0
-            messages.append({"role": "user", "content": transcript})
-
-            reply = ""
-            should_end = False
-            if CFG.llm_api_key:
+            if captured_frames >= MIN_SPEECH_FRAMES:
+                prompted_silence = 0
                 try:
-                    reply, should_end = await loop.run_in_executor(
-                        EXECUTOR, run_llm_turn_sync, messages, caller_id
-                    )
-                except Exception as exc:
-                    log.warning("[%s] LLM call failed (%s), falling back to Spitch-Direct mode", call_uuid[:8], exc)
-                    reply, should_end = await loop.run_in_executor(
-                        EXECUTOR, run_spitch_direct_turn_sync, transcript, lang, caller_id
-                    )
-            else:
-                reply, should_end = await loop.run_in_executor(
-                    EXECUTOR, run_spitch_direct_turn_sync, transcript, lang, caller_id
-                )
+                    utterance_queue.put_nowait(captured)
+                except asyncio.QueueFull:
+                    pass
 
-            if reply:
-                await speak_text(reply, lang)
-            if should_end:
-                hangup_requested = True
-                await send_frame(writer, MSG_HANGUP, b"")
-                break
+        closed.set()
+        turn_task.cancel()
+        writer_task.cancel()
+        await asyncio.gather(turn_task, writer_task, return_exceptions=True)
 
     except Exception as exc:
         log.error("[%s] Call handler exception: %s", call_uuid[:8] or "init", exc)
     finally:
+        closed.set()
         try:
             writer.close()
             await writer.wait_closed()
@@ -817,6 +937,8 @@ async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
                     "ok": bool(CFG.spitch_api_key),
                     "mode": "llm+spitch" if CFG.llm_api_key else "spitch-direct",
                     "voices": {"ha": CFG.ha_voice, "en": CFG.en_voice},
+                    "soxResampling": HAS_SOX,
+                    "cachedGreetings": len(TTS_CACHE),
                     "apiToolsConfigured": bool(CFG.agent_tool_key),
                     "activeRegisteredSessions": len(SESSIONS),
                 }
@@ -850,7 +972,6 @@ async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
             if lang not in ("ha", "en"):
                 lang = "ha"
 
-            # Evict stale entries older than 30 min
             now = time.time()
             for k in [k for k, v in SESSIONS.items() if now - v.get("ts", 0) > 1800]:
                 SESSIONS.pop(k, None)
@@ -879,6 +1000,18 @@ async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
             pass
 
 
+async def warm_greetings() -> None:
+    if not CFG.spitch_api_key:
+        return
+    loop = asyncio.get_running_loop()
+    for code, text in OPENINGS.items():
+        try:
+            pcm = await loop.run_in_executor(EXECUTOR, spitch_tts_sync, text, code)
+            log.info("Pre-cached %s greeting (%.1fs, sox=%s)", code, len(pcm) / 16000, HAS_SOX)
+        except Exception as exc:
+            log.warning("Greeting pre-cache failed for %s: %s", code, exc)
+
+
 async def main() -> None:
     global CFG
     load_env(os.environ.get("BRIDGE_ENV_FILE", "/opt/sip-bridge/bridge.env"))
@@ -888,13 +1021,15 @@ async def main() -> None:
 
     http_srv = await asyncio.start_server(handle_http, "127.0.0.1", CFG.http_port)
     as_srv = await asyncio.start_server(handle_audiosocket, "127.0.0.1", CFG.audiosocket_port)
+    asyncio.create_task(warm_greetings())
     log.info(
-        "Spitch Bilingual Voice Agent listening: HTTP=127.0.0.1:%d AudioSocket=127.0.0.1:%d mode=%s ha=%s en=%s",
+        "Spitch Bilingual Voice Agent listening: HTTP=127.0.0.1:%d AudioSocket=127.0.0.1:%d mode=%s ha=%s en=%s sox=%s",
         CFG.http_port,
         CFG.audiosocket_port,
         "llm+spitch" if CFG.llm_api_key else "spitch-direct",
         CFG.ha_voice,
         CFG.en_voice,
+        HAS_SOX,
     )
     async with http_srv, as_srv:
         await asyncio.gather(http_srv.serve_forever(), as_srv.serve_forever())

@@ -17,6 +17,7 @@ exten => s,1,NoOp(Inbound from Alphatech: caller=${CALLERID(num)} dialled=${EXTE
  same => n,Set(CN=${CALLERID(num)})
  same => n,ExecIf($[${REGEX("^0[789][01][0-9]{8}$" ${CN})}]?Set(CALLERID(num)=+234${CN:1}))
  same => n,ExecIf($[${REGEX("^234[0-9]{10}$" ${CN})}]?Set(CALLERID(num)=+${CN}))
+ same => n,Set(JITTERBUFFER(adaptive)=default)
  ; When VOICE_MODE=spitch-ivr, route to the bilingual Press-1 Hausa / Press-2 Nigerian English IVR.
  same => n,GotoIf($["${VOICE_MODE}" = "spitch-ivr"]?spitch-ivr,s,1)
  ; Legacy direct ElevenLabs handoff

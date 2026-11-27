@@ -9,7 +9,9 @@ can play them with Background(custom/gombe-ivr-menu) at zero per-call latency.
 import audioop
 import json
 import os
+import shutil
 import struct
+import subprocess
 import sys
 import urllib.request
 import wave
@@ -47,7 +49,6 @@ def strip_wav_header(data: bytes) -> tuple[bytes, int, int, int]:
             pos += chunk_size + (chunk_size % 2)
         elif chunk_id == b"data":
             pcm = data[pos:]
-            # Ensure even frame alignment
             rem = len(pcm) % (channels * sampwidth)
             if rem:
                 pcm = pcm[:-rem]
@@ -55,6 +56,31 @@ def strip_wav_header(data: bytes) -> tuple[bytes, int, int, int]:
         else:
             pos += chunk_size + (chunk_size % 2)
     raise ValueError("WAV data chunk not found")
+
+
+def resample_to_8k(pcm: bytes, channels: int, sampwidth: int, rate: int) -> bytes:
+    if channels == 2:
+        pcm = audioop.tomono(pcm, sampwidth, 0.5, 0.5)
+    if sampwidth != 2:
+        pcm = audioop.lin2lin(pcm, sampwidth, 2)
+    if shutil.which("sox"):
+        proc = subprocess.run(
+            [
+                "sox",
+                "-q",
+                "-t", "raw", "-r", str(rate), "-e", "signed-integer", "-b", "16", "-c", "1", "-",
+                "-t", "raw", "-r", "8000", "-e", "signed-integer", "-b", "16", "-c", "1", "-",
+                "highpass", "100", "lowpass", "3500", "norm", "-3",
+            ],
+            input=pcm,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        return proc.stdout
+    if rate != 8000:
+        pcm, _ = audioop.ratecv(pcm, 2, 1, rate, 8000, None)
+    return pcm
 
 
 def spitch_tts_pcm8k(api_key: str, text: str, language: str, voice: str, speed: float = 1.0) -> bytes:
@@ -79,13 +105,7 @@ def spitch_tts_pcm8k(api_key: str, text: str, language: str, voice: str, speed: 
     with urllib.request.urlopen(req, timeout=30) as resp:
         raw = resp.read()
     pcm, channels, sampwidth, rate = strip_wav_header(raw)
-    if channels == 2:
-        pcm = audioop.tomono(pcm, sampwidth, 0.5, 0.5)
-    if sampwidth != 2:
-        pcm = audioop.lin2lin(pcm, sampwidth, 2)
-    if rate != 8000:
-        pcm, _ = audioop.ratecv(pcm, 2, 1, rate, 8000, None)
-    return pcm
+    return resample_to_8k(pcm, channels, sampwidth, rate)
 
 
 def silence_8k(seconds: float) -> bytes:
